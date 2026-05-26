@@ -1,6 +1,9 @@
 mod bindings;
 mod graph;
 
+// TODO: Scope down.
+pub use graph::*;
+
 use pyo3::prelude::*;
 
 #[pymodule]

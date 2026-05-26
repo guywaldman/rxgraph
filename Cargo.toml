@@ -5,7 +5,20 @@ edition = "2024"
 
 [lib]
 name = "rxgraph"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "lib"]
 
 [dependencies]
+arrow = "58.3.0"
 pyo3 = "0.28.3"
+pyo3-arrow = "0.17.0"
+rand = "0.10.1"
+rayon = "1.12.0"
+sprs = "0.11.4"
+stats_alloc = "0.1.10"
+
+[[bench]]
+name = "traversal"
+harness = false
+
+[dev-dependencies]
+criterion = { version = "0.8.2", features = ["html_reports"] }
