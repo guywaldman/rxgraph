@@ -1,14 +1,13 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+use pyo3::prelude::*;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// A Python module implemented in Rust.
+#[pymodule]
+mod rxgraph {
+    use pyo3::prelude::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    /// Formats the sum of two numbers as string.
+    #[pyfunction]
+    fn sum_as_string(a: usize, b: usize) -> PyResult<String> {
+        Ok((a + b).to_string())
     }
 }
