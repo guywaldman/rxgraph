@@ -1,6 +1,12 @@
+mod bindings;
+mod graph;
+
 use pyo3::prelude::*;
 
 #[pymodule]
-fn rxgraph(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<bindings::Graph>()?;
+    m.add_class::<bindings::Schema>()?;
+    m.add_class::<bindings::SchemaField>()?;
     Ok(())
 }

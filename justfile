@@ -6,9 +6,9 @@ default: test
 venv:
     test -x {{python}} || uv venv {{venv}}
 
-develop: venv
+dev: venv
     uv pip install --python {{python}} maturin pytest
     {{venv}}/bin/maturin develop --release
 
-test: develop
+test: dev
     {{python}} -m pytest

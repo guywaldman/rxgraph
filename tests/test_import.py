@@ -1,4 +1,5 @@
 def test_rxgraph_imports() -> None:
-    import rxgraph
+    import rxgraph as rxg
 
-    assert rxgraph.__name__ == "rxgraph"
+    g = rxg.Graph(node_schema=rxg.Schema(fields=[]))
+    assert g is not None

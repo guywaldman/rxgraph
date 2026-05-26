@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "rxgraph"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "pyo3",
 ]
