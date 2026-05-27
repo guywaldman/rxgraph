@@ -386,9 +386,15 @@ impl BoundColumn {
             ColumnRef::State(name) => state_index(state_names, &name)
                 .map(Self::State)
                 .unwrap_or(Self::MissingState),
-            ColumnRef::SrcField(name) => Self::Src(bind_readers(graph.node_tables(), &name)?),
-            ColumnRef::DestField(name) => Self::Dest(bind_readers(graph.node_tables(), &name)?),
-            ColumnRef::EdgeField(name) => Self::Edge(bind_readers(graph.edge_tables(), &name)?),
+            ColumnRef::SrcField(name) => {
+                Self::Src(bind_readers(graph.node_tables(), &name, "node")?)
+            }
+            ColumnRef::DestField(name) => {
+                Self::Dest(bind_readers(graph.node_tables(), &name, "node")?)
+            }
+            ColumnRef::EdgeField(name) => {
+                Self::Edge(bind_readers(graph.edge_tables(), &name, "edge")?)
+            }
         })
     }
 
@@ -421,14 +427,24 @@ pub(crate) struct EvalCtx<'a> {
     pub(crate) state: &'a StateRow,
 }
 
-fn bind_readers(tables: &[crate::graph::Table], name: &str) -> Result<Vec<Option<ColumnReader>>> {
-    tables
+fn bind_readers(
+    tables: &[crate::graph::Table],
+    name: &str,
+    kind: &str,
+) -> Result<Vec<Option<ColumnReader>>> {
+    let readers = tables
         .iter()
         .map(|table| match table.batch.schema().index_of(name) {
             Ok(index) => Ok(Some(ColumnReader::new(name, table.batch.column(index))?)),
             Err(_) => Ok(None),
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+
+    if readers.iter().any(Option::is_some) {
+        Ok(readers)
+    } else {
+        bail!("column {name:?} is not present in any {kind} table")
+    }
 }
 
 fn read_node(graph: &Graph, readers: &[Option<ColumnReader>], node: NodeId) -> Result<Scalar> {

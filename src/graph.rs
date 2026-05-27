@@ -290,6 +290,12 @@ fn build_csr(
 mod tests {
     use super::*;
     use crate::test_utils::{edges, nodes};
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ArrayRef, StringArray, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+    };
 
     #[test]
     fn builds_graph_with_multiple_types() {
@@ -333,5 +339,46 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("missing dest 99"));
+    }
+
+    #[test]
+    fn rejects_node_table_without_uint64_id() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)])),
+            vec![Arc::new(StringArray::from(vec!["10"])) as ArrayRef],
+        )
+        .unwrap();
+        let err = GraphBuilder::new()
+            .with_node_table("person", batch)
+            .build()
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("node table \"person\" column \"id\" must have Arrow type UInt64")
+        );
+    }
+
+    #[test]
+    fn rejects_edge_table_without_dest() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "src",
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from(vec![10])) as ArrayRef],
+        )
+        .unwrap();
+        let err = GraphBuilder::new()
+            .with_node_table("person", nodes(&[10], &["a"], &[1]))
+            .with_edge_table("knows", batch)
+            .build()
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("edge table \"knows\" is missing required column \"dest\"")
+        );
     }
 }

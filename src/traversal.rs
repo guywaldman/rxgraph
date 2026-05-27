@@ -724,4 +724,30 @@ mod tests {
             graph.search(parallel).unwrap()
         );
     }
+
+    #[test]
+    fn rejects_field_missing_from_all_tables_before_traversal() {
+        let graph = GraphBuilder::new()
+            .with_node_table("n", nodes(&[0, 1], &["n", "n"], &[0, 0]))
+            .with_edge_table("e", edges(&[0], &[1], &["e"]))
+            .build()
+            .unwrap();
+        let kernel = DslKernel::new(
+            r#"{"Column":"edge.price"}"#,
+            [],
+            r#"{"Literal":{"Scalar":{"Boolean":false}}}"#,
+            [],
+        )
+        .unwrap();
+        let traversal = DslTraversalBuilder::new(kernel)
+            .with_start_nodes([0])
+            .with_max_depth(1)
+            .build();
+
+        let err = graph.search(traversal).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("column \"price\" is not present in any edge table")
+        );
+    }
 }
