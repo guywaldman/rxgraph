@@ -22,6 +22,30 @@ class Graph:
     def search(self, traversal: Traversal) -> SearchResult:
         """Run a traversal and return stopped paths plus traversal stats."""
         ...
+    def bfs(self, start: int, max_depth: int | None = None) -> list[int]:
+        """Return nodes reachable from ``start`` in breadth-first order."""
+        ...
+    def dfs(self, start: int, max_depth: int | None = None) -> list[int]:
+        """Return nodes reachable from ``start`` in depth-first pre-order."""
+        ...
+    def reachable_nodes(self, start: int) -> list[int]:
+        """Return all nodes reachable from ``start``."""
+        ...
+    def shortest_path(self, source: int, target: int) -> list[int] | None:
+        """Return an unweighted directed shortest path, if one exists."""
+        ...
+    def out_degrees(self) -> list[int]:
+        """Return out-degree for each node in node insertion order."""
+        ...
+    def in_degrees(self) -> list[int]:
+        """Return in-degree for each node in node insertion order."""
+        ...
+    def degrees(self) -> list[int]:
+        """Return total directed degree for each node in node insertion order."""
+        ...
+    def weakly_connected_components(self) -> list[list[int]]:
+        """Return weakly connected components, ignoring edge direction."""
+        ...
 
 class Kernel:
     """Traversal kernel built from Polars expressions."""

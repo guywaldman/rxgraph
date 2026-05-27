@@ -3,10 +3,9 @@ set shell := ["zsh", "-cu"]
 venv := ".venv"
 python := venv / "bin/python"
 maturin := venv / "bin/maturin"
-pytest := venv / "bin/pytest"
 ruff := venv / "bin/ruff"
 prek := venv / "bin/prek"
-py_sources := "python tests scripts"
+py_sources := "python tests benches"
 python_manifest := "crates/rxgraph-python/Cargo.toml"
 
 default: test
@@ -21,7 +20,9 @@ lock:
 lock-check:
     uv lock --check
 
-develop: setup
+develop: develop-release
+
+develop-release: setup
     {{maturin}} develop --manifest-path {{python_manifest}} --release
 
 fmt:
@@ -39,8 +40,8 @@ lint: setup
 test-rust:
     cargo test --workspace --locked
 
-test-python: develop
-    {{pytest}}
+test-python *args: develop-release
+    {{python}} -m pytest {{args}}
 
 test: test-rust test-python
 
@@ -58,5 +59,5 @@ precommit: setup
 install-hooks: setup
     {{prek}} install
 
-bench-python: develop
-    {{python}} scripts/bench_python.py
+bench *args: develop-release
+    {{python}} -m benches.main {{args}}

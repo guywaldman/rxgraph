@@ -32,6 +32,8 @@ pub struct Graph {
     internal_to_external: Vec<u64>,
     node_rows: Vec<RowRef>,
     edge_rows: Vec<RowRef>,
+    edge_srcs: Vec<NodeId>,
+    edge_dests: Vec<NodeId>,
     offsets: Vec<usize>,
     edge_ids: Vec<EdgeId>,
     dests: Vec<NodeId>,
@@ -129,6 +131,8 @@ impl Graph {
         let mut edge_tables = Vec::with_capacity(edge_batches.len());
         let mut edge_rows = Vec::with_capacity(edge_count_hint);
         let mut edge_endpoints = Vec::with_capacity(edge_count_hint);
+        let mut edge_srcs = Vec::with_capacity(edge_count_hint);
+        let mut edge_dests = Vec::with_capacity(edge_count_hint);
 
         for (table_idx, (typ, batch)) in edge_batches.into_iter().enumerate() {
             let srcs = required_u64(&batch, "src", "edge", &typ)?;
@@ -157,6 +161,8 @@ impl Graph {
                     row,
                 });
                 edge_endpoints.push((src, dest));
+                edge_srcs.push(src);
+                edge_dests.push(dest);
             }
 
             edge_tables.push(Table { batch });
@@ -171,6 +177,8 @@ impl Graph {
             internal_to_external,
             node_rows,
             edge_rows,
+            edge_srcs,
+            edge_dests,
             offsets,
             edge_ids,
             dests: csr_dests,
@@ -214,6 +222,14 @@ impl Graph {
     pub(crate) fn out_degree(&self, node: NodeId) -> usize {
         let i = node as usize;
         self.offsets[i + 1] - self.offsets[i]
+    }
+
+    pub(crate) fn edge_source(&self, edge: EdgeId) -> NodeId {
+        self.edge_srcs[edge as usize]
+    }
+
+    pub(crate) fn edge_dest(&self, edge: EdgeId) -> NodeId {
+        self.edge_dests[edge as usize]
     }
 
     pub(crate) fn node_row(&self, node: NodeId) -> RowRef {

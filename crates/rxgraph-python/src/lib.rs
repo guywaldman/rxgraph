@@ -66,6 +66,42 @@ impl PyGraph {
         Ok(result.into())
     }
 
+    #[pyo3(signature = (start, max_depth = None))]
+    fn bfs(&self, start: u64, max_depth: Option<usize>) -> PyResult<Vec<u64>> {
+        self.inner.bfs(start, max_depth).map_err(to_py_value_err)
+    }
+
+    #[pyo3(signature = (start, max_depth = None))]
+    fn dfs(&self, start: u64, max_depth: Option<usize>) -> PyResult<Vec<u64>> {
+        self.inner.dfs(start, max_depth).map_err(to_py_value_err)
+    }
+
+    fn reachable_nodes(&self, start: u64) -> PyResult<Vec<u64>> {
+        self.inner.reachable_nodes(start).map_err(to_py_value_err)
+    }
+
+    fn shortest_path(&self, source: u64, target: u64) -> PyResult<Option<Vec<u64>>> {
+        self.inner
+            .shortest_path(source, target)
+            .map_err(to_py_value_err)
+    }
+
+    fn out_degrees(&self) -> Vec<usize> {
+        self.inner.out_degrees()
+    }
+
+    fn in_degrees(&self) -> Vec<usize> {
+        self.inner.in_degrees()
+    }
+
+    fn degrees(&self) -> Vec<usize> {
+        self.inner.degrees()
+    }
+
+    fn weakly_connected_components(&self) -> Vec<Vec<u64>> {
+        self.inner.weakly_connected_components()
+    }
+
     #[getter]
     fn node_count(&self) -> usize {
         self.inner.node_count()

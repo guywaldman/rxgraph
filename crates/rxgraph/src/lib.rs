@@ -4,6 +4,7 @@
 //! node and edge attributes in Arrow arrays. Traversals are driven by a small
 //! expression kernel that can be serialized from higher-level frontends.
 
+mod algorithms;
 mod dsl;
 mod graph;
 mod traversal;
