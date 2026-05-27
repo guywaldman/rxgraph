@@ -71,4 +71,8 @@ docs/_build/
 # Pyenv
 .python-version
 
+# Profiling
+*.trace
+
+# Misc.
 temp

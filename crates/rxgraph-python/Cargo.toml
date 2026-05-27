@@ -13,4 +13,5 @@ crate-type = ["cdylib"]
 anyhow.workspace = true
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-arrow.workspace = true
+rayon.workspace = true
 rxgraph.workspace = true

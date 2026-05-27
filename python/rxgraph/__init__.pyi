@@ -1,12 +1,21 @@
-from typing import Any, Literal
+from collections.abc import Hashable, Iterable, Mapping
+from typing import Any, Literal, Self, TypeVar
+
+from polars import DataFrame, Expr, col as col, lit as lit
+
+Node = TypeVar("Node", bound=Hashable)
+
+def rayon_thread_count() -> int:
+    """Return the Rayon worker thread count used by rxgraph."""
+    ...
 
 class Graph:
     """Arrow-backed directed graph."""
 
     def __init__(
         self,
-        node_tables: list[tuple[str, Any]],
-        edge_tables: list[tuple[str, Any]],
+        node_tables: list[tuple[str, DataFrame]],
+        edge_tables: list[tuple[str, DataFrame]],
     ) -> None:
         """Build a graph from node and edge tables.
 
@@ -15,23 +24,36 @@ class Graph:
         """
         ...
 
+    @classmethod
+    def from_edges(
+        cls,
+        edges: Iterable[tuple[Node, Node] | tuple[Node, Node, Mapping[str, Any]]],
+        *,
+        nodes: Iterable[Node | tuple[Node, Mapping[str, Any]]] | None = None,
+    ) -> Self:
+        """Build a directed graph from Python node labels and edge tuples."""
+        ...
+
     @property
     def node_count(self) -> int: ...
     @property
     def edge_count(self) -> int: ...
+    def node_id(self, label: Hashable) -> int:
+        """Return the internal numeric ID for a node label."""
+        ...
     def search(self, traversal: Traversal) -> SearchResult:
         """Run a traversal and return stopped paths plus traversal stats."""
         ...
-    def bfs(self, start: int, max_depth: int | None = None) -> list[int]:
+    def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
         ...
-    def dfs(self, start: int, max_depth: int | None = None) -> list[int]:
+    def dfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in depth-first pre-order."""
         ...
-    def reachable_nodes(self, start: int) -> list[int]:
+    def reachable_nodes(self, start: Hashable) -> list[Any]:
         """Return all nodes reachable from ``start``."""
         ...
-    def shortest_path(self, source: int, target: int) -> list[int] | None:
+    def shortest_path(self, source: Hashable, target: Hashable) -> list[Any] | None:
         """Return an unweighted directed shortest path, if one exists."""
         ...
     def out_degrees(self) -> list[int]:
@@ -43,7 +65,7 @@ class Graph:
     def degrees(self) -> list[int]:
         """Return total directed degree for each node in node insertion order."""
         ...
-    def weakly_connected_components(self) -> list[list[int]]:
+    def weakly_connected_components(self) -> list[list[Any]]:
         """Return weakly connected components, ignoring edge direction."""
         ...
 
@@ -52,9 +74,9 @@ class Kernel:
 
     def __init__(
         self,
-        visit: Any,
-        next_state: dict[str, Any],
-        stop: Any,
+        visit: Expr | str,
+        next_state: dict[str, Expr | str],
+        stop: Expr | str,
         initial_state: dict[str, bool | int | float | str | None],
     ) -> None:
         """Create a kernel.
@@ -71,7 +93,7 @@ class Traversal:
     def __init__(
         self,
         kernel: Kernel,
-        start_nodes: list[int],
+        start_nodes: list[Hashable],
         max_depth: int,
         max_paths: int,
         strategy: Literal["dfs", "bfs"] = "dfs",
@@ -106,7 +128,7 @@ class SearchPath:
     """One stopped path returned by a traversal."""
 
     @property
-    def nodes(self) -> list[int]: ...
+    def nodes(self) -> list[Any]: ...
     @property
     def edges(self) -> list[int]: ...
     @property

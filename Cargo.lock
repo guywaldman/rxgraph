@@ -1297,6 +1297,7 @@ dependencies = [
  "anyhow",
  "pyo3",
  "pyo3-arrow",
+ "rayon",
  "rxgraph",
 ]
 

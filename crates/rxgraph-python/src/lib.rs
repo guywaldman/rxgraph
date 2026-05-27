@@ -4,20 +4,36 @@ use pyo3::{
     types::{PyAny, PyDict, PyString},
 };
 use pyo3_arrow::PyTable;
+use rayon::ThreadPoolBuilder;
 use rxgraph::{
     DslKernel, DslTraversalBuilder, EdgeId, Graph, GraphBuilder, Parallelism, Scalar, SearchPath,
     SearchResult, SearchStats, TraversalStrategy,
 };
+use std::thread;
 
 #[pymodule]
 fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    initialize_rayon_pool();
     m.add_class::<PyGraph>()?;
     m.add_class::<PyKernel>()?;
     m.add_class::<PyTraversal>()?;
     m.add_class::<PySearchResult>()?;
     m.add_class::<PySearchStats>()?;
     m.add_class::<PySearchPath>()?;
+    m.add_function(wrap_pyfunction!(rayon_thread_count, m)?)?;
     Ok(())
+}
+
+fn initialize_rayon_pool() {
+    let threads = thread::available_parallelism().map_or(1, usize::from);
+    let _ = ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global();
+}
+
+#[pyfunction]
+fn rayon_thread_count() -> usize {
+    rayon::current_num_threads()
 }
 
 #[pyclass(name = "Graph", unsendable)]

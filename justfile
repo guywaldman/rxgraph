@@ -20,9 +20,7 @@ lock:
 lock-check:
     uv lock --check
 
-develop: develop-release
-
-develop-release: setup
+build-maturin: setup
     {{maturin}} develop --manifest-path {{python_manifest}} --release
 
 fmt:
@@ -40,7 +38,7 @@ lint: setup
 test-rust:
     cargo test --workspace --locked
 
-test-python *args: develop-release
+test-python *args: build-maturin
     {{python}} -m pytest {{args}}
 
 test: test-rust test-python
@@ -59,5 +57,12 @@ precommit: setup
 install-hooks: setup
     {{prek}} install
 
-bench *args: develop-release
+bench *args: build-maturin
     {{python}} -m benches.main {{args}}
+
+profile script: setup
+    @command -v flamegraph >/dev/null || { echo "Install cargo-flamegraph first: cargo install flamegraph"; exit 1; }
+    @{{maturin}} develop --manifest-path {{python_manifest}} --profile profiling
+    @mkdir -p dist
+    @flamegraph --output dist/flamegraph.svg -- {{python}} {{script}}
+    @echo "Wrote dist/flamegraph.svg"

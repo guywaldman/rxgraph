@@ -4,9 +4,12 @@ build-backend = "maturin"
 
 [project]
 name = "rxgraph"
-requires-python = ">=3.8"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
@@ -28,7 +31,7 @@ dev = [
     "maturin>=1.13,<1.14",
     "igraph>=0.11,<0.12",
     "networkx>=3.1,<3.6",
-    "pyperf>=2.10,<2.11; python_version >= '3.9'",
+    "pyperf>=2.10,<2.11",
     "prek>=0.4,<0.5",
     "pytest>=8.3,<9.1",
     "rich>=13.9,<14",

@@ -1,12 +1,11 @@
-"""
-Runs benchmarks against rxgraph, igraph and networkx.
-Compares various algorithms/traversals wih low/high/mid scale, which is configurable.
+"""Scale-streaming benchmark harness for rxgraph.
 
-Admittedly, this is mostly AI-generated, so these benchmarks can lie more than usual.
-They should not be taken seriously at this stage :)
+The timed functions exclude graph construction. Each scale is built, measured,
+printed, and then the next scale starts. ``rxgraph-df`` uses the DataFrame API;
+``rxgraph-python`` uses ``Graph.from_edges``.
 """
 
-from __future__ import annotations
+# fmt: off
 
 import argparse
 import gc
@@ -19,207 +18,115 @@ from pathlib import Path
 from typing import Any
 
 import polars as pl
-
 import rxgraph as rxg
+from rich import box
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
-from benches.scenarios import (
-    GraphData,
-    algorithm_cases,
-    build_graph_data,
-    build_library_graphs,
-)
-
-
-@dataclass
-class TraversalData:
-    nodes: pl.DataFrame
-    edges: pl.DataFrame
-    node_count: int
-    edge_count: int
-    destination: int
+SAME = 1.05
+INIT = {"spent": 0, "hops": 0, "ready_at": 0, "risk": 0, "detours": 0}
 
 
-@dataclass
-class TraversalGraphs:
-    rxgraph: rxg.Graph
-    networkx: Any | None
-    igraph: Any | None
-    node_rows: list[dict[str, Any]]
-    edge_rows: list[dict[str, Any]]
-
-
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Scale:
     name: str
-    node_count: int
-    extra_edges: int
+    nodes: int
+    fanout: int
 
 
-@dataclass
-class BenchResult:
-    bench: str
-    algorithm: str
-    scale: str
-    library: str
-    node_count: int
-    edge_count: int
-    values: list[float]
-    result_size: int
+@dataclass(frozen=True, slots=True)
+class Data:
+    nodes: pl.DataFrame
+    edges: pl.DataFrame
+    target_node: int | None = None
+
+    @property
+    def target(self) -> int:
+        return self.target_node if self.target_node is not None else self.nodes.height - 1
+
+    @property
+    def pairs(self) -> list[tuple[int, int]]:
+        return list(zip(self.edges["src"].to_list(), self.edges["dest"].to_list()))
+
+
+@dataclass(frozen=True, slots=True)
+class Case:
+    alg: str
+    lib: str
+    run: Callable[[], Any]
+    norm: Callable[[Any], Any] = lambda value: value
+
+
+@dataclass(frozen=True, slots=True)
+class Result:
+    case: Case
+    scale: Scale
+    data: Data
+    times: list[float]
+    size: int
+
+    @property
+    def bench(self) -> str:
+        return f"{self.case.alg}/{self.scale.name}"
 
     @property
     def median(self) -> float:
-        return statistics.median(self.values)
+        return statistics.median(self.times)
 
     @property
     def best(self) -> float:
-        return min(self.values)
+        return min(self.times)
 
     @property
     def p90(self) -> float:
-        values = sorted(self.values)
-        index = math.ceil(len(values) * 0.9) - 1
-        return values[max(index, 0)]
+        return sorted(self.times)[max(math.ceil(len(self.times) * 0.9) - 1, 0)]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Benchmark rxgraph algorithms against NetworkX and igraph."
-    )
-    parser.add_argument(
-        "--low-nodes",
-        type=int,
-        default=10_000,
-        help="Node count for the low scale.",
-    )
-    parser.add_argument(
-        "--mid-nodes",
-        type=int,
-        default=100_000,
-        help="Node count for the mid scale.",
-    )
-    parser.add_argument(
-        "--high-nodes",
-        type=int,
-        default=1_000_000,
-        help="Node count for the high scale.",
-    )
-    parser.add_argument(
-        "--extra-edges",
-        type=int,
-        default=4,
-        help="Extra outgoing edge fanout for the high scale.",
-    )
-    parser.add_argument("--runs", type=int, default=15)
-    parser.add_argument("--warmups", type=int, default=3)
-    parser.add_argument(
-        "--json", type=Path, default=Path("dist/algorithm-benchmarks.json")
-    )
-    parser.add_argument("--max-paths", type=int, default=50)
-    parser.add_argument(
-        "--traversal-fanout",
-        type=int,
-        default=256,
-        help="Additional noisy outgoing edges added at each traversal stress point.",
-    )
-    args = parser.parse_args()
-
-    scales = build_scales(
-        args.low_nodes, args.mid_nodes, args.high_nodes, args.extra_edges
-    )
-    results = []
-
-    for scale in scales:
-        data = build_graph_data(scale.node_count, scale.extra_edges)
-        graphs = build_library_graphs(data)
-        for case in algorithm_cases(data, graphs):
-            results.append(
-                run_benchmark(
-                    case.name,
-                    scale.name,
-                    case.library,
-                    data,
-                    case.run,
-                    args.warmups,
-                    args.runs,
-                )
-            )
-        traversal_data = build_traversal_data(scale.node_count, args.traversal_fanout)
-        traversal_graphs = build_traversal_graphs(traversal_data)
-        for algorithm, library, func in build_traversal_benches(
-            traversal_data, traversal_graphs, args.max_paths
-        ):
-            results.append(
-                run_benchmark(
-                    algorithm,
-                    scale.name,
-                    library,
-                    GraphData(
-                        nodes=traversal_data.nodes,
-                        edges=traversal_data.edges,
-                        node_count=traversal_data.node_count,
-                        edge_count=traversal_data.edge_count,
-                        source=0,
-                        target=traversal_data.destination,
-                    ),
-                    func,
-                    args.warmups,
-                    args.runs,
-                )
-            )
-
-    write_pyperf_json(args.json, results)
-    print_report(results, scales, args.json)
+    args = args_parser().parse_args()
+    console = Console(width=max(Console().width, 160))
+    results: list[Result] = []
+    for scale in make_scales(args):
+        scale_results = run_scale(scale, args)
+        results += scale_results
+        print_table(console, scale, scale_results)
+    write_json(args.json, results)
+    console.print(f"[dim]pyperf JSON written to {args.json}[/dim]")
 
 
-def build_scales(
-    low_nodes: int, mid_nodes: int, high_nodes: int, extra_edges: int
-) -> list[Scale]:
-    low_nodes = max(low_nodes, 2)
-    mid_nodes = max(mid_nodes, low_nodes + 1)
-    high_nodes = max(high_nodes, mid_nodes + 1)
+def args_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Benchmark rxgraph algorithms.")
+    for name, default in [("low_nodes", 10_000), ("mid_nodes", 100_000), ("high_nodes", 1_000_000), ("extra_edges", 4), ("runs", 10), ("warmups", 3), ("max_paths", 50), ("traversal_fanout", 256)]:
+        p.add_argument(f"--{name.replace('_', '-')}", type=int, default=default)
+    p.add_argument("--json", type=Path, default=Path("dist/algorithm-benchmarks.json"))
+    return p
+
+
+def make_scales(args: argparse.Namespace) -> list[Scale]:
+    low, mid = max(args.low_nodes, 2), max(args.mid_nodes, args.low_nodes + 1)
+    high = max(args.high_nodes, mid + 1)
     return [
-        Scale("low", low_nodes, max(1, extra_edges // 2)),
-        Scale("mid", mid_nodes, max(1, (extra_edges * 3) // 4)),
-        Scale("high", high_nodes, max(1, extra_edges)),
+        Scale("low", low, max(1, args.extra_edges // 2)),
+        Scale("mid", mid, max(1, args.extra_edges * 3 // 4)),
+        Scale("high", high, max(1, args.extra_edges)),
     ]
 
 
-def build_traversal_data(node_count: int, traversal_fanout: int) -> TraversalData:
-    node_count = max(node_count, 2)
-    traversal_fanout = max(traversal_fanout, 0)
-    step = max(node_count // 18, 1)
-    destination = node_count - 1
+def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
+    simple, travel = simple_data(scale.nodes, scale.fanout), travel_data(scale.nodes, args.traversal_fanout)
+    cases = simple_cases(simple) + travel_cases(travel, args.max_paths)
+    return [measure(case, scale, travel if case.alg == "traversal" else simple, args.warmups, args.runs) for case in cases]
 
-    nodes = pl.DataFrame(
-        {
-            "id": range(node_count),
-            "risk": [(node * 7) % 9 for node in range(node_count)],
-            "min_connection": [35 + ((node * 11) % 50) for node in range(node_count)],
-            "closed": [
-                node != 0
-                and node + 1 != node_count
-                and node % 23 == 0
-                and node % step != 0
-                for node in range(node_count)
-            ],
-        },
-        schema={
-            "id": pl.UInt64,
-            "risk": pl.Int32,
-            "min_connection": pl.UInt64,
-            "closed": pl.Boolean,
-        },
-    )
 
-    src: list[int] = []
-    dest: list[int] = []
-    price: list[int] = []
-    departure: list[int] = []
-    arrival: list[int] = []
-    reliability: list[int] = []
-    route_kind: list[str] = []
-    detour_cost: list[int] = []
+def simple_data(n: int, fanout: int) -> Data:
+    main = max(2, n - max(1, n // 20))
+    edges = [(src, dst) for src in range(main - 1) for step in range(1, fanout + 2) if (dst := src + step) < main and (step == 1 or dst % step == 0)]
+    return Data(df({"id": range(n)}, {"id": pl.UInt64}), df({"src": [s for s, _ in edges], "dest": [d for _, d in edges]}, {"src": pl.UInt64, "dest": pl.UInt64}), main - 1)
 
+
+def travel_data(n: int, noise: int) -> Data:
+    step = max(n // 18, 1)
     strides = sorted(
         {
             1,
@@ -232,134 +139,259 @@ def build_traversal_data(node_count: int, traversal_fanout: int) -> TraversalDat
             max(step - 1, 1),
             step,
             step + 1,
-            max(node_count // 7, 1),
-            max(node_count // 5, 1),
+            max(n // 7, 1),
+            max(n // 5, 1),
         }
     )
-
-    for from_id in range(node_count - 1):
-        for stride in strides:
-            to = min(from_id + stride, node_count - 1)
-            if to == from_id:
-                continue
-            push_traversal_edge(
+    rows = []
+    for src in range(n - 1):
+        rows += [
+            flight(
                 src,
-                dest,
-                price,
-                departure,
-                arrival,
-                reliability,
-                route_kind,
-                detour_cost,
-                from_id,
-                to,
-                25 + ((stride * 3 + from_id) % 110),
-                92 if is_main_stride(stride, node_count, step) else 45,
+                min(src + st, n - 1),
+                25 + ((st * 3 + src) % 110),
+                92 if st in strides[-4:] else 45,
                 "route",
                 0,
             )
-
-        if is_stress_node(from_id, node_count, step):
-            for extra in range(traversal_fanout):
-                to = 1 + ((from_id + extra * 37 + 17) % (node_count - 1))
-                if to != from_id:
-                    is_valid = extra % 5 == 0
-                    push_traversal_edge(
-                        src,
-                        dest,
-                        price,
-                        departure,
-                        arrival,
-                        reliability,
-                        route_kind,
-                        detour_cost,
-                        from_id,
-                        to,
-                        20 + (extra % 50),
-                        95 if is_valid else 35 + (extra % 30),
-                        "route" if is_valid else "skip",
-                        1 if is_valid else 0,
-                    )
-
-    edges = pl.DataFrame(
-        {
-            "src": src,
-            "dest": dest,
-            "price": price,
-            "departure": departure,
-            "arrival": arrival,
-            "reliability": reliability,
-            "route_kind": route_kind,
-            "detour_cost": detour_cost,
-        },
-        schema={
-            "src": pl.UInt64,
-            "dest": pl.UInt64,
-            "price": pl.UInt64,
-            "departure": pl.UInt64,
-            "arrival": pl.UInt64,
-            "reliability": pl.Int32,
-            "route_kind": pl.String,
-            "detour_cost": pl.UInt64,
-        },
+            for st in strides
+            if min(src + st, n - 1) != src
+        ]
+        if src % step == 0 or src % max(n // 5, 1) == 0 or src % max(n // 7, 1) == 0:
+            rows += [
+                flight(
+                    src,
+                    dst,
+                    20 + i % 50,
+                    95 if i % 5 == 0 else 35 + i % 30,
+                    "route" if i % 5 == 0 else "skip",
+                    int(i % 5 == 0),
+                )
+                for i in range(max(noise, 0))
+                if (dst := 1 + ((src + i * 37 + 17) % (n - 1))) != src
+            ]
+    return Data(
+        df(
+            {
+                "id": range(n),
+                "risk": [(i * 7) % 9 for i in range(n)],
+                "min_connection": [35 + ((i * 11) % 50) for i in range(n)],
+                "closed": [
+                    i not in {0, n - 1} and i % 23 == 0 and i % step != 0
+                    for i in range(n)
+                ],
+            },
+            {
+                "id": pl.UInt64,
+                "risk": pl.Int32,
+                "min_connection": pl.UInt64,
+                "closed": pl.Boolean,
+            },
+        ),
+        df(
+            rows,
+            {
+                "src": pl.UInt64,
+                "dest": pl.UInt64,
+                "price": pl.UInt64,
+                "departure": pl.UInt64,
+                "arrival": pl.UInt64,
+                "reliability": pl.Int32,
+                "route_kind": pl.String,
+                "detour_cost": pl.UInt64,
+            },
+        ),
     )
 
-    return TraversalData(nodes, edges, node_count, len(src), destination)
+
+def df(data: Any, schema: dict[str, Any]) -> pl.DataFrame:
+    return pl.DataFrame(data, schema=schema)
 
 
-def build_traversal_graphs(data: TraversalData) -> TraversalGraphs:
-    rx_graph = rxg.Graph([("airport", data.nodes)], [("flight", data.edges)])
-    node_rows = data.nodes.to_dicts()
-    edge_rows = data.edges.to_dicts()
+def flight(
+    src: int, dst: int, price: int, reliability: int, kind: str, detour: int
+) -> dict[str, int | str]:
+    depart = src * 120 + (dst % 9) * 7
+    return {
+        "src": src,
+        "dest": dst,
+        "price": price,
+        "departure": depart,
+        "arrival": depart + 45 + ((dst * 13 + src) % 240),
+        "reliability": reliability,
+        "route_kind": kind,
+        "detour_cost": detour,
+    }
 
-    nx_graph = None
-    try:
+
+def simple_cases(data: Data) -> list[Case]:
+    return [
+        case
+        for lib, graph in simple_graphs(data).items()
+        for case in alg_cases(lib, graph, data)
+    ]
+
+
+def simple_graphs(data: Data) -> dict[str, Any]:
+    graphs = {
+        "rxgraph-df": rxg.Graph([("n", data.nodes)], [("e", data.edges)]),
+        "rxgraph-python": rxg.Graph.from_edges(
+            data.pairs, nodes=range(data.nodes.height)
+        ),
+    }
+    if nx := opt("networkx"):
+        graphs["networkx"] = nx.MultiDiGraph()
+        graphs["networkx"].add_nodes_from(range(data.nodes.height))
+        graphs["networkx"].add_edges_from(data.pairs)
+    if ig := opt("igraph"):
+        graphs["igraph"] = ig.Graph(
+            n=data.nodes.height, edges=data.pairs, directed=True
+        )
+    return graphs
+
+
+def alg_cases(lib: str, graph: Any, data: Data) -> list[Case]:
+    if is_rx(lib):
+        return [
+            Case("bfs", lib, lambda: graph.bfs(0), set),
+            Case(
+                "shortest_path",
+                lib,
+                lambda: graph.shortest_path(0, data.target),
+                path_sig,
+            ),
+            Case("degrees", lib, graph.degrees),
+            Case("weak_components", lib, graph.weakly_connected_components, comp_sig),
+        ]
+    if lib == "networkx":
         import networkx as nx
 
-        nx_graph = nx.MultiDiGraph()
-        for node in node_rows:
-            nx_graph.add_node(node["id"], **node)
-        for edge_id, edge in enumerate(edge_rows):
-            nx_graph.add_edge(edge["src"], edge["dest"], edge_id=edge_id, **edge)
-    except ImportError:
-        pass
+        return [
+            Case("bfs", lib, lambda: list(nx.bfs_tree(graph, 0).nodes()), set),
+            Case(
+                "shortest_path",
+                lib,
+                lambda: nx.shortest_path(graph, 0, data.target),
+                path_sig,
+            ),
+            Case("degrees", lib, lambda: [d for _, d in graph.degree()]),
+            Case(
+                "weak_components",
+                lib,
+                lambda: [list(c) for c in nx.weakly_connected_components(graph)],
+                comp_sig,
+            ),
+        ]
+    return [
+        Case("bfs", lib, lambda: graph.bfs(0, mode="out")[0], set),
+        Case(
+            "shortest_path",
+            lib,
+            lambda: graph.get_shortest_paths(
+                0, to=data.target, mode="out", output="vpath"
+            )[0],
+            path_sig,
+        ),
+        Case("degrees", lib, lambda: graph.degree(mode="all")),
+        Case(
+            "weak_components",
+            lib,
+            lambda: [list(c) for c in graph.connected_components(mode="weak")],
+            comp_sig,
+        ),
+    ]
 
-    ig_graph = None
-    try:
-        import igraph as ig
 
-        ig_graph = ig.Graph(
-            n=data.node_count,
-            edges=[(edge["src"], edge["dest"]) for edge in edge_rows],
+def travel_cases(data: Data, max_paths: int) -> list[Case]:
+    nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
+    graphs, kernel = travel_graphs(data, nodes, edges), travel_kernel(data.target)
+    traversal = rxg.Traversal(kernel, [0], 18, max_paths, "dfs")
+    cases = [
+        Case(
+            "traversal",
+            "rxgraph-df",
+            lambda: graphs["rxgraph-df"].search(traversal).paths,
+        ),
+        Case(
+            "traversal",
+            "rxgraph-python",
+            lambda: graphs["rxgraph-python"].search(traversal).paths,
+        ),
+    ]
+    if nxg := graphs.get("networkx"):
+        cases.append(
+            Case(
+                "traversal",
+                "networkx",
+                lambda: py_travel(
+                    lambda n: ((d, e) for _, d, e in nxg.out_edges(n, data=True)),
+                    lambda n: nxg.nodes[n],
+                    data.target,
+                    max_paths,
+                ),
+            )
+        )
+    if igg := graphs.get("igraph"):
+        cases.append(
+            Case(
+                "traversal",
+                "igraph",
+                lambda: py_travel(
+                    lambda n: (
+                        (e.target, e.attributes()) for e in igg.es.select(_source=n)
+                    ),
+                    lambda n: igg.vs[n].attributes(),
+                    data.target,
+                    max_paths,
+                ),
+            )
+        )
+    return cases
+
+
+def travel_graphs(
+    data: Data, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
+) -> dict[str, Any]:
+    graphs = {
+        "rxgraph-df": rxg.Graph([("airport", data.nodes)], [("flight", data.edges)]),
+        "rxgraph-python": rxg.Graph.from_edges(
+            [(e["src"], e["dest"], omit(e, "src", "dest")) for e in edges],
+            nodes=[(n["id"], omit(n, "id")) for n in nodes],
+        ),
+    }
+    if nx := opt("networkx"):
+        graphs["networkx"] = nx.MultiDiGraph()
+        graphs["networkx"].add_nodes_from((n["id"], n) for n in nodes)
+        for i, e in enumerate(edges):
+            graphs["networkx"].add_edge(e["src"], e["dest"], edge_id=i, **e)
+    if ig := opt("igraph"):
+        graphs["igraph"] = ig.Graph(
+            n=data.nodes.height,
+            edges=[(e["src"], e["dest"]) for e in edges],
             directed=True,
         )
-        for key in node_rows[0]:
-            ig_graph.vs[key] = [node[key] for node in node_rows]
-        for key in edge_rows[0]:
-            ig_graph.es[key] = [edge[key] for edge in edge_rows]
-    except ImportError:
-        pass
-
-    return TraversalGraphs(rx_graph, nx_graph, ig_graph, node_rows, edge_rows)
+        for key in nodes[0]:
+            graphs["igraph"].vs[key] = [n[key] for n in nodes]
+        for key in edges[0]:
+            graphs["igraph"].es[key] = [e[key] for e in edges]
+    return graphs
 
 
-def build_traversal_benches(
-    data: TraversalData, graphs: TraversalGraphs, max_paths: int
-) -> list[tuple[str, str, Callable[[], Any]]]:
-    s = lambda name: pl.col(f"state.{name}")
-    d = lambda name: pl.col(f"dest.{name}")
-    e = lambda name: pl.col(f"edge.{name}")
-    kernel = rxg.Kernel(
-        visit=(
-            (s("detours") == 0)
-            & (~d("closed"))
-            & (e("reliability") >= 70)
-            & (e("route_kind") != "skip")
-            & (s("hops") < 18)
-            & ((s("spent") + e("price")) <= 950)
-            & (e("departure") >= s("ready_at"))
-            & ((s("risk") + d("risk")) <= 90)
-        ),
+def travel_kernel(target: int) -> rxg.Kernel:
+    s, d, e = (
+        (lambda n: rxg.col(f"state.{n}")),
+        (lambda n: rxg.col(f"dest.{n}")),
+        (lambda n: rxg.col(f"edge.{n}")),
+    )
+    return rxg.Kernel(
+        visit=(s("detours") == 0)
+        & ~d("closed")
+        & (e("reliability") >= 70)
+        & (e("route_kind") != "skip")
+        & (s("hops") < 18)
+        & ((s("spent") + e("price")) <= 950)
+        & (e("departure") >= s("ready_at"))
+        & ((s("risk") + d("risk")) <= 90),
         next_state={
             "spent": s("spent") + e("price"),
             "hops": s("hops") + 1,
@@ -367,129 +399,40 @@ def build_traversal_benches(
             "risk": s("risk") + d("risk"),
             "detours": s("detours") + e("detour_cost"),
         },
-        stop=pl.col("dest.id") == data.destination,
-        initial_state={"spent": 0, "hops": 0, "ready_at": 0, "risk": 0, "detours": 0},
-    )
-    traversal = rxg.Traversal(kernel, [0], 18, max_paths, "dfs")
-    benches: list[tuple[str, str, Callable[[], Any]]] = [
-        ("traversal", "rxgraph", lambda: graphs.rxgraph.search(traversal).paths)
-    ]
-
-    if graphs.networkx is not None:
-        nx_graph = graphs.networkx
-        benches.append(
-            (
-                "traversal",
-                "networkx",
-                lambda: traversal_python_dfs(
-                    lambda node: (
-                        (dest, edge)
-                        for _, dest, edge in nx_graph.out_edges(node, data=True)
-                    ),
-                    lambda node: nx_graph.nodes[node],
-                    data.destination,
-                    max_paths,
-                ),
-            )
-        )
-
-    if graphs.igraph is not None:
-        ig_graph = graphs.igraph
-        benches.append(
-            (
-                "traversal",
-                "igraph",
-                lambda: traversal_python_dfs(
-                    lambda node: (
-                        (edge.target, edge.attributes())
-                        for edge in ig_graph.es.select(_source=node)
-                    ),
-                    lambda node: ig_graph.vs[node].attributes(),
-                    data.destination,
-                    max_paths,
-                ),
-            )
-        )
-
-    return benches
-
-
-def push_traversal_edge(
-    src: list[int],
-    dest: list[int],
-    price: list[int],
-    departure: list[int],
-    arrival: list[int],
-    reliability: list[int],
-    route_kind: list[str],
-    detour_cost: list[int],
-    from_id: int,
-    to: int,
-    fare: int,
-    reliability_score: int,
-    kind: str,
-    detour: int,
-) -> None:
-    depart = from_id * 120 + ((to % 9) * 7)
-    flight_time = 45 + ((to * 13 + from_id) % 240)
-    src.append(from_id)
-    dest.append(to)
-    price.append(fare)
-    departure.append(depart)
-    arrival.append(depart + flight_time)
-    reliability.append(reliability_score)
-    route_kind.append(kind)
-    detour_cost.append(detour)
-
-
-def is_main_stride(stride: int, count: int, step: int) -> bool:
-    return stride in {step, step + 1, max(count // 5, 1), max(count // 7, 1)}
-
-
-def is_stress_node(node: int, count: int, step: int) -> bool:
-    return (
-        node % step == 0
-        or node % max(count // 5, 1) == 0
-        or node % max(count // 7, 1) == 0
+        stop=rxg.col("dest.id") == target,
+        initial_state=INIT,
     )
 
 
-def traversal_python_dfs(
-    out_edges: Any, node_data: Any, destination: int, max_paths: int
+def py_travel(
+    out_edges: Callable[[int], Any],
+    node_data: Callable[[int], dict[str, Any]],
+    target: int,
+    max_paths: int,
 ) -> list[int]:
-    frontier = [
-        (0, (0,), {"spent": 0, "hops": 0, "ready_at": 0, "risk": 0, "detours": 0})
-    ]
-    paths: list[int] = []
-
+    frontier, paths = [(0, (0,), INIT)], []
     while frontier and len(paths) < max_paths:
         node, path, state = frontier.pop()
-        for dest, edge in out_edges(node):
-            if dest in path:
-                continue
-            dest_data = node_data(dest)
-            if not traversal_visit(dest_data, edge, state):
+        for dst, edge in out_edges(node):
+            dest = node_data(dst)
+            if dst in path or not visit(dest, edge, state):
                 continue
             next_state = {
                 "spent": state["spent"] + edge["price"],
                 "hops": state["hops"] + 1,
-                "ready_at": edge["arrival"] + dest_data["min_connection"],
-                "risk": state["risk"] + dest_data["risk"],
+                "ready_at": edge["arrival"] + dest["min_connection"],
+                "risk": state["risk"] + dest["risk"],
                 "detours": state["detours"] + edge["detour_cost"],
             }
-            if dest == destination:
-                paths.append(dest)
-                if len(paths) >= max_paths:
-                    break
-            else:
-                frontier.append((dest, (*path, dest), next_state))
-
+            paths.append(dst) if dst == target else frontier.append(
+                (dst, (*path, dst), next_state)
+            )
+            if len(paths) >= max_paths:
+                break
     return paths
 
 
-def traversal_visit(
-    dest: dict[str, Any], edge: dict[str, Any], state: dict[str, int]
-) -> bool:
+def visit(dest: dict[str, Any], edge: dict[str, Any], state: dict[str, int]) -> bool:
     return (
         state["detours"] == 0
         and not dest["closed"]
@@ -502,229 +445,204 @@ def traversal_visit(
     )
 
 
-def run_benchmark(
-    algorithm: str,
-    scale: str,
-    library: str,
-    data: GraphData,
-    func: Callable[[], Any],
-    warmups: int,
-    runs: int,
-) -> BenchResult:
+def measure(case: Case, scale: Scale, data: Data, warmups: int, runs: int) -> Result:
     result = None
     for _ in range(warmups):
-        result = func()
-
-    gc_was_enabled = gc.isenabled()
+        result = case.run()
+    gc_enabled, values = gc.isenabled(), []
     gc.disable()
     try:
-        values = []
         for _ in range(runs):
             gc.collect()
-            started = time.perf_counter()
-            result = func()
-            elapsed = time.perf_counter() - started
-            values.append(elapsed)
+            start = time.perf_counter()
+            result = case.run()
+            values.append(time.perf_counter() - start)
     finally:
-        if gc_was_enabled:
-            gc.enable()
-
-    return BenchResult(
-        bench=f"{algorithm}/{scale}",
-        algorithm=algorithm,
-        scale=scale,
-        library=library,
-        node_count=data.node_count,
-        edge_count=data.edge_count,
-        values=values,
-        result_size=result_size(result),
+        gc.enable() if gc_enabled else None
+    return Result(
+        case,
+        scale,
+        data,
+        values,
+        len(result) if isinstance(result, list) else int(result is not None),
     )
 
 
-def result_size(result: Any) -> int:
-    if result is None:
-        return 0
-    if isinstance(result, list):
-        return len(result)
-    return 1
+def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
+    table = Table(title=f"rxgraph benchmarks: {scale.name}", box=box.ROUNDED)
+    for name, justify in [
+        ("Bench", "left"),
+        ("Library", "left"),
+        ("Median", "right"),
+        ("P90", "right"),
+        ("Best", "right"),
+        ("rxgraph speedup", "right"),
+        ("Graph", "right"),
+        ("Result size", "right"),
+    ]:
+        table.add_column(name, justify=justify, no_wrap=True)
+    best, baselines = best_by_bench(results), rx_baselines(results)
+    ordered = sorted(results, key=sort_key)
+    for i, r in enumerate(ordered):
+        is_best = r.case.lib == best[r.bench]
+        lib = Text(
+            f"{r.case.lib} (best)" if is_best else r.case.lib,
+            style="bold green"
+            if is_best
+            else ("bold cyan" if is_rx(r.case.lib) else ""),
+        )
+        table.add_row(
+            r.bench,
+            lib,
+            fmt_time(r.median),
+            fmt_time(r.p90),
+            fmt_time(r.best),
+            speed(r, baselines[r.bench]),
+            f"{fmt_count(r.data.nodes.height)}n/{fmt_count(r.data.edges.height)}e",
+            fmt_count(r.size),
+            end_section=i + 1 < len(ordered) and ordered[i + 1].case.alg != r.case.alg,
+            style="bold" if is_rx(r.case.lib) else None,
+        )
+    console.print(
+        f"[bold]Workload[/bold]: {scale.name}={fmt_count(scale.nodes)} nodes/fanout {scale.fanout}"
+    )
+    console.print(table)
 
 
-def write_pyperf_json(path: Path, results: list[BenchResult]) -> None:
+def write_json(path: Path, results: list[Result]) -> None:
     import pyperf
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    benchmarks = []
+    pyperf.BenchmarkSuite(
+        [
+            pyperf.Benchmark(
+                [
+                    pyperf.Run(
+                        r.times,
+                        metadata={
+                            "name": f"{r.bench}:{r.case.lib}",
+                            "unit": "second",
+                            "loops": 1,
+                            "algorithm": r.case.alg,
+                            "scale": r.scale.name,
+                            "node_count": r.data.nodes.height,
+                            "edge_count": r.data.edges.height,
+                            "result_size": r.size,
+                        },
+                        collect_metadata=False,
+                    )
+                ]
+            )
+            for r in results
+        ]
+    ).dump(str(path), replace=True)
 
-    for result in results:
-        run = pyperf.Run(
-            result.values,
-            metadata={
-                "name": f"{result.bench}:{result.library}",
-                "unit": "second",
-                "loops": 1,
-                "algorithm": result.algorithm,
-                "scale": result.scale,
-                "node_count": result.node_count,
-                "edge_count": result.edge_count,
-                "result_size": result.result_size,
-            },
-            collect_metadata=False,
-        )
-        benchmarks.append(pyperf.Benchmark([run]))
 
-    pyperf.BenchmarkSuite(benchmarks).dump(str(path), replace=True)
+def sort_key(r: Result) -> tuple[str, int, float]:
+    return r.case.alg, lib_order(r.case.lib), r.median
 
 
-def print_report(
-    results: list[BenchResult], scales: list[Scale], json_path: Path
-) -> None:
-    try:
-        from rich.console import Console
-        from rich.table import Table
-        from rich.text import Text
-    except ImportError:
-        print_plain_report(results, scales, json_path)
-        return
-
-    console = Console(width=max(Console().width, 160))
-    table = Table(title="rxgraph algorithm benchmarks")
-    table.add_column("Bench", no_wrap=True)
-    table.add_column("Library", no_wrap=True)
-    table.add_column("Median", justify="right", no_wrap=True)
-    table.add_column("P90", justify="right", no_wrap=True)
-    table.add_column("Best", justify="right", no_wrap=True)
-    table.add_column("rxgraph speedup", justify="right", no_wrap=True)
-    table.add_column("Graph", justify="right", no_wrap=True)
-    table.add_column("Result size", justify="right", no_wrap=True)
-
-    baselines = {
-        result.bench: result.median for result in results if result.library == "rxgraph"
+def best_by_bench(results: list[Result]) -> dict[str, str]:
+    by_bench = {r.bench: [] for r in results}
+    for r in results:
+        by_bench[r.bench].append(r)
+    return {
+        bench: min(rows, key=lambda r: (r.median, lib_order(r.case.lib))).case.lib
+        for bench, rows in by_bench.items()
     }
-    best_p90s = best_p90_by_bench(results)
-
-    ordered_results = sorted(results, key=report_sort_key)
-    for index, result in enumerate(ordered_results):
-        baseline = baselines.get(result.bench)
-        speedup = ""
-        speedup_cell: str | Text = ""
-        if baseline is not None:
-            ratio = result.median / baseline
-            speedup = f"{ratio:.1f}x"
-            speedup_cell = Text(speedup, style=speedup_style(result.library, ratio))
-        library = result.library
-        if result.p90 == best_p90s[result.bench]:
-            library = f"{library} (best)"
-        library_cell: str | Text = library
-        if result.library == "rxgraph":
-            library_cell = Text(library, style="bold cyan")
-        next_result = (
-            ordered_results[index + 1] if index + 1 < len(ordered_results) else None
-        )
-        table.add_row(
-            result.bench,
-            library_cell,
-            format_seconds(result.median),
-            format_seconds(result.p90),
-            format_seconds(result.best),
-            speedup_cell,
-            f"{result.node_count:,}n/{result.edge_count:,}e",
-            str(result.result_size),
-            end_section=next_result is not None
-            and next_result.algorithm != result.algorithm,
-            style="bold" if result.library == "rxgraph" else None,
-        )
-
-    console.print(
-        "[bold]Workloads[/bold]: "
-        + ", ".join(
-            f"{scale.name}={scale.node_count:,} nodes/fanout {scale.extra_edges}"
-            for scale in scales
-        )
-        + ". Synthetic data generation and graph construction are excluded from timings."
-    )
-    console.print(table)
-    console.print(f"[dim]pyperf JSON written to {json_path}[/dim]")
 
 
-def print_plain_report(
-    results: list[BenchResult], scales: list[Scale], json_path: Path
-) -> None:
-    scale_summary = ", ".join(
-        f"{scale.name}={scale.node_count:,} nodes/fanout {scale.extra_edges}"
-        for scale in scales
-    )
-    print(f"Workloads: {scale_summary}")
-    baselines = {
-        result.bench: result.median for result in results if result.library == "rxgraph"
+def lib_order(library: str) -> int:
+    return {"rxgraph-df": 0, "rxgraph-python": 1, "igraph": 2, "networkx": 3}.get(library, 99)
+
+
+def rx_baselines(results: list[Result]) -> dict[str, float]:
+    return {
+        b: next(r.median for r in results if r.bench == b and r.case.lib == "rxgraph-df")
+        for b in {r.bench for r in results}
     }
-    best_p90s = best_p90_by_bench(results)
-    previous_algorithm = None
-    for result in sorted(results, key=report_sort_key):
-        if previous_algorithm is not None and result.algorithm != previous_algorithm:
-            print()
-        previous_algorithm = result.algorithm
-        baseline = baselines.get(result.bench)
-        speedup = "n/a" if baseline is None else f"{result.median / baseline:.1f}x"
-        library = result.library
-        if result.p90 == best_p90s[result.bench]:
-            library = f"{library} (best)"
-        print(
-            f"{result.bench:22} {library:17} "
-            f"median={format_seconds(result.median):>10} "
-            f"p90={format_seconds(result.p90):>10} "
-            f"best={format_seconds(result.best):>10} "
-            f"rxgraph_speedup={speedup:>7} "
-            f"graph={result.node_count:,}n/{result.edge_count:,}e "
-            f"size={result.result_size}"
+
+
+def plain_speedup(r: Result, baseline: float) -> str:
+    ratio = r.median / baseline
+    if 1 / SAME < ratio < SAME:
+        return "baseline" if r.case.lib == "rxgraph-df" else "same"
+    return f"{(1 / ratio if ratio < 1 else ratio):.1f}x {'faster' if ratio < 1 else 'slower'}"
+
+
+def speed(r: Result, baseline: float) -> Text:
+    label, ratio = plain_speedup(r, baseline), r.median / baseline
+    fast, ratio = ratio < 1, (1 / ratio if ratio < 1 else ratio)
+    style = (
+        "bold"
+        if label == "baseline"
+        else ""
+        if label == "same"
+        else (
+            "bold bright_green"
+            if fast and ratio >= 10
+            else "green"
+            if fast and ratio >= 2
+            else "dim green"
+            if fast
+            else "bold bright_red"
+            if ratio >= 10
+            else "red"
+            if ratio >= 2
+            else "dim red"
         )
-    print(f"pyperf JSON written to {json_path}")
+    )
+    return Text(label, style=style)
 
 
-def report_sort_key(result: BenchResult) -> tuple[str, int, int, float]:
-    scale_order = {"low": 0, "mid": 1, "high": 2}
+def fmt_count(value: int) -> str:
+    for suffix, unit in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
+        if abs(value) >= unit:
+            scaled = value / unit
+            return (
+                f"{scaled:.0f}{suffix}"
+                if scaled >= 10 or scaled.is_integer()
+                else f"{scaled:.1f}{suffix}"
+            )
+    return str(value)
+
+
+format_count = fmt_count
+
+
+def fmt_time(value: float) -> str:
     return (
-        result.algorithm,
-        scale_order.get(result.scale, 99),
-        0 if result.library == "rxgraph" else 1,
-        result.median,
+        f"{value * 1e9:.1f} ns"
+        if value < 1e-6
+        else f"{value * 1e6:.1f} us"
+        if value < 1e-3
+        else f"{value * 1e3:.1f} ms"
+        if value < 1
+        else f"{value:.2f} s"
     )
 
 
-def best_p90_by_bench(results: list[BenchResult]) -> dict[str, float]:
-    best: dict[str, float] = {}
-    for result in results:
-        current = best.get(result.bench)
-        if current is None or result.p90 < current:
-            best[result.bench] = result.p90
-    return best
+def path_sig(path: list[int] | None) -> tuple[int, int, int] | None:
+    return None if not path else (path[0], path[-1], len(path))
 
 
-def speedup_style(library: str, ratio: float) -> str:
-    if library == "rxgraph":
-        return "bold"
-    if ratio >= 10:
-        return "bold bright_green"
-    if ratio >= 2:
-        return "green"
-    if ratio > 1:
-        return "dim green"
-    if ratio <= 0.5:
-        return "bold bright_red"
-    if ratio < 1:
-        return "red"
-    return ""
+def comp_sig(components: list[list[int]]) -> list[list[int]]:
+    return sorted(sorted(c) for c in components)
 
 
-def format_seconds(value: float) -> str:
-    if math.isnan(value):
-        return "n/a"
-    if value < 1e-6:
-        return f"{value * 1e9:.1f} ns"
-    if value < 1e-3:
-        return f"{value * 1e6:.1f} us"
-    if value < 1:
-        return f"{value * 1e3:.1f} ms"
-    return f"{value:.2f} s"
+def omit(row: dict[str, Any], *keys: str) -> dict[str, Any]:
+    return {k: v for k, v in row.items() if k not in keys}
+
+
+def opt(name: str) -> Any | None:
+    try:
+        return __import__(name)
+    except ImportError:
+        return None
+
+
+def is_rx(library: str) -> bool:
+    return library.startswith("rxgraph")
 
 
 if __name__ == "__main__":
