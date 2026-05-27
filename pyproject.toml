@@ -1,5 +1,5 @@
 [build-system]
-requires = ["maturin>=1.13,<2.0"]
+requires = ["maturin>=1.13,<1.14"]
 build-backend = "maturin"
 
 [project]
@@ -11,12 +11,22 @@ classifiers = [
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
-dependencies = ["polars>=1.8.2"]
+dependencies = ["polars>=1.8.2,<1.41"]
 
 [tool.maturin]
+manifest-path = "crates/rxgraph-python/Cargo.toml"
+module-name = "rxgraph._rxgraph"
 python-source = "python"
 
 [tool.ruff.lint]
 ignore = [
     "E731", # Do not assign a `lambda` expression, use a `def`
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13,<1.14",
+    "prek>=0.4,<0.5",
+    "pytest>=8.3,<9.1",
+    "ruff>=0.15,<0.16",
 ]

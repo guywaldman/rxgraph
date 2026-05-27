@@ -17,10 +17,8 @@ class Graph:
 
     @property
     def node_count(self) -> int: ...
-
     @property
     def edge_count(self) -> int: ...
-
     def search(self, traversal: Traversal) -> SearchResult:
         """Run a traversal and return stopped paths plus traversal stats."""
         ...

@@ -107,9 +107,7 @@ def main() -> None:
             bench_igraph(workload, args.max_paths, args.runs),
         ]
     )
-    print_results(
-        results
-    )
+    print_results(results)
 
 
 def bench_rxgraph(
@@ -124,8 +122,8 @@ def bench_rxgraph(
 ) -> BenchResult:
     started = time.perf_counter()
     graph = rxg.Graph(
-        [("airport", workload.airports.to_arrow())],
-        [("flight", workload.flights.to_arrow())],
+        [("airport", workload.airports)],
+        [("flight", workload.flights)],
     )
     build = time.perf_counter() - started
 

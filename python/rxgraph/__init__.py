@@ -1,4 +1,4 @@
-from .rxgraph import Graph, Kernel, SearchPath, SearchResult, SearchStats, Traversal  # ty:ignore[unresolved-import]
+from ._rxgraph import Graph, Kernel, SearchPath, SearchResult, SearchStats, Traversal  # ty:ignore[unresolved-import]
 
 __all__ = [
     "Graph",

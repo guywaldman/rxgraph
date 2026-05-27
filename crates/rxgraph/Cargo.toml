@@ -1,0 +1,35 @@
+[package]
+name = "rxgraph"
+version = "0.0.4"
+edition.workspace = true
+rust-version.workspace = true
+description = "Arrow-backed graph traversal engine"
+license = "MIT"
+repository.workspace = true
+readme = "README.md"
+keywords = ["arrow", "graph", "traversal", "polars"]
+categories = ["algorithms", "data-structures"]
+include = [
+    "Cargo.toml",
+    "README.md",
+    "src/**/*.rs",
+    "examples/**/*.rs",
+    "benches/**/*.rs",
+]
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+rand.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sprs.workspace = true
+stats_alloc.workspace = true
+
+[[bench]]
+name = "flight_routes"
+harness = false
+
+[dev-dependencies]
+criterion.workspace = true

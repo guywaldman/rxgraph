@@ -10,7 +10,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
     array::{
         Array, ArrayRef, BooleanArray, Int32Array, Int64Array, LargeStringArray, StringArray,
-        UInt64Array,
+        StringViewArray, UInt64Array,
     },
     datatypes::DataType,
 };
@@ -235,6 +235,7 @@ enum ColumnReader {
     U64(UInt64Array),
     Utf8(StringArray),
     LargeUtf8(LargeStringArray),
+    Utf8View(StringViewArray),
 }
 
 impl DslKernel {
@@ -412,7 +413,7 @@ impl BoundColumn {
                 let reader = readers
                     .get(row.table)
                     .and_then(Option::as_ref)
-                    .with_context(|| format!("edge table missing bound reader"))?;
+                    .with_context(|| "edge table missing bound reader".to_string())?;
                 reader.value(row.row)
             }
         }
@@ -452,7 +453,7 @@ fn read_node(graph: &Graph, readers: &[Option<ColumnReader>], node: NodeId) -> R
     let reader = readers
         .get(row.table)
         .and_then(Option::as_ref)
-        .with_context(|| format!("node table missing bound reader"))?;
+        .with_context(|| "node table missing bound reader".to_string())?;
     reader.value(row.row)
 }
 
@@ -475,6 +476,7 @@ impl ColumnReader {
             DataType::UInt64 => reader!(U64, UInt64Array),
             DataType::Utf8 => reader!(Utf8, StringArray),
             DataType::LargeUtf8 => reader!(LargeUtf8, LargeStringArray),
+            DataType::Utf8View => reader!(Utf8View, StringViewArray),
             typ => bail!("unsupported DSL column type for {name:?}: {typ:?}"),
         })
     }
@@ -509,6 +511,13 @@ impl ColumnReader {
                 }
             }
             Self::LargeUtf8(array) => {
+                if array.is_null(row) {
+                    Ok(Scalar::Null)
+                } else {
+                    Ok(Scalar::Str(Arc::from(array.value(row))))
+                }
+            }
+            Self::Utf8View(array) => {
                 if array.is_null(row) {
                     Ok(Scalar::Null)
                 } else {

@@ -1282,14 +1282,22 @@ dependencies = [
  "anyhow",
  "arrow",
  "criterion",
- "pyo3",
- "pyo3-arrow",
  "rand",
  "rayon",
  "serde",
  "serde_json",
  "sprs",
  "stats_alloc",
+]
+
+[[package]]
+name = "rxgraph-python"
+version = "0.0.4"
+dependencies = [
+ "anyhow",
+ "pyo3",
+ "pyo3-arrow",
+ "rxgraph",
 ]
 
 [[package]]

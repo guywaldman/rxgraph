@@ -26,7 +26,7 @@ def test_polars_kernel_traversal() -> None:
             "kind": pl.String,
         },
     )
-    graph = rxg.Graph([("n", nodes.to_arrow())], [("e", edges.to_arrow())])
+    graph = rxg.Graph([("n", nodes)], [("e", edges)])
 
     s = lambda name: pl.col(f"state.{name}")
     d = lambda name: pl.col(f"dest.{name}")
@@ -58,7 +58,7 @@ def test_parallel_bfs_matches_serial_bfs() -> None:
         {"src": [0, 0, 1, 2], "dest": [1, 2, 3, 3]},
         schema={"src": pl.UInt64, "dest": pl.UInt64},
     )
-    graph = rxg.Graph([("n", nodes.to_arrow())], [("e", edges.to_arrow())])
+    graph = rxg.Graph([("n", nodes)], [("e", edges)])
     kernel = rxg.Kernel(
         visit=~pl.col("dest.closed"),
         next_state={},
@@ -88,7 +88,7 @@ def test_graph_schema_errors_are_informative() -> None:
         ValueError,
         match='node table "n" column "id" must have Arrow type UInt64',
     ):
-        rxg.Graph([("n", nodes.to_arrow())], [("e", edges.to_arrow())])
+        rxg.Graph([("n", nodes)], [("e", edges)])
 
 
 def test_kernel_schema_errors_are_informative() -> None:
@@ -100,7 +100,7 @@ def test_kernel_schema_errors_are_informative() -> None:
         {"src": [0], "dest": [1]},
         schema={"src": pl.UInt64, "dest": pl.UInt64},
     )
-    graph = rxg.Graph([("n", nodes.to_arrow())], [("e", edges.to_arrow())])
+    graph = rxg.Graph([("n", nodes)], [("e", edges)])
     kernel = rxg.Kernel(
         visit=pl.col("edge.price") > 0,
         next_state={},
