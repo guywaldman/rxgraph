@@ -12,3 +12,6 @@ dev: venv
 
 test: dev
     {{python}} -m pytest
+
+bench-python: dev
+    {{python}} scripts/bench_python.py

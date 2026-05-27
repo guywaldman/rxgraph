@@ -1,3 +1,10 @@
-from .rxgraph import Graph, Schema, SchemaField  # ty:ignore[unresolved-import]
+from .rxgraph import Graph, Kernel, SearchPath, SearchResult, SearchStats, Traversal  # ty:ignore[unresolved-import]
 
-__all__ = ["Graph", "Schema", "SchemaField"]
+__all__ = [
+    "Graph",
+    "Kernel",
+    "SearchPath",
+    "SearchResult",
+    "SearchStats",
+    "Traversal",
+]
