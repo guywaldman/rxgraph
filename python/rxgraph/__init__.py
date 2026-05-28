@@ -102,7 +102,64 @@ class Graph:
         except KeyError as exc:
             raise ValueError(f"node label {label!r} is not present in the graph") from exc
 
-    def search(self, traversal: "Traversal") -> "SearchResult":
+    def search(
+        self,
+        traversal: "Traversal | None" = None,
+        *,
+        start_nodes: Iterable[Hashable] | None = None,
+        visit: Any | None = None,
+        next_state: Mapping[str, Any] | None = None,
+        stop: Any | None = None,
+        initial_state: Mapping[str, Any] | None = None,
+        max_depth: int | None = None,
+        max_paths: int | None = None,
+        strategy: str = "dfs",
+        parallel: bool | str = True,
+        intermediate_states: bool = False,
+    ) -> "SearchResult":
+        """Run a stateful traversal.
+
+        Pass an existing ``Traversal`` as the first argument, or pass traversal
+        parameters directly. ``visit`` is optional and defaults to accepting all
+        candidate edges. ``stop`` decides which accepted paths are returned.
+        ``next_state`` maps state names to Polars expressions evaluated after
+        each accepted edge. ``initial_state`` may contain scalars or Python
+        lists; list state can be updated with Polars list expressions such as
+        ``pl.concat_list``. ``strategy`` is ``"dfs"`` or ``"bfs"``.
+        """
+        if traversal is None:
+            if start_nodes is None:
+                raise TypeError("search() missing required keyword argument: 'start_nodes'")
+            if stop is None:
+                raise TypeError("search() missing required keyword argument: 'stop'")
+            traversal = Traversal(
+                Kernel(
+                    pl.lit(True) if visit is None else visit,
+                    dict(next_state or {}),
+                    stop,
+                    dict(initial_state or {}),
+                ),
+                list(start_nodes),
+                max_depth,
+                max_paths,
+                strategy,
+                parallel,
+                intermediate_states,
+            )
+        elif any(
+            value is not None
+            for value in (
+                start_nodes,
+                visit,
+                next_state,
+                stop,
+                initial_state,
+                max_depth,
+                max_paths,
+            )
+        ) or strategy != "dfs" or parallel is not True or intermediate_states:
+            raise TypeError("search() accepts either a Traversal or traversal keyword arguments")
+
         inner = self._inner.search(traversal._to_inner(self))
         return SearchResult(inner, self._id_to_label)
 
@@ -140,7 +197,11 @@ class Graph:
 
 
 class Traversal:
-    """Traversal configuration used by :meth:`Graph.search`."""
+    """Traversal configuration used by :meth:`Graph.search`.
+
+    This class remains useful when the same traversal is reused. For one-off
+    searches, pass the same arguments directly to ``Graph.search``.
+    """
 
     def __init__(
         self,
@@ -152,6 +213,15 @@ class Traversal:
         parallel: bool | str = True,
         intermediate_states: bool = False,
     ) -> None:
+        """Create a reusable traversal configuration.
+
+        ``kernel`` contains visit/state/stop expressions. ``start_nodes`` are
+        external graph node IDs or labels. ``max_depth`` limits accepted-edge
+        depth, and ``max_paths`` limits returned paths. ``strategy`` is
+        ``"dfs"`` or ``"bfs"``. ``parallel`` accepts ``True``/``False`` or
+        ``"on"``/``"off"``/``"auto"``. ``intermediate_states`` stores per-node
+        state history on returned paths and is disabled by default.
+        """
         self.kernel = kernel
         self.start_nodes = list(start_nodes)
         self.max_depth = max_depth

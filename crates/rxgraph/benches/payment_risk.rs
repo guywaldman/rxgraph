@@ -7,8 +7,8 @@ use arrow::{
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 use rxgraph::{
-    DslExpr as e, DslKernel, Graph, Scalar, TraversalConfig, TraversalConfigBuilder,
-    TraversalStrategy,
+    DslExpr as e, DslKernel, Graph, TraversalConfig, TraversalConfigBuilder, TraversalStrategy,
+    Value,
 };
 
 fn bench_payment_risk(c: &mut Criterion) {
@@ -107,10 +107,10 @@ impl Workload {
             ],
             stop,
             [
-                ("amount".to_string(), Scalar::U64(0)),
-                ("hops".to_string(), Scalar::U64(0)),
-                ("time".to_string(), Scalar::U64(0)),
-                ("risk".to_string(), Scalar::I64(0)),
+                ("amount".to_string(), Value::U64(0)),
+                ("hops".to_string(), Value::U64(0)),
+                ("time".to_string(), Value::U64(0)),
+                ("risk".to_string(), Value::I64(0)),
             ],
         )
     }

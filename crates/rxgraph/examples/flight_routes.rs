@@ -7,7 +7,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use rxgraph::{
-    DslExpr as e, DslKernel, Graph, GraphId, Scalar, TraversalConfigBuilder, TraversalStrategy,
+    DslExpr as e, DslKernel, Graph, GraphId, TraversalConfigBuilder, TraversalStrategy, Value,
 };
 
 fn main() -> Result<()> {
@@ -143,11 +143,11 @@ impl Workload {
             ],
             e::dest_id().eq(e::uint((self.airports - 1) as u64)),
             [
-                ("spent".into(), Scalar::U64(0)),
-                ("hops".into(), Scalar::U64(0)),
-                ("ready_at".into(), Scalar::U64(0)),
-                ("risk".into(), Scalar::I64(0)),
-                ("detours".into(), Scalar::U64(0)),
+                ("spent".into(), Value::U64(0)),
+                ("hops".into(), Value::U64(0)),
+                ("ready_at".into(), Value::U64(0)),
+                ("risk".into(), Value::I64(0)),
+                ("detours".into(), Value::U64(0)),
             ],
         )
     }

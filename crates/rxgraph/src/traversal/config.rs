@@ -51,13 +51,13 @@ pub struct TraversalConfig {
 /// revisits inside a path, and parallel traversal enabled.
 ///
 /// ```
-/// use rxgraph::{DslExpr as e, DslKernel, Scalar, TraversalConfigBuilder};
+/// use rxgraph::{DslExpr as e, DslKernel, Value, TraversalConfigBuilder};
 ///
 /// let kernel = DslKernel::new(
 ///     e::edge("enabled"),
 ///     std::iter::empty::<(String, rxgraph::DslExpr)>(),
 ///     e::dest("is_target"),
-///     [("seen".into(), Scalar::Bool(true))],
+///     [("seen".into(), Value::Bool(true))],
 /// );
 /// let config = TraversalConfigBuilder::new(kernel)
 ///     .with_start_nodes([0_u64])

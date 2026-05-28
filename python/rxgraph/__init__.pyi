@@ -1,5 +1,5 @@
 from collections.abc import Hashable, Iterable, Mapping
-from typing import Any, Literal, Self, TypeVar
+from typing import Any, Literal, Self, TypeVar, overload
 
 from polars import DataFrame, Expr, col as col, lit as lit
 
@@ -43,9 +43,23 @@ class Graph:
     def node_id(self, label: Hashable) -> GraphId:
         """Return the graph ID used by the engine for a node label."""
         ...
-    def search(self, traversal: Traversal) -> SearchResult:
-        """Run a traversal and return stopped paths plus traversal stats."""
-        ...
+    @overload
+    def search(self, traversal: Traversal) -> SearchResult: ...
+    @overload
+    def search(
+        self,
+        *,
+        start_nodes: Iterable[Hashable],
+        stop: Expr | str,
+        visit: Expr | str | None = None,
+        next_state: Mapping[str, Expr | str] | None = None,
+        initial_state: Mapping[str, Any] | None = None,
+        max_depth: int | None = None,
+        max_paths: int | None = None,
+        strategy: Literal["dfs", "bfs"] = "dfs",
+        parallel: bool | Literal["auto", "off", "on"] = True,
+        intermediate_states: bool = False,
+    ) -> SearchResult: ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
         ...
@@ -79,7 +93,7 @@ class Kernel:
         visit: Expr | str,
         next_state: dict[str, Expr | str],
         stop: Expr | str,
-        initial_state: dict[str, bool | int | float | str | None],
+        initial_state: Mapping[str, Any],
     ) -> None:
         """Create a kernel.
 

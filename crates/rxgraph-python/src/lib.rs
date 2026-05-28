@@ -8,8 +8,8 @@ use pyo3::{
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
 use rxgraph::{
-    DslKernel, Graph, GraphId, OwnedGraphId, Scalar, SearchResult, SearchStats, StateRow,
-    TraversalConfigBuilder, TraversalStrategy,
+    DslKernel, Graph, GraphId, OwnedGraphId, SearchResult, SearchStats, StateRow,
+    TraversalConfigBuilder, TraversalStrategy, Value,
 };
 use std::thread;
 
@@ -234,7 +234,7 @@ impl PyKernel {
                     .map_err(|_| PyTypeError::new_err("initial_state keys must be strings"))?
                     .to_str()?
                     .to_string();
-                Ok((key, py_to_scalar(&value)?))
+                Ok((key, py_to_value(&value)?))
             })
             .collect::<PyResult<Vec<_>>>()?;
 
@@ -479,19 +479,26 @@ fn states_to_py(py: Python<'_>, states: Vec<StateRow>) -> PyResult<Py<PyAny>> {
 fn state_to_py(py: Python<'_>, state: StateRow) -> PyResult<Py<PyAny>> {
     let dict = PyDict::new(py);
     for (name, value) in state {
-        dict.set_item(name, scalar_to_py(py, value)?)?;
+        dict.set_item(name, value_to_py(py, value)?)?;
     }
     Ok(dict.into_any().unbind())
 }
 
-fn scalar_to_py(py: Python<'_>, value: Scalar) -> PyResult<Py<PyAny>> {
+fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
     match value {
-        Scalar::Null => Ok(py.None()),
-        Scalar::Bool(value) => value.into_py_any(py),
-        Scalar::I64(value) => value.into_py_any(py),
-        Scalar::U64(value) => value.into_py_any(py),
-        Scalar::F64(value) => value.into_py_any(py),
-        Scalar::Str(value) => value.to_string().into_py_any(py),
+        Value::Null => Ok(py.None()),
+        Value::Bool(value) => value.into_py_any(py),
+        Value::I64(value) => value.into_py_any(py),
+        Value::U64(value) => value.into_py_any(py),
+        Value::F64(value) => value.into_py_any(py),
+        Value::Str(value) => value.to_string().into_py_any(py),
+        Value::List(values) => {
+            let values = values
+                .into_iter()
+                .map(|value| value_to_py(py, value))
+                .collect::<PyResult<Vec<_>>>()?;
+            Ok(PyList::new(py, values)?.into_any().unbind())
+        }
     }
 }
 
@@ -532,28 +539,35 @@ fn components_to_py(py: Python<'_>, components: Vec<Vec<GraphId<'_>>>) -> PyResu
     }
 }
 
-fn py_to_scalar(value: &Bound<'_, PyAny>) -> PyResult<Scalar> {
+fn py_to_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     if value.is_none() {
-        return Ok(Scalar::Null);
+        return Ok(Value::Null);
     }
     if let Ok(value) = value.extract::<bool>() {
-        return Ok(Scalar::Bool(value));
+        return Ok(Value::Bool(value));
     }
     if let Ok(value) = value.extract::<u64>() {
-        return Ok(Scalar::U64(value));
+        return Ok(Value::U64(value));
     }
     if let Ok(value) = value.extract::<i64>() {
-        return Ok(Scalar::I64(value));
+        return Ok(Value::I64(value));
     }
     if let Ok(value) = value.extract::<f64>() {
-        return Ok(Scalar::F64(value));
+        return Ok(Value::F64(value));
     }
     if let Ok(value) = value.cast::<PyString>() {
-        return Ok(Scalar::Str(std::sync::Arc::from(value.to_str()?)));
+        return Ok(Value::Str(std::sync::Arc::from(value.to_str()?)));
+    }
+    if let Ok(values) = value.cast::<PyList>() {
+        return values
+            .iter()
+            .map(|value| py_to_value(&value))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::List);
     }
 
     Err(PyTypeError::new_err(format!(
-        "cannot convert {} to DSL scalar",
+        "cannot convert {} to DSL value",
         value.get_type().name()?
     )))
 }

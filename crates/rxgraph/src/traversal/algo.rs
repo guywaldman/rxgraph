@@ -680,7 +680,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        dsl::{DslExpr as e, DslKernel, Scalar},
+        dsl::{DslExpr as e, DslKernel, Value},
         graph::{EDGE_DEST_COL, EDGE_SRC_COL, GraphId, ID_COL, Repo},
         traversal::config::{TraversalConfigBuilder, TraversalStrategy},
     };
@@ -785,13 +785,13 @@ mod tests {
         }
     }
 
-    fn state_u64(state: &[(String, Scalar)], name: &str) -> u64 {
+    fn state_u64(state: &[(String, Value)], name: &str) -> u64 {
         match state
             .iter()
             .find(|(key, _)| key == name)
             .map(|(_, value)| value)
         {
-            Some(Scalar::U64(value)) => *value,
+            Some(Value::U64(value)) => *value,
             other => panic!("expected {name} to be U64, got {other:?}"),
         }
     }
@@ -860,7 +860,7 @@ mod tests {
             e::bool(true),
             [("hops".into(), e::state("hops").plus(e::uint(1)))],
             e::dest("kind").eq(e::string("end")),
-            [("hops".into(), Scalar::U64(0))],
+            [("hops".into(), Value::U64(0))],
         );
 
         let graph = graph();
@@ -917,7 +917,7 @@ mod tests {
             e::bool(true),
             [],
             e::bool(true),
-            [("x".to_string(), Scalar::U64(0))],
+            [("x".to_string(), Value::U64(0))],
         ))
         .with_start_nodes(["missing".to_string()])
         .build();

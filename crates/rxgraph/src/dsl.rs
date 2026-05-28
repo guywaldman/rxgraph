@@ -10,7 +10,7 @@
 //! Expressions can read source-node fields, destination-node fields, edge fields,
 //! traversal state, and graph identity columns via [`DslExpr::src_id`],
 //! [`DslExpr::dest_id`], and [`DslExpr::edge_id`]. Identity expressions follow
-//! the graph's ID mode: [`Scalar::U64`] for integer-ID graphs and [`Scalar::Str`]
+//! the graph's ID mode: [`Value::U64`] for integer-ID graphs and [`Value::Str`]
 //! for string-ID graphs.
 //!
 //! Prefer the method-based [`DslExpr`] API in Rust. [`DslKernel::from_polars_json`]
@@ -20,13 +20,13 @@
 //! paths that reach a target node:
 //!
 //! ```
-//! use rxgraph::{DslExpr as e, DslKernel, Scalar};
+//! use rxgraph::{DslExpr as e, DslKernel, Value};
 //!
 //! let kernel = DslKernel::new(
 //!     e::edge("enabled"),
 //!     [("hops".into(), e::state("hops").plus(e::uint(1)))],
 //!     e::dest("is_target"),
-//!     [("hops".into(), Scalar::U64(0))],
+//!     [("hops".into(), Value::U64(0))],
 //! );
 //! ```
 
@@ -38,8 +38,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
     array::{
         Array, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
-        Int64Array, LargeStringArray, StringArray, StringViewArray, UInt8Array, UInt16Array,
-        UInt32Array, UInt64Array,
+        Int64Array, LargeListArray, LargeStringArray, ListArray, StringArray, StringViewArray,
+        UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     datatypes::DataType,
     record_batch::RecordBatch,
@@ -68,7 +68,7 @@ impl DslKernel {
         visit: DslExpr,
         next_state: impl IntoIterator<Item = (String, DslExpr)>,
         stop: DslExpr,
-        initial_state: impl IntoIterator<Item = (String, Scalar)>,
+        initial_state: impl IntoIterator<Item = (String, Value)>,
     ) -> Self {
         let mut initial_state = initial_state.into_iter().collect::<StateRow>();
         initial_state.sort_by(|a, b| a.0.cmp(&b.0));
@@ -92,7 +92,7 @@ impl DslKernel {
         visit_json: &str,
         next_state: impl IntoIterator<Item = (String, String)>,
         stop_json: &str,
-        initial_state: impl IntoIterator<Item = (String, Scalar)>,
+        initial_state: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<Self> {
         let mut initial_state = initial_state.into_iter().collect::<StateRow>();
         initial_state.sort_by(|a, b| a.0.cmp(&b.0));
@@ -122,9 +122,9 @@ impl DslKernel {
 ///
 /// Names are normalized once when the kernel is bound to a graph. During search,
 /// state reads and writes use compact indexes.
-pub type StateRow = Vec<(String, Scalar)>;
+pub type StateRow = Vec<(String, Value)>;
 // Bound state drops names so every state read/write is an index lookup.
-pub(crate) type StateValues = SmallVec<[Scalar; 8]>;
+pub(crate) type StateValues = SmallVec<[Value; 8]>;
 
 /// Typed traversal expression.
 ///
@@ -171,37 +171,37 @@ impl DslExpr {
 
     /// Null literal.
     pub fn null() -> Self {
-        Self::literal(Scalar::Null)
+        Self::literal(Value::Null)
     }
 
     /// Boolean literal.
     pub fn bool(value: bool) -> Self {
-        Self::literal(Scalar::Bool(value))
+        Self::literal(Value::Bool(value))
     }
 
     /// Signed integer literal.
     pub fn int(value: i64) -> Self {
-        Self::literal(Scalar::I64(value))
+        Self::literal(Value::I64(value))
     }
 
     /// Unsigned integer literal.
     pub fn uint(value: u64) -> Self {
-        Self::literal(Scalar::U64(value))
+        Self::literal(Value::U64(value))
     }
 
     /// Floating point literal.
     pub fn float(value: f64) -> Self {
-        Self::literal(Scalar::F64(value))
+        Self::literal(Value::F64(value))
     }
 
     /// String literal.
     pub fn string(value: impl Into<Arc<str>>) -> Self {
-        Self::literal(Scalar::Str(value.into()))
+        Self::literal(Value::Str(value.into()))
     }
 
-    /// Scalar literal.
-    pub fn literal(value: Scalar) -> Self {
-        Self(Expr::Literal(value))
+    /// Literal value.
+    pub fn literal(value: impl Into<Value>) -> Self {
+        Self(Expr::Literal(value.into()))
     }
 
     /// Parses the supported Polars JSON expression subset.
@@ -264,7 +264,7 @@ impl DslExpr {
         self.binary(BinaryOp::Multiply, rhs)
     }
 
-    /// Numeric division. Always returns [`Scalar::F64`].
+    /// Numeric division. Always returns [`Value::F64`].
     pub fn divide(self, rhs: Self) -> Self {
         self.binary(BinaryOp::Divide, rhs)
     }
@@ -329,6 +329,13 @@ impl DslExpr {
         self.str_pred(StrOp::EndsWith, suffix)
     }
 
+    /// Concatenates list expressions, appending scalar expressions as single items.
+    pub fn concat_list(values: impl IntoIterator<Item = Self>) -> Self {
+        Self(Expr::ListConcat(
+            values.into_iter().map(|expr| expr.0).collect(),
+        ))
+    }
+
     fn binary(self, op: BinaryOp, rhs: Self) -> Self {
         Self(Expr::Binary(Box::new(self.0), op, Box::new(rhs.0)))
     }
@@ -339,9 +346,6 @@ impl DslExpr {
 }
 
 /// Scalar value used by DSL expressions and traversal state.
-///
-/// Arrow columns are converted to this compact runtime representation when read
-/// by the DSL.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     /// Null value.
@@ -358,7 +362,42 @@ pub enum Scalar {
     Str(Arc<str>),
 }
 
-impl Scalar {
+impl From<Scalar> for Value {
+    fn from(value: Scalar) -> Self {
+        match value {
+            Scalar::Null => Self::Null,
+            Scalar::Bool(value) => Self::Bool(value),
+            Scalar::I64(value) => Self::I64(value),
+            Scalar::U64(value) => Self::U64(value),
+            Scalar::F64(value) => Self::F64(value),
+            Scalar::Str(value) => Self::Str(value),
+        }
+    }
+}
+
+/// Runtime value used by DSL expressions and traversal state.
+///
+/// Arrow columns are converted to this compact runtime representation when read
+/// by the DSL.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Value {
+    /// Null value.
+    Null,
+    /// Boolean value.
+    Bool(bool),
+    /// Signed integer value.
+    I64(i64),
+    /// Unsigned integer value.
+    U64(u64),
+    /// Floating point value.
+    F64(f64),
+    /// Shared string value.
+    Str(Arc<str>),
+    /// Ordered value list.
+    List(Vec<Value>),
+}
+
+impl Value {
     /// Converts the scalar to JSON for callers that need a loosely typed value.
     pub fn to_value(&self) -> Json {
         match self {
@@ -370,6 +409,7 @@ impl Scalar {
                 .map(Json::Number)
                 .unwrap_or(Json::Null),
             Self::Str(value) => Json::String(value.to_string()),
+            Self::List(values) => Json::Array(values.iter().map(Value::to_value).collect()),
         }
     }
 
@@ -410,13 +450,14 @@ impl Scalar {
 #[derive(Debug, Clone)]
 enum Expr<C> {
     Column(C),
-    Literal(Scalar),
+    Literal(Value),
     Binary(Box<Expr<C>>, BinaryOp, Box<Expr<C>>),
     MaskIfAny {
         value: Box<Expr<C>>,
         mask: Box<Expr<C>>,
         then_value: Box<Expr<C>>,
     },
+    ListConcat(Vec<Expr<C>>),
     Not(Box<Expr<C>>),
     IsNull(Box<Expr<C>>),
     IsNotNull(Box<Expr<C>>),
@@ -442,6 +483,12 @@ impl<C> Expr<C> {
                 mask: Box::new(mask.try_map_column(f)?),
                 then_value: Box::new(then_value.try_map_column(f)?),
             },
+            Self::ListConcat(values) => Expr::ListConcat(
+                values
+                    .into_iter()
+                    .map(|expr| expr.try_map_column(f))
+                    .collect::<Result<_>>()?,
+            ),
             Self::Not(expr) => Expr::Not(Box::new(expr.try_map_column(f)?)),
             Self::IsNull(expr) => Expr::IsNull(Box::new(expr.try_map_column(f)?)),
             Self::IsNotNull(expr) => Expr::IsNotNull(Box::new(expr.try_map_column(f)?)),
@@ -533,7 +580,7 @@ impl BoundKernel {
         self.visit.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn next_state(&self, current: &[Scalar], ctx: &EvalCtx<'_>) -> Result<StateValues> {
+    pub(crate) fn next_state(&self, current: &[Value], ctx: &EvalCtx<'_>) -> Result<StateValues> {
         let mut next = current.iter().cloned().collect::<StateValues>();
         for (index, expr) in &self.next_state {
             next[*index] = expr.eval(ctx)?;
@@ -545,7 +592,7 @@ impl BoundKernel {
         self.stop.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn state_row(&self, state: &[Scalar]) -> StateRow {
+    pub(crate) fn state_row(&self, state: &[Value]) -> StateRow {
         self.names
             .iter()
             .cloned()
@@ -581,7 +628,7 @@ impl BoundColumn {
         })
     }
 
-    fn eval(&self, ctx: &EvalCtx<'_>) -> Result<Scalar> {
+    fn eval(&self, ctx: &EvalCtx<'_>) -> Result<Value> {
         match self {
             Self::SrcId => graph_id_scalar(
                 ctx.graph
@@ -605,7 +652,7 @@ impl BoundColumn {
             Self::Dest(reader) => reader.value(ctx.dest as usize),
             Self::Edge(reader) => reader.value(ctx.edge as usize),
             Self::State(index) => Ok(ctx.state[*index].clone()),
-            Self::MissingState => Ok(Scalar::Null),
+            Self::MissingState => Ok(Value::Null),
         }
     }
 
@@ -618,8 +665,8 @@ impl BoundColumn {
             Self::Dest(reader) => reader.str_value(ctx.dest as usize)?,
             Self::Edge(reader) => reader.str_value(ctx.edge as usize)?,
             Self::State(index) => match &ctx.state[*index] {
-                Scalar::Null => None,
-                Scalar::Str(value) => Some(value),
+                Value::Null => None,
+                Value::Str(value) => Some(value),
                 _ => bail!("string predicate expected strings"),
             },
             Self::MissingState => None,
@@ -636,18 +683,18 @@ impl BoundColumn {
             Self::Dest(reader) => reader.try_str_value(ctx.dest as usize)?,
             Self::Edge(reader) => reader.try_str_value(ctx.edge as usize)?,
             Self::State(index) => match &ctx.state[*index] {
-                Scalar::Null => Some(None),
-                Scalar::Str(value) => Some(Some(value)),
+                Value::Null => Some(None),
+                Value::Str(value) => Some(Some(value)),
                 _ => None,
             },
         })
     }
 }
 
-fn graph_id_scalar(id: GraphId<'_>) -> Result<Scalar> {
+fn graph_id_scalar(id: GraphId<'_>) -> Result<Value> {
     Ok(match id {
-        GraphId::U64(value) => Scalar::U64(value),
-        GraphId::Str(value) => Scalar::Str(Arc::from(value)),
+        GraphId::U64(value) => Value::U64(value),
+        GraphId::Str(value) => Value::Str(Arc::from(value)),
     })
 }
 
@@ -668,15 +715,15 @@ fn graph_id_try_str(id: Option<GraphId<'_>>) -> Result<Option<Option<&str>>> {
 }
 
 impl Expr<BoundColumn> {
-    fn eval(&self, ctx: &EvalCtx<'_>) -> Result<Scalar> {
+    fn eval(&self, ctx: &EvalCtx<'_>) -> Result<Value> {
         Ok(match self {
             Self::Column(column) => column.eval(ctx)?,
             Self::Literal(value) => value.clone(),
             Self::Binary(left, BinaryOp::And, right) => {
-                Scalar::Bool(left.eval(ctx)?.truthy()? && right.eval(ctx)?.truthy()?)
+                Value::Bool(left.eval(ctx)?.truthy()? && right.eval(ctx)?.truthy()?)
             }
             Self::Binary(left, BinaryOp::Or, right) => {
-                Scalar::Bool(left.eval(ctx)?.truthy()? || right.eval(ctx)?.truthy()?)
+                Value::Bool(left.eval(ctx)?.truthy()? || right.eval(ctx)?.truthy()?)
             }
             Self::Binary(left, op, right) => {
                 if let Some(value) = eval_str_binary(left, *op, right, ctx)? {
@@ -699,14 +746,15 @@ impl Expr<BoundColumn> {
                     .as_u64()
                     .context("mask_if_any mask must be an unsigned integer")?;
                 if value & mask == 0 {
-                    Scalar::U64(0)
+                    Value::U64(0)
                 } else {
                     then_value.eval(ctx)?
                 }
             }
-            Self::Not(expr) => Scalar::Bool(!expr.eval(ctx)?.truthy()?),
-            Self::IsNull(expr) => Scalar::Bool(expr.eval(ctx)? == Scalar::Null),
-            Self::IsNotNull(expr) => Scalar::Bool(expr.eval(ctx)? != Scalar::Null),
+            Self::ListConcat(values) => eval_list_concat(values, ctx)?,
+            Self::Not(expr) => Value::Bool(!expr.eval(ctx)?.truthy()?),
+            Self::IsNull(expr) => Value::Bool(expr.eval(ctx)? == Value::Null),
+            Self::IsNotNull(expr) => Value::Bool(expr.eval(ctx)? != Value::Null),
             Self::StrPred(left, op, right) => eval_str_pred(left, *op, right, ctx)?,
         })
     }
@@ -714,8 +762,8 @@ impl Expr<BoundColumn> {
     fn str_value<'a>(&'a self, ctx: &'a EvalCtx<'_>) -> Result<Option<&'a str>> {
         Ok(match self {
             Self::Column(column) => column.str_value(ctx)?,
-            Self::Literal(Scalar::Null) => None,
-            Self::Literal(Scalar::Str(value)) => Some(value),
+            Self::Literal(Value::Null) => None,
+            Self::Literal(Value::Str(value)) => Some(value),
             _ => bail!("string predicate expected strings"),
         })
     }
@@ -723,11 +771,23 @@ impl Expr<BoundColumn> {
     fn try_str_value<'a>(&'a self, ctx: &'a EvalCtx<'_>) -> Result<Option<Option<&'a str>>> {
         Ok(match self {
             Self::Column(column) => column.try_str_value(ctx)?,
-            Self::Literal(Scalar::Null) => Some(None),
-            Self::Literal(Scalar::Str(value)) => Some(Some(value)),
+            Self::Literal(Value::Null) => Some(None),
+            Self::Literal(Value::Str(value)) => Some(Some(value)),
             _ => None,
         })
     }
+}
+
+fn eval_list_concat(values: &[Expr<BoundColumn>], ctx: &EvalCtx<'_>) -> Result<Value> {
+    let mut out = Vec::new();
+    for expr in values {
+        match expr.eval(ctx)? {
+            Value::List(values) => out.extend(values),
+            Value::Null => out.push(Value::Null),
+            value => out.push(value),
+        }
+    }
+    Ok(Value::List(out))
 }
 
 pub(crate) struct EvalCtx<'a> {
@@ -735,7 +795,7 @@ pub(crate) struct EvalCtx<'a> {
     pub(crate) src: NodeId,
     pub(crate) dest: NodeId,
     pub(crate) edge: EdgeId,
-    pub(crate) state: &'a [Scalar],
+    pub(crate) state: &'a [Value],
 }
 
 #[derive(Debug, Clone)]
@@ -754,6 +814,8 @@ enum ColumnReader {
     Utf8(StringArray),
     LargeUtf8(LargeStringArray),
     Utf8View(StringViewArray),
+    List(ListArray),
+    LargeList(LargeListArray),
 }
 
 impl ColumnReader {
@@ -787,15 +849,17 @@ impl ColumnReader {
             DataType::Utf8 => Self::Utf8(typed!(Utf8, StringArray)),
             DataType::LargeUtf8 => Self::LargeUtf8(typed!(LargeUtf8, LargeStringArray)),
             DataType::Utf8View => Self::Utf8View(typed!(Utf8View, StringViewArray)),
+            DataType::List(_) => Self::List(typed!(List, ListArray)),
+            DataType::LargeList(_) => Self::LargeList(typed!(LargeList, LargeListArray)),
             typ => bail!("unsupported DSL column type for {name:?}: {typ:?}"),
         })
     }
 
-    fn value(&self, row: usize) -> Result<Scalar> {
+    fn value(&self, row: usize) -> Result<Value> {
         macro_rules! nullable {
             ($array:expr, $value:expr) => {
                 if $array.is_null(row) {
-                    Scalar::Null
+                    Value::Null
                 } else {
                     $value
                 }
@@ -803,20 +867,26 @@ impl ColumnReader {
         }
 
         Ok(match self {
-            Self::Bool(array) => nullable!(array, Scalar::Bool(array.value(row))),
-            Self::I8(array) => nullable!(array, Scalar::I64(array.value(row) as i64)),
-            Self::I16(array) => nullable!(array, Scalar::I64(array.value(row) as i64)),
-            Self::I32(array) => nullable!(array, Scalar::I64(array.value(row) as i64)),
-            Self::I64(array) => nullable!(array, Scalar::I64(array.value(row))),
-            Self::U8(array) => nullable!(array, Scalar::U64(array.value(row) as u64)),
-            Self::U16(array) => nullable!(array, Scalar::U64(array.value(row) as u64)),
-            Self::U32(array) => nullable!(array, Scalar::U64(array.value(row) as u64)),
-            Self::U64(array) => nullable!(array, Scalar::U64(array.value(row))),
-            Self::F32(array) => nullable!(array, Scalar::F64(array.value(row) as f64)),
-            Self::F64(array) => nullable!(array, Scalar::F64(array.value(row))),
-            Self::Utf8(array) => nullable!(array, Scalar::Str(Arc::from(array.value(row)))),
-            Self::LargeUtf8(array) => nullable!(array, Scalar::Str(Arc::from(array.value(row)))),
-            Self::Utf8View(array) => nullable!(array, Scalar::Str(Arc::from(array.value(row)))),
+            Self::Bool(array) => nullable!(array, Value::Bool(array.value(row))),
+            Self::I8(array) => nullable!(array, Value::I64(array.value(row) as i64)),
+            Self::I16(array) => nullable!(array, Value::I64(array.value(row) as i64)),
+            Self::I32(array) => nullable!(array, Value::I64(array.value(row) as i64)),
+            Self::I64(array) => nullable!(array, Value::I64(array.value(row))),
+            Self::U8(array) => nullable!(array, Value::U64(array.value(row) as u64)),
+            Self::U16(array) => nullable!(array, Value::U64(array.value(row) as u64)),
+            Self::U32(array) => nullable!(array, Value::U64(array.value(row) as u64)),
+            Self::U64(array) => nullable!(array, Value::U64(array.value(row))),
+            Self::F32(array) => nullable!(array, Value::F64(array.value(row) as f64)),
+            Self::F64(array) => nullable!(array, Value::F64(array.value(row))),
+            Self::Utf8(array) => nullable!(array, Value::Str(Arc::from(array.value(row)))),
+            Self::LargeUtf8(array) => nullable!(array, Value::Str(Arc::from(array.value(row)))),
+            Self::Utf8View(array) => nullable!(array, Value::Str(Arc::from(array.value(row)))),
+            Self::List(array) => {
+                nullable!(array, Value::List(array_to_scalars(&array.value(row))?))
+            }
+            Self::LargeList(array) => {
+                nullable!(array, Value::List(array_to_scalars(&array.value(row))?))
+            }
         })
     }
 
@@ -837,21 +907,119 @@ impl ColumnReader {
     }
 }
 
+fn array_to_scalars(array: &dyn Array) -> Result<Vec<Value>> {
+    macro_rules! primitive {
+        ($array:ty, $scalar:expr) => {
+            if let Some(array) = array.as_any().downcast_ref::<$array>() {
+                return (0..array.len())
+                    .map(|row| {
+                        Ok(if array.is_null(row) {
+                            Value::Null
+                        } else {
+                            $scalar(array.value(row))
+                        })
+                    })
+                    .collect();
+            }
+        };
+    }
+
+    primitive!(BooleanArray, Value::Bool);
+    primitive!(Int8Array, |value| Value::I64(value as i64));
+    primitive!(Int16Array, |value| Value::I64(value as i64));
+    primitive!(Int32Array, |value| Value::I64(value as i64));
+    primitive!(Int64Array, Value::I64);
+    primitive!(UInt8Array, |value| Value::U64(value as u64));
+    primitive!(UInt16Array, |value| Value::U64(value as u64));
+    primitive!(UInt32Array, |value| Value::U64(value as u64));
+    primitive!(UInt64Array, Value::U64);
+    primitive!(Float32Array, |value| Value::F64(value as f64));
+    primitive!(Float64Array, Value::F64);
+
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        return string_array_to_scalars(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        return string_array_to_scalars(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        return string_array_to_scalars(array);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
+        return (0..array.len())
+            .map(|row| {
+                Ok(if array.is_null(row) {
+                    Value::Null
+                } else {
+                    Value::List(array_to_scalars(&array.value(row))?)
+                })
+            })
+            .collect();
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
+        return (0..array.len())
+            .map(|row| {
+                Ok(if array.is_null(row) {
+                    Value::Null
+                } else {
+                    Value::List(array_to_scalars(&array.value(row))?)
+                })
+            })
+            .collect();
+    }
+
+    bail!("unsupported list value type: {:?}", array.data_type())
+}
+
+fn string_array_to_scalars<T: ArrayString>(array: &T) -> Result<Vec<Value>> {
+    Ok((0..array.len())
+        .map(|row| {
+            if array.is_null(row) {
+                Value::Null
+            } else {
+                Value::Str(Arc::from(array.str_value(row)))
+            }
+        })
+        .collect())
+}
+
+trait ArrayString: Array {
+    fn str_value(&self, row: usize) -> &str;
+}
+
+impl ArrayString for StringArray {
+    fn str_value(&self, row: usize) -> &str {
+        self.value(row)
+    }
+}
+
+impl ArrayString for LargeStringArray {
+    fn str_value(&self, row: usize) -> &str {
+        self.value(row)
+    }
+}
+
+impl ArrayString for StringViewArray {
+    fn str_value(&self, row: usize) -> &str {
+        self.value(row)
+    }
+}
+
 fn eval_str_pred(
     left: &Expr<BoundColumn>,
     op: StrOp,
     right: &Expr<BoundColumn>,
     ctx: &EvalCtx<'_>,
-) -> Result<Scalar> {
+) -> Result<Value> {
     let Some(left) = left.str_value(ctx)? else {
-        return Ok(Scalar::Null);
+        return Ok(Value::Null);
     };
     let Some(right) = right.str_value(ctx)? else {
-        return Ok(Scalar::Null);
+        return Ok(Value::Null);
     };
 
     // Borrow Arrow string values directly; string predicates are common and should not allocate per edge.
-    Ok(Scalar::Bool(match op {
+    Ok(Value::Bool(match op {
         StrOp::Contains => left.contains(right),
         StrOp::StartsWith => left.starts_with(right),
         StrOp::EndsWith => left.ends_with(right),
@@ -863,7 +1031,7 @@ fn eval_str_binary(
     op: BinaryOp,
     right: &Expr<BoundColumn>,
     ctx: &EvalCtx<'_>,
-) -> Result<Option<Scalar>> {
+) -> Result<Option<Value>> {
     if !matches!(
         op,
         BinaryOp::Eq
@@ -883,51 +1051,51 @@ fn eval_str_binary(
         return Ok(None);
     };
 
-    // Simple string comparisons borrow Arrow/literal values instead of materializing Scalar::Str.
+    // Simple string comparisons borrow Arrow/literal values instead of materializing Value::Str.
     Ok(Some(match (left, right) {
         (None, None) => match op {
-            BinaryOp::Eq => Scalar::Bool(true),
-            BinaryOp::NotEq => Scalar::Bool(false),
-            _ => Scalar::Null,
+            BinaryOp::Eq => Value::Bool(true),
+            BinaryOp::NotEq => Value::Bool(false),
+            _ => Value::Null,
         },
         (None, _) | (_, None) => match op {
-            BinaryOp::Eq => Scalar::Bool(false),
-            BinaryOp::NotEq => Scalar::Bool(true),
-            _ => Scalar::Null,
+            BinaryOp::Eq => Value::Bool(false),
+            BinaryOp::NotEq => Value::Bool(true),
+            _ => Value::Null,
         },
         (Some(left), Some(right)) => match op {
-            BinaryOp::Eq => Scalar::Bool(left == right),
-            BinaryOp::NotEq => Scalar::Bool(left != right),
-            BinaryOp::Lt => Scalar::Bool(left < right),
-            BinaryOp::LtEq => Scalar::Bool(left <= right),
-            BinaryOp::Gt => Scalar::Bool(left > right),
-            BinaryOp::GtEq => Scalar::Bool(left >= right),
+            BinaryOp::Eq => Value::Bool(left == right),
+            BinaryOp::NotEq => Value::Bool(left != right),
+            BinaryOp::Lt => Value::Bool(left < right),
+            BinaryOp::LtEq => Value::Bool(left <= right),
+            BinaryOp::Gt => Value::Bool(left > right),
+            BinaryOp::GtEq => Value::Bool(left >= right),
             _ => return Ok(None),
         },
     }))
 }
 
-fn eval_binary(left: Scalar, op: BinaryOp, right: Scalar) -> Result<Scalar> {
-    if matches!(left, Scalar::Null) || matches!(right, Scalar::Null) {
+fn eval_binary(left: Value, op: BinaryOp, right: Value) -> Result<Value> {
+    if matches!(left, Value::Null) || matches!(right, Value::Null) {
         return Ok(match op {
-            BinaryOp::Eq => Scalar::Bool(left == right),
-            BinaryOp::NotEq => Scalar::Bool(left != right),
-            _ => Scalar::Null,
+            BinaryOp::Eq => Value::Bool(left == right),
+            BinaryOp::NotEq => Value::Bool(left != right),
+            _ => Value::Null,
         });
     }
 
     Ok(match op {
-        BinaryOp::Eq => Scalar::Bool(scalar_eq(&left, &right)),
-        BinaryOp::NotEq => Scalar::Bool(!scalar_eq(&left, &right)),
-        BinaryOp::Lt => Scalar::Bool(compare(&left, &right)?.is_lt()),
-        BinaryOp::LtEq => Scalar::Bool(compare(&left, &right)?.is_le()),
-        BinaryOp::Gt => Scalar::Bool(compare(&left, &right)?.is_gt()),
-        BinaryOp::GtEq => Scalar::Bool(compare(&left, &right)?.is_ge()),
+        BinaryOp::Eq => Value::Bool(scalar_eq(&left, &right)),
+        BinaryOp::NotEq => Value::Bool(!scalar_eq(&left, &right)),
+        BinaryOp::Lt => Value::Bool(compare(&left, &right)?.is_lt()),
+        BinaryOp::LtEq => Value::Bool(compare(&left, &right)?.is_le()),
+        BinaryOp::Gt => Value::Bool(compare(&left, &right)?.is_gt()),
+        BinaryOp::GtEq => Value::Bool(compare(&left, &right)?.is_ge()),
         BinaryOp::Plus => numeric(left, right, |a, b| a + b, |a, b| a + b)?,
         BinaryOp::Minus => numeric(left, right, |a, b| a - b, |a, b| a - b)?,
         BinaryOp::Multiply => numeric(left, right, |a, b| a * b, |a, b| a * b)?,
-        BinaryOp::Divide => Scalar::F64(number(&left)? / number(&right)?),
-        BinaryOp::Modulus => Scalar::I64((integer(&left)? % integer(&right)?) as i64),
+        BinaryOp::Divide => Value::F64(number(&left)? / number(&right)?),
+        BinaryOp::Modulus => Value::I64((integer(&left)? % integer(&right)?) as i64),
         BinaryOp::BitAnd => bitwise(left, right, |a, b| a & b)?,
         BinaryOp::BitOr => bitwise(left, right, |a, b| a | b)?,
         BinaryOp::BitXor => bitwise(left, right, |a, b| a ^ b)?,
@@ -935,10 +1103,11 @@ fn eval_binary(left: Scalar, op: BinaryOp, right: Scalar) -> Result<Scalar> {
     })
 }
 
-fn scalar_eq(left: &Scalar, right: &Scalar) -> bool {
+fn scalar_eq(left: &Value, right: &Value) -> bool {
     match (left, right) {
-        (Scalar::Bool(left), Scalar::Bool(right)) => left == right,
-        (Scalar::Str(left), Scalar::Str(right)) => left == right,
+        (Value::Bool(left), Value::Bool(right)) => left == right,
+        (Value::Str(left), Value::Str(right)) => left == right,
+        (Value::List(left), Value::List(right)) => left == right,
         _ => left
             .as_f64()
             .zip(right.as_f64())
@@ -946,42 +1115,42 @@ fn scalar_eq(left: &Scalar, right: &Scalar) -> bool {
     }
 }
 
-fn integer(value: &Scalar) -> Result<i128> {
+fn integer(value: &Value) -> Result<i128> {
     value.as_i128().context("expected integer")
 }
 
-fn number(value: &Scalar) -> Result<f64> {
+fn number(value: &Value) -> Result<f64> {
     value.as_f64().context("expected number")
 }
 
 fn numeric(
-    left: Scalar,
-    right: Scalar,
+    left: Value,
+    right: Value,
     int: impl FnOnce(i128, i128) -> i128,
     float: impl FnOnce(f64, f64) -> f64,
-) -> Result<Scalar> {
-    if matches!(left, Scalar::F64(_)) || matches!(right, Scalar::F64(_)) {
-        Ok(Scalar::F64(float(number(&left)?, number(&right)?)))
+) -> Result<Value> {
+    if matches!(left, Value::F64(_)) || matches!(right, Value::F64(_)) {
+        Ok(Value::F64(float(number(&left)?, number(&right)?)))
     } else {
         let value = int(integer(&left)?, integer(&right)?);
         Ok(if value >= 0 {
-            Scalar::U64(value as u64)
+            Value::U64(value as u64)
         } else {
-            Scalar::I64(value as i64)
+            Value::I64(value as i64)
         })
     }
 }
 
-fn bitwise(left: Scalar, right: Scalar, op: impl FnOnce(u64, u64) -> u64) -> Result<Scalar> {
-    Ok(Scalar::U64(op(
+fn bitwise(left: Value, right: Value, op: impl FnOnce(u64, u64) -> u64) -> Result<Value> {
+    Ok(Value::U64(op(
         left.as_u64().context("expected unsigned integer")?,
         right.as_u64().context("expected unsigned integer")?,
     )))
 }
 
-fn compare(left: &Scalar, right: &Scalar) -> Result<std::cmp::Ordering> {
+fn compare(left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
     match (left, right) {
-        (Scalar::Str(left), Scalar::Str(right)) => Ok(left.cmp(right)),
+        (Value::Str(left), Value::Str(right)) => Ok(left.cmp(right)),
         _ => number(left)?
             .partial_cmp(&number(right)?)
             .context("cannot compare NaN"),
@@ -1089,42 +1258,43 @@ fn parse_rx_expr(value: &Json) -> Result<Expr<ColumnRef>> {
     })
 }
 
-fn parse_literal(value: &Json) -> Result<Scalar> {
+fn parse_literal(value: &Json) -> Result<Value> {
     parse_scalar_literal(
         value
-            .pointer("/Scalar")
+            .pointer("/Value")
+            .or_else(|| value.pointer("/Scalar"))
             .or_else(|| value.pointer("/Dyn"))
             .context("unsupported literal")?,
     )
 }
 
-fn parse_scalar_literal(value: &Json) -> Result<Scalar> {
+fn parse_scalar_literal(value: &Json) -> Result<Value> {
     let object = value.as_object().context("literal must be object")?;
     if let Some(value) = object.get("String") {
-        return Ok(Scalar::Str(Arc::from(
+        return Ok(Value::Str(Arc::from(
             value.as_str().context("String literal must be string")?,
         )));
     }
     if let Some(value) = object.get("Boolean") {
-        return Ok(Scalar::Bool(
+        return Ok(Value::Bool(
             value.as_bool().context("Boolean literal must be bool")?,
         ));
     }
     if object.contains_key("Null") {
-        return Ok(Scalar::Null);
+        return Ok(Value::Null);
     }
     if let Some(value) = object.get("Int") {
-        return Ok(Scalar::I64(
+        return Ok(Value::I64(
             value.as_i64().context("Int literal must be i64")?,
         ));
     }
     if let Some(value) = object.get("UInt") {
-        return Ok(Scalar::U64(
+        return Ok(Value::U64(
             value.as_u64().context("UInt literal must be u64")?,
         ));
     }
     if let Some(value) = object.get("Float") {
-        return Ok(Scalar::F64(
+        return Ok(Value::F64(
             value.as_f64().context("Float literal must be f64")?,
         ));
     }
@@ -1158,6 +1328,11 @@ fn parse_function(value: &Json) -> Result<Expr<ColumnRef>> {
     }
     if function.pointer("/StringExpr/EndsWith").is_some() {
         return binary_fn(inputs, StrOp::EndsWith);
+    }
+    if function.pointer("/ListExpr").and_then(Json::as_str) == Some("Concat") {
+        return Ok(Expr::ListConcat(
+            inputs.iter().map(parse_expr).collect::<Result<_>>()?,
+        ));
     }
     bail!("unsupported Polars function {function}")
 }
@@ -1206,7 +1381,7 @@ fn normalize_state(state: StateRow, names: &[String]) -> StateValues {
                 .binary_search_by(|(key, _)| key.as_str().cmp(name))
                 .ok()
                 .map(|i| state[i].1.clone())
-                .unwrap_or(Scalar::Null)
+                .unwrap_or(Value::Null)
         })
         .collect::<StateValues>()
 }
@@ -1262,8 +1437,8 @@ mod tests {
                 .eq(DslExpr::string("target"))
                 .and(DslExpr::edge_id().eq(DslExpr::string("ab"))),
             [
-                ("budget".into(), Scalar::U64(6)),
-                ("spent".into(), Scalar::U64(0)),
+                ("budget".into(), Value::U64(6)),
+                ("spent".into(), Value::U64(0)),
             ],
         );
 
@@ -1317,8 +1492,8 @@ mod tests {
             ],
             DslExpr::state("bits").eq(DslExpr::uint(0b100)),
             [
-                ("bits".into(), Scalar::U64(0b010)),
-                ("last".into(), Scalar::U64(1)),
+                ("bits".into(), Value::U64(0b010)),
+                ("last".into(), Value::U64(1)),
             ],
         );
 
@@ -1349,7 +1524,7 @@ mod tests {
                 .into(),
         )];
         let kernel =
-            DslKernel::from_polars_json(visit, next_state, stop, [("hops".into(), Scalar::U64(0))])
+            DslKernel::from_polars_json(visit, next_state, stop, [("hops".into(), Value::U64(0))])
                 .unwrap();
 
         let graph = string_graph();
@@ -1375,7 +1550,7 @@ mod tests {
                 .starts_with(DslExpr::string("tar"))
                 .and(DslExpr::dest("kind").contains(DslExpr::string("get")))
                 .and(DslExpr::dest("kind").ends_with(DslExpr::string("et"))),
-            std::iter::empty::<(String, Scalar)>(),
+            std::iter::empty::<(String, Value)>(),
         );
 
         let graph = string_graph();
