@@ -9,8 +9,8 @@ def graph() -> rxg.Graph:
         schema={"id": pl.UInt64},
     )
     edges = pl.DataFrame(
-        {"src": [10, 10, 20, 30], "dest": [20, 30, 40, 40]},
-        schema={"src": pl.UInt64, "dest": pl.UInt64},
+        {"id": [1, 2, 3, 4], "src": [10, 10, 20, 30], "dest": [20, 30, 40, 40]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
     )
     return rxg.Graph([("n", nodes)], [("e", edges)])
 
@@ -39,6 +39,21 @@ def test_degrees_and_components() -> None:
     assert g.in_degrees() == [0, 1, 1, 2, 0]
     assert g.degrees() == [2, 2, 2, 2, 0]
     assert g.weakly_connected_components() == [[10, 20, 30, 40], [50]]
+
+
+def test_string_id_dataframe_graph() -> None:
+    nodes = pl.DataFrame(
+        {"id": ["a", "b", "c"]},
+        schema={"id": pl.String},
+    )
+    edges = pl.DataFrame(
+        {"id": ["ab", "bc"], "src": ["a", "b"], "dest": ["b", "c"]},
+        schema={"id": pl.String, "src": pl.String, "dest": pl.String},
+    )
+    g = rxg.Graph(nodes, edges)
+
+    assert g.bfs("a") == ["a", "b", "c"]
+    assert g.shortest_path("a", "c") == ["a", "b", "c"]
 
 
 def test_missing_node_errors_are_informative() -> None:

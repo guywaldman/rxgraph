@@ -5,8 +5,6 @@ printed, and then the next scale starts. ``rxgraph-df`` uses the DataFrame API;
 ``rxgraph-python`` uses ``Graph.from_edges``.
 """
 
-# fmt: off
-
 import argparse
 import gc
 import math
@@ -97,7 +95,16 @@ def main() -> None:
 
 def args_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Benchmark rxgraph algorithms.")
-    for name, default in [("low_nodes", 10_000), ("mid_nodes", 100_000), ("high_nodes", 1_000_000), ("extra_edges", 4), ("runs", 10), ("warmups", 3), ("max_paths", 50), ("traversal_fanout", 256)]:
+    for name, default in [
+        ("low_nodes", 10_000),
+        ("mid_nodes", 100_000),
+        ("high_nodes", 1_000_000),
+        ("extra_edges", 4),
+        ("runs", 10),
+        ("warmups", 3),
+        ("max_paths", 50),
+        ("traversal_fanout", 256),
+    ]:
         p.add_argument(f"--{name.replace('_', '-')}", type=int, default=default)
     p.add_argument("--json", type=Path, default=Path("dist/algorithm-benchmarks.json"))
     return p
@@ -114,15 +121,43 @@ def make_scales(args: argparse.Namespace) -> list[Scale]:
 
 
 def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
-    simple, travel = simple_data(scale.nodes, scale.fanout), travel_data(scale.nodes, args.traversal_fanout)
+    simple, travel = (
+        simple_data(scale.nodes, scale.fanout),
+        travel_data(scale.nodes, args.traversal_fanout),
+    )
     cases = simple_cases(simple) + travel_cases(travel, args.max_paths)
-    return [measure(case, scale, travel if case.alg == "traversal" else simple, args.warmups, args.runs) for case in cases]
+    return [
+        measure(
+            case,
+            scale,
+            travel if case.alg == "traversal" else simple,
+            args.warmups,
+            args.runs,
+        )
+        for case in cases
+    ]
 
 
 def simple_data(n: int, fanout: int) -> Data:
     main = max(2, n - max(1, n // 20))
-    edges = [(src, dst) for src in range(main - 1) for step in range(1, fanout + 2) if (dst := src + step) < main and (step == 1 or dst % step == 0)]
-    return Data(df({"id": range(n)}, {"id": pl.UInt64}), df({"src": [s for s, _ in edges], "dest": [d for _, d in edges]}, {"src": pl.UInt64, "dest": pl.UInt64}), main - 1)
+    edges = [
+        (src, dst)
+        for src in range(main - 1)
+        for step in range(1, fanout + 2)
+        if (dst := src + step) < main and (step == 1 or dst % step == 0)
+    ]
+    return Data(
+        df({"id": range(n)}, {"id": pl.UInt64}),
+        df(
+            {
+                "id": range(len(edges)),
+                "src": [s for s, _ in edges],
+                "dest": [d for _, d in edges],
+            },
+            {"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+        ),
+        main - 1,
+    )
 
 
 def travel_data(n: int, noise: int) -> Data:
@@ -170,16 +205,16 @@ def travel_data(n: int, noise: int) -> Data:
                 for i in range(max(noise, 0))
                 if (dst := 1 + ((src + i * 37 + 17) % (n - 1))) != src
             ]
+    for i, row in enumerate(rows):
+        row["id"] = i
+
     return Data(
         df(
             {
                 "id": range(n),
                 "risk": [(i * 7) % 9 for i in range(n)],
                 "min_connection": [35 + ((i * 11) % 50) for i in range(n)],
-                "closed": [
-                    i not in {0, n - 1} and i % 23 == 0 and i % step != 0
-                    for i in range(n)
-                ],
+                "closed": [i not in {0, n - 1} and i % 23 == 0 and i % step != 0 for i in range(n)],
             },
             {
                 "id": pl.UInt64,
@@ -191,6 +226,7 @@ def travel_data(n: int, noise: int) -> Data:
         df(
             rows,
             {
+                "id": pl.UInt64,
                 "src": pl.UInt64,
                 "dest": pl.UInt64,
                 "price": pl.UInt64,
@@ -208,9 +244,7 @@ def df(data: Any, schema: dict[str, Any]) -> pl.DataFrame:
     return pl.DataFrame(data, schema=schema)
 
 
-def flight(
-    src: int, dst: int, price: int, reliability: int, kind: str, detour: int
-) -> dict[str, int | str]:
+def flight(src: int, dst: int, price: int, reliability: int, kind: str, detour: int) -> dict[str, int | str]:
     depart = src * 120 + (dst % 9) * 7
     return {
         "src": src,
@@ -225,43 +259,42 @@ def flight(
 
 
 def simple_cases(data: Data) -> list[Case]:
-    return [
-        case
-        for lib, graph in simple_graphs(data).items()
-        for case in alg_cases(lib, graph, data)
-    ]
+    return [case for lib, graph in simple_graphs(data).items() for case in alg_cases(lib, graph, data)]
 
 
 def simple_graphs(data: Data) -> dict[str, Any]:
+    string_data = string_ids(data)
     graphs = {
-        "rxgraph-df": rxg.Graph([("n", data.nodes)], [("e", data.edges)]),
-        "rxgraph-python": rxg.Graph.from_edges(
-            data.pairs, nodes=range(data.nodes.height)
-        ),
+        "rxgraph-df": rxg.Graph(data.nodes, data.edges),
+        "rxgraph-df-string-ids": rxg.Graph(string_data.nodes, string_data.edges),
+        "rxgraph-python": rxg.Graph.from_edges(data.pairs, nodes=range(data.nodes.height)),
     }
     if nx := opt("networkx"):
         graphs["networkx"] = nx.MultiDiGraph()
         graphs["networkx"].add_nodes_from(range(data.nodes.height))
         graphs["networkx"].add_edges_from(data.pairs)
     if ig := opt("igraph"):
-        graphs["igraph"] = ig.Graph(
-            n=data.nodes.height, edges=data.pairs, directed=True
-        )
+        graphs["igraph"] = ig.Graph(n=data.nodes.height, edges=data.pairs, directed=True)
     return graphs
 
 
 def alg_cases(lib: str, graph: Any, data: Data) -> list[Case]:
     if is_rx(lib):
+        start = "0" if lib == "rxgraph-df-string-ids" else 0
+        target = str(data.target) if lib == "rxgraph-df-string-ids" else data.target
+        bfs_norm = numeric_set if lib == "rxgraph-df-string-ids" else set
+        path_norm = numeric_path_sig if lib == "rxgraph-df-string-ids" else path_sig
+        comp_norm = numeric_comp_sig if lib == "rxgraph-df-string-ids" else comp_sig
         return [
-            Case("bfs", lib, lambda: graph.bfs(0), set),
+            Case("bfs", lib, lambda: graph.bfs(start), bfs_norm),
             Case(
                 "shortest_path",
                 lib,
-                lambda: graph.shortest_path(0, data.target),
-                path_sig,
+                lambda: graph.shortest_path(start, target),
+                path_norm,
             ),
             Case("degrees", lib, graph.degrees),
-            Case("weak_components", lib, graph.weakly_connected_components, comp_sig),
+            Case("weak_components", lib, graph.weakly_connected_components, comp_norm),
         ]
     if lib == "networkx":
         import networkx as nx
@@ -287,9 +320,7 @@ def alg_cases(lib: str, graph: Any, data: Data) -> list[Case]:
         Case(
             "shortest_path",
             lib,
-            lambda: graph.get_shortest_paths(
-                0, to=data.target, mode="out", output="vpath"
-            )[0],
+            lambda: graph.get_shortest_paths(0, to=data.target, mode="out", output="vpath")[0],
             path_sig,
         ),
         Case("degrees", lib, lambda: graph.degree(mode="all")),
@@ -304,13 +335,19 @@ def alg_cases(lib: str, graph: Any, data: Data) -> list[Case]:
 
 def travel_cases(data: Data, max_paths: int) -> list[Case]:
     nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
-    graphs, kernel = travel_graphs(data, nodes, edges), travel_kernel(data.target)
-    traversal = rxg.Traversal(kernel, [0], 18, max_paths, "dfs")
+    graphs = travel_graphs(data, nodes, edges)
+    traversal = rxg.Traversal(travel_kernel(data.target), [0], 18, max_paths, "dfs")
+    string_traversal = rxg.Traversal(travel_kernel(str(data.target)), ["0"], 18, max_paths, "dfs")
     cases = [
         Case(
             "traversal",
             "rxgraph-df",
             lambda: graphs["rxgraph-df"].search(traversal).paths,
+        ),
+        Case(
+            "traversal",
+            "rxgraph-df-string-ids",
+            lambda: graphs["rxgraph-df-string-ids"].search(string_traversal).paths,
         ),
         Case(
             "traversal",
@@ -337,9 +374,7 @@ def travel_cases(data: Data, max_paths: int) -> list[Case]:
                 "traversal",
                 "igraph",
                 lambda: py_travel(
-                    lambda n: (
-                        (e.target, e.attributes()) for e in igg.es.select(_source=n)
-                    ),
+                    lambda n: ((e.target, e.attributes()) for e in igg.es.select(_source=n)),
                     lambda n: igg.vs[n].attributes(),
                     data.target,
                     max_paths,
@@ -349,13 +384,13 @@ def travel_cases(data: Data, max_paths: int) -> list[Case]:
     return cases
 
 
-def travel_graphs(
-    data: Data, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
-) -> dict[str, Any]:
+def travel_graphs(data: Data, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> dict[str, Any]:
+    string_data = string_ids(data)
     graphs = {
-        "rxgraph-df": rxg.Graph([("airport", data.nodes)], [("flight", data.edges)]),
+        "rxgraph-df": rxg.Graph(data.nodes, data.edges),
+        "rxgraph-df-string-ids": rxg.Graph(string_data.nodes, string_data.edges),
         "rxgraph-python": rxg.Graph.from_edges(
-            [(e["src"], e["dest"], omit(e, "src", "dest")) for e in edges],
+            [(e["src"], e["dest"], omit(e, "id", "src", "dest")) for e in edges],
             nodes=[(n["id"], omit(n, "id")) for n in nodes],
         ),
     }
@@ -377,7 +412,7 @@ def travel_graphs(
     return graphs
 
 
-def travel_kernel(target: int) -> rxg.Kernel:
+def travel_kernel(target: int | str) -> rxg.Kernel:
     s, d, e = (
         (lambda n: rxg.col(f"state.{n}")),
         (lambda n: rxg.col(f"dest.{n}")),
@@ -404,12 +439,24 @@ def travel_kernel(target: int) -> rxg.Kernel:
     )
 
 
+def string_ids(data: Data) -> Data:
+    return Data(
+        data.nodes.with_columns(pl.col("id").cast(pl.String)),
+        data.edges.with_columns(
+            pl.col("id").cast(pl.String),
+            pl.col("src").cast(pl.String),
+            pl.col("dest").cast(pl.String),
+        ),
+        data.target,
+    )
+
+
 def py_travel(
     out_edges: Callable[[int], Any],
     node_data: Callable[[int], dict[str, Any]],
     target: int,
     max_paths: int,
-) -> list[int]:
+) -> list[tuple[int, ...]]:
     frontier, paths = [(0, (0,), INIT)], []
     while frontier and len(paths) < max_paths:
         node, path, state = frontier.pop()
@@ -424,9 +471,8 @@ def py_travel(
                 "risk": state["risk"] + dest["risk"],
                 "detours": state["detours"] + edge["detour_cost"],
             }
-            paths.append(dst) if dst == target else frontier.append(
-                (dst, (*path, dst), next_state)
-            )
+            next_path = (*path, dst)
+            paths.append(next_path) if dst == target else frontier.append((dst, next_path, next_state))
             if len(paths) >= max_paths:
                 break
     return paths
@@ -487,9 +533,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
         is_best = r.case.lib == best[r.bench]
         lib = Text(
             f"{r.case.lib} (best)" if is_best else r.case.lib,
-            style="bold green"
-            if is_best
-            else ("bold cyan" if is_rx(r.case.lib) else ""),
+            style="bold green" if is_best else ("bold cyan" if is_rx(r.case.lib) else ""),
         )
         table.add_row(
             r.bench,
@@ -503,9 +547,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
             end_section=i + 1 < len(ordered) and ordered[i + 1].case.alg != r.case.alg,
             style="bold" if is_rx(r.case.lib) else None,
         )
-    console.print(
-        f"[bold]Workload[/bold]: {scale.name}={fmt_count(scale.nodes)} nodes/fanout {scale.fanout}"
-    )
+    console.print(f"[bold]Workload[/bold]: {scale.name}={fmt_count(scale.nodes)} nodes/fanout {scale.fanout}")
     console.print(table)
 
 
@@ -546,10 +588,7 @@ def best_by_bench(results: list[Result]) -> dict[str, str]:
     by_bench = {r.bench: [] for r in results}
     for r in results:
         by_bench[r.bench].append(r)
-    return {
-        bench: min(rows, key=lambda r: (r.median, lib_order(r.case.lib))).case.lib
-        for bench, rows in by_bench.items()
-    }
+    return {bench: min(rows, key=lambda r: (r.median, lib_order(r.case.lib))).case.lib for bench, rows in by_bench.items()}
 
 
 def lib_order(library: str) -> int:
@@ -557,10 +596,7 @@ def lib_order(library: str) -> int:
 
 
 def rx_baselines(results: list[Result]) -> dict[str, float]:
-    return {
-        b: next(r.median for r in results if r.bench == b and r.case.lib == "rxgraph-df")
-        for b in {r.bench for r in results}
-    }
+    return {b: next(r.median for r in results if r.bench == b and r.case.lib == "rxgraph-df") for b in {r.bench for r in results}}
 
 
 def plain_speedup(r: Result, baseline: float) -> str:
@@ -599,11 +635,7 @@ def fmt_count(value: int) -> str:
     for suffix, unit in (("B", 1_000_000_000), ("M", 1_000_000), ("K", 1_000)):
         if abs(value) >= unit:
             scaled = value / unit
-            return (
-                f"{scaled:.0f}{suffix}"
-                if scaled >= 10 or scaled.is_integer()
-                else f"{scaled:.1f}{suffix}"
-            )
+            return f"{scaled:.0f}{suffix}" if scaled >= 10 or scaled.is_integer() else f"{scaled:.1f}{suffix}"
     return str(value)
 
 
@@ -626,8 +658,20 @@ def path_sig(path: list[int] | None) -> tuple[int, int, int] | None:
     return None if not path else (path[0], path[-1], len(path))
 
 
+def numeric_path_sig(path: list[int | str] | None) -> tuple[int, int, int] | None:
+    return None if not path else (int(path[0]), int(path[-1]), len(path))
+
+
 def comp_sig(components: list[list[int]]) -> list[list[int]]:
     return sorted(sorted(c) for c in components)
+
+
+def numeric_comp_sig(components: list[list[int | str]]) -> list[list[int]]:
+    return sorted(sorted(int(v) for v in c) for c in components)
+
+
+def numeric_set(values: list[int | str]) -> set[int]:
+    return {int(value) for value in values}
 
 
 def omit(row: dict[str, Any], *keys: str) -> dict[str, Any]:

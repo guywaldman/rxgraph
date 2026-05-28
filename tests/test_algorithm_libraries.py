@@ -1,6 +1,7 @@
 from collections import defaultdict
 
 from benches.main import (
+    INIT,
     Result,
     Scale,
     best_by_bench,
@@ -9,6 +10,9 @@ from benches.main import (
     simple_graphs,
     simple_cases,
     simple_data,
+    travel_cases,
+    travel_data,
+    visit,
 )
 
 
@@ -22,11 +26,30 @@ def test_algorithm_cases_match_networkx_and_igraph() -> None:
 
     for name, results in by_name.items():
         assert "rxgraph-df" in results
+        assert "rxgraph-df-string-ids" in results
         assert "rxgraph-python" in results
+        assert "networkx" in results
+        assert "igraph" in results
         assert results["rxgraph-python"] == results["rxgraph-df"]
         for library, result in results.items():
             assert result == results["rxgraph-df"], f"{name} mismatch for {library}"
     assert len(by_name["weak_components"]["rxgraph-df"]) > 1
+
+
+def test_traversal_matches_reference_libraries() -> None:
+    data = travel_data(96, 8)
+    cases = travel_cases(data, max_paths=8)
+    by_lib = {case.lib: case.run() for case in cases}
+
+    for library in ["rxgraph-df", "rxgraph-df-string-ids", "rxgraph-python", "networkx", "igraph"]:
+        assert library in by_lib
+
+    reference = sorted(reference_travel_paths(data, max_paths=8))
+    assert normalize_rx_paths(by_lib["rxgraph-df"]) == reference
+    assert normalize_rx_paths(by_lib["rxgraph-df-string-ids"]) == reference
+    assert normalize_rx_paths(by_lib["rxgraph-python"]) == reference
+    assert normalize_reference_paths(by_lib["networkx"]) == reference
+    assert normalize_reference_paths(by_lib["igraph"]) == reference
 
 
 def test_benchmark_report_helpers_are_human_readable() -> None:
@@ -53,3 +76,38 @@ def result(library: str, median: float) -> Result:
         times=[median],
         size=1,
     )
+
+
+def reference_travel_paths(data, max_paths: int) -> list[tuple[int, ...]]:
+    nodes = {row["id"]: row for row in data.nodes.to_dicts()}
+    edges = defaultdict(list)
+    for row in data.edges.to_dicts():
+        edges[row["src"]].append(row)
+
+    frontier, paths = [(0, (0,), INIT)], []
+    while frontier and len(paths) < max_paths:
+        node, path, state = frontier.pop()
+        for edge in edges[node]:
+            dst = edge["dest"]
+            if dst in path or not visit(nodes[dst], edge, state):
+                continue
+            next_state = {
+                "spent": state["spent"] + edge["price"],
+                "hops": state["hops"] + 1,
+                "ready_at": edge["arrival"] + nodes[dst]["min_connection"],
+                "risk": state["risk"] + nodes[dst]["risk"],
+                "detours": state["detours"] + edge["detour_cost"],
+            }
+            next_path = (*path, dst)
+            paths.append(next_path) if dst == data.target else frontier.append((dst, next_path, next_state))
+            if len(paths) >= max_paths:
+                break
+    return paths
+
+
+def normalize_rx_paths(paths) -> list[tuple[int, ...]]:
+    return sorted(tuple(int(node) for node in path.nodes) for path in paths)
+
+
+def normalize_reference_paths(paths) -> list[tuple[int, ...]]:
+    return sorted(tuple(int(node) for node in path) for path in paths)

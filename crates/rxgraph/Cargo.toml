@@ -20,16 +20,23 @@ include = [
 [dependencies]
 anyhow.workspace = true
 arrow.workspace = true
+arrow-schema.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec.workspace = true
 sprs.workspace = true
 stats_alloc.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+pretty_assertions.workspace = true
+
+[[bench]]
+name = "payment_risk"
+harness = false
 
 [[bench]]
 name = "flight_routes"
 harness = false
-
-[dev-dependencies]
-criterion.workspace = true

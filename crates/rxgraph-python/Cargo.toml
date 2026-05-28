@@ -11,6 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 anyhow.workspace = true
+arrow.workspace = true
 pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-arrow.workspace = true
 rayon.workspace = true

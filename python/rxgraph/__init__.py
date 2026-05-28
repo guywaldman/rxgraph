@@ -17,22 +17,20 @@ class Graph:
 
     def __init__(
         self,
-        node_tables: list[tuple[str, Any]],
-        edge_tables: list[tuple[str, Any]],
+        nodes: Any,
+        edges: Any,
         *,
         _label_to_id: dict[Hashable, int] | None = None,
         _id_to_label: list[Hashable] | None = None,
     ) -> None:
-        self._inner = _rxgraph.Graph(node_tables, edge_tables)
+        self._inner = _rxgraph.Graph(_table(nodes), _table(edges))
         self._label_to_id = _label_to_id
         self._id_to_label = _id_to_label
 
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[
-            tuple[Hashable, Hashable] | tuple[Hashable, Hashable, Mapping[str, Any]]
-        ],
+        edges: Iterable[tuple[Hashable, Hashable] | tuple[Hashable, Hashable, Mapping[str, Any]]],
         *,
         nodes: Iterable[Hashable | tuple[Hashable, Mapping[str, Any]]] | None = None,
     ) -> Self:
@@ -69,17 +67,18 @@ class Graph:
         node_data = _rows_to_columns(node_attrs)
         node_data["id"] = list(range(len(id_to_label)))
         edge_data = _rows_to_columns(edge_attrs)
+        edge_data["id"] = list(range(len(edge_srcs)))
         edge_data["src"] = edge_srcs
         edge_data["dest"] = edge_dests
 
         node_table = pl.DataFrame(node_data, schema_overrides={"id": pl.UInt64})
         edge_table = pl.DataFrame(
             edge_data,
-            schema_overrides={"src": pl.UInt64, "dest": pl.UInt64},
+            schema_overrides={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
         )
         return cls(
-            [("node", node_table)],
-            [("edge", edge_table)],
+            node_table,
+            edge_table,
             _label_to_id=label_to_id,
             _id_to_label=id_to_label,
         )
@@ -93,17 +92,15 @@ class Graph:
         return self._inner.edge_count
 
     def node_id(self, label: Hashable) -> int:
-        """Return the internal numeric ID for a label in an object graph."""
+        """Return the graph ID used by the engine for a label."""
         if self._label_to_id is None:
-            if not isinstance(label, int):
-                raise ValueError("table-backed graphs use integer node ids")
+            if not isinstance(label, int | str):
+                raise ValueError("table-backed graph ids must be integers or strings")
             return label
         try:
             return self._label_to_id[label]
         except KeyError as exc:
-            raise ValueError(
-                f"node label {label!r} is not present in the graph"
-            ) from exc
+            raise ValueError(f"node label {label!r} is not present in the graph") from exc
 
     def search(self, traversal: "Traversal") -> "SearchResult":
         inner = self._inner.search(traversal._to_inner(self))
@@ -134,10 +131,7 @@ class Graph:
         return self._inner.degrees()
 
     def weakly_connected_components(self) -> list[list[Any]]:
-        return [
-            self._map_nodes(component)
-            for component in self._inner.weakly_connected_components()
-        ]
+        return [self._map_nodes(component) for component in self._inner.weakly_connected_components()]
 
     def _map_nodes(self, nodes: list[int]) -> list[Any]:
         if self._id_to_label is None:
@@ -155,18 +149,14 @@ class Traversal:
         max_depth: int,
         max_paths: int,
         strategy: str = "dfs",
-        parallel: str = "auto",
-        parallel_min_frontier: int = 512,
-        parallel_min_edges: int = 8192,
+        parallel: bool | str = True,
     ) -> None:
         self.kernel = kernel
         self.start_nodes = list(start_nodes)
         self.max_depth = max_depth
         self.max_paths = max_paths
         self.strategy = strategy
-        self.parallel = parallel
-        self.parallel_min_frontier = parallel_min_frontier
-        self.parallel_min_edges = parallel_min_edges
+        self.parallel = _parallel_bool(parallel)
 
     def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
         return _rxgraph.Traversal(
@@ -176,17 +166,13 @@ class Traversal:
             self.max_paths,
             self.strategy,
             self.parallel,
-            self.parallel_min_frontier,
-            self.parallel_min_edges,
         )
 
 
 class SearchPath:
     """One stopped path returned by a traversal."""
 
-    def __init__(
-        self, inner: _rxgraph.SearchPath, id_to_label: list[Hashable] | None
-    ) -> None:
+    def __init__(self, inner: _rxgraph.SearchPath, id_to_label: list[Hashable] | None) -> None:
         self._inner = inner
         self._id_to_label = id_to_label
 
@@ -202,7 +188,7 @@ class SearchPath:
 
     @property
     def state(self) -> str:
-        return self._inner.state
+        raise AttributeError("rxgraph paths do not materialize traversal state")
 
 
 class SearchResult:
@@ -237,7 +223,7 @@ def _parse_edge(
 
 
 def _attrs(attrs: Mapping[str, Any], kind: str) -> dict[str, Any]:
-    reserved = {"id"} if kind == "node" else {"src", "dest"}
+    reserved = {"id"} if kind == "node" else {"id", "src", "dest"}
     overlap = reserved.intersection(attrs)
     if overlap:
         names = ", ".join(sorted(overlap))
@@ -246,15 +232,26 @@ def _attrs(attrs: Mapping[str, Any], kind: str) -> dict[str, Any]:
 
 
 def _rows_to_columns(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    keys = sorted(
-        {
-            key
-            for row in rows
-            for key in row
-            if any(r.get(key) is not None for r in rows)
-        }
-    )
+    keys = sorted({key for row in rows for key in row if any(r.get(key) is not None for r in rows)})
     return {key: [row.get(key) for row in rows] for key in keys}
+
+
+def _table(value: Any) -> Any:
+    if isinstance(value, list):
+        if len(value) != 1:
+            raise ValueError("rxgraph expects one node DataFrame and one edge DataFrame")
+        return value[0][1]
+    return value
+
+
+def _parallel_bool(value: bool | str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value in {"on", "auto"}:
+        return True
+    if value == "off":
+        return False
+    raise ValueError("parallel must be a bool, or one of 'on', 'off', 'auto'")
 
 
 __all__ = [

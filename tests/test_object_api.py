@@ -1,5 +1,3 @@
-import json
-
 import pytest
 import rxgraph as rxg
 
@@ -55,7 +53,7 @@ def test_from_edges_traversal_uses_polars_reexports_and_returns_labels() -> None
 
     assert len(result.paths) == 1
     assert result.paths[0].nodes == ["a", "b", "c"]
-    assert json.loads(result.paths[0].state)["spent"] == 11
+    assert result.paths[0].edges == [0, 1]
 
 
 def test_from_edges_errors_for_unknown_label_and_reserved_attrs() -> None:
@@ -67,3 +65,5 @@ def test_from_edges_errors_for_unknown_label_and_reserved_attrs() -> None:
         rxg.Graph.from_edges([], nodes=[("a", {"id": 1})])
     with pytest.raises(ValueError, match="reserved keys: src"):
         rxg.Graph.from_edges([("a", "b", {"src": 1})])
+    with pytest.raises(ValueError, match="reserved keys: id"):
+        rxg.Graph.from_edges([("a", "b", {"id": 1})])

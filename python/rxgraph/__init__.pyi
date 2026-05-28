@@ -4,6 +4,7 @@ from typing import Any, Literal, Self, TypeVar
 from polars import DataFrame, Expr, col as col, lit as lit
 
 Node = TypeVar("Node", bound=Hashable)
+GraphId = int | str
 
 def rayon_thread_count() -> int:
     """Return the Rayon worker thread count used by rxgraph."""
@@ -14,13 +15,14 @@ class Graph:
 
     def __init__(
         self,
-        node_tables: list[tuple[str, DataFrame]],
-        edge_tables: list[tuple[str, DataFrame]],
+        nodes: DataFrame | list[tuple[str, DataFrame]],
+        edges: DataFrame | list[tuple[str, DataFrame]],
     ) -> None:
         """Build a graph from node and edge tables.
 
-        Node tables require an ``id`` UInt64 column. Edge tables require
-        ``src`` and ``dest`` UInt64 columns.
+        Nodes require ``id`` and edges require ``id``, ``src``, and ``dest``.
+        All ID columns must be either UInt64 or string. Optional ``type``
+        columns must be string when present.
         """
         ...
 
@@ -38,8 +40,8 @@ class Graph:
     def node_count(self) -> int: ...
     @property
     def edge_count(self) -> int: ...
-    def node_id(self, label: Hashable) -> int:
-        """Return the internal numeric ID for a node label."""
+    def node_id(self, label: Hashable) -> GraphId:
+        """Return the graph ID used by the engine for a node label."""
         ...
     def search(self, traversal: Traversal) -> SearchResult:
         """Run a traversal and return stopped paths plus traversal stats."""
@@ -97,14 +99,12 @@ class Traversal:
         max_depth: int,
         max_paths: int,
         strategy: Literal["dfs", "bfs"] = "dfs",
-        parallel: Literal["auto", "off", "on"] = "auto",
-        parallel_min_frontier: int = 512,
-        parallel_min_edges: int = 8192,
+        parallel: bool | Literal["auto", "off", "on"] = True,
     ) -> None:
         """Create a traversal.
 
-        ``strategy`` is ``"dfs"`` or ``"bfs"``. ``parallel`` affects only BFS;
-        DFS remains serial because its early-stop order is usually the point.
+        ``strategy`` is ``"dfs"`` or ``"bfs"``. ``parallel`` enables or disables
+        rxgraph parallel traversal.
         """
         ...
 
@@ -112,7 +112,9 @@ class SearchStats:
     """Counters collected while searching."""
 
     @property
-    def visited_path_entries(self) -> int: ...
+    def start_nodes(self) -> int: ...
+    @property
+    def path_entries(self) -> int: ...
     @property
     def evaluated_edges(self) -> int: ...
     @property
@@ -120,7 +122,9 @@ class SearchStats:
     @property
     def stopped_paths(self) -> int: ...
     @property
-    def skipped_errors(self) -> int: ...
+    def rejected_edges(self) -> int: ...
+    @property
+    def skipped_revisits(self) -> int: ...
     @property
     def max_depth(self) -> int: ...
 
@@ -130,7 +134,7 @@ class SearchPath:
     @property
     def nodes(self) -> list[Any]: ...
     @property
-    def edges(self) -> list[int]: ...
+    def edges(self) -> list[Any]: ...
     @property
     def state(self) -> str: ...
 

@@ -1,4 +1,6 @@
 use pyo3::{
+    Borrowed,
+    conversion::IntoPyObjectExt,
     exceptions::{PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyAny, PyDict, PyString},
@@ -6,14 +8,15 @@ use pyo3::{
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
 use rxgraph::{
-    DslKernel, DslTraversalBuilder, EdgeId, Graph, GraphBuilder, Parallelism, Scalar, SearchPath,
-    SearchResult, SearchStats, TraversalStrategy,
+    DslKernel, Graph, GraphId, OwnedGraphId, Scalar, SearchResult, SearchStats,
+    TraversalConfigBuilder, TraversalStrategy,
 };
 use std::thread;
 
 #[pymodule]
 fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     initialize_rayon_pool();
+
     m.add_class::<PyGraph>()?;
     m.add_class::<PyKernel>()?;
     m.add_class::<PyTraversal>()?;
@@ -26,9 +29,7 @@ fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
 fn initialize_rayon_pool() {
     let threads = thread::available_parallelism().map_or(1, usize::from);
-    let _ = ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build_global();
+    let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
 }
 
 #[pyfunction]
@@ -44,62 +45,117 @@ struct PyGraph {
 #[pymethods]
 impl PyGraph {
     #[new]
-    #[pyo3(signature = (node_tables, edge_tables))]
-    fn new(
-        node_tables: Vec<(String, PyTable)>,
-        edge_tables: Vec<(String, PyTable)>,
-    ) -> PyResult<Self> {
-        let mut builder = GraphBuilder::new();
-
-        for (typ, table) in node_tables {
-            let (batches, _) = table.into_inner();
-            for batch in batches {
-                builder = builder.with_node_table(typ.clone(), batch);
-            }
-        }
-        for (typ, table) in edge_tables {
-            let (batches, _) = table.into_inner();
-            for batch in batches {
-                builder = builder.with_edge_table(typ.clone(), batch);
-            }
-        }
-
+    #[pyo3(signature = (nodes, edges))]
+    fn new(nodes: PyTable, edges: PyTable) -> PyResult<Self> {
         Ok(Self {
-            inner: builder.build().map_err(to_py_value_err)?,
+            inner: Graph::new(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
+                .map_err(to_py_value_err)?,
         })
     }
 
-    fn search(&self, traversal: &PyTraversal) -> PyResult<PySearchResult> {
-        let traversal = DslTraversalBuilder::new(traversal.kernel.clone())
+    fn search(&self, py: Python<'_>, traversal: &PyTraversal) -> PyResult<PySearchResult> {
+        let mut builder = TraversalConfigBuilder::new(traversal.kernel.clone())
             .with_start_nodes(traversal.start_nodes.clone())
-            .with_max_depth(traversal.max_depth)
-            .with_max_paths(traversal.max_paths)
             .with_strategy(traversal.strategy)
-            .with_parallelism(traversal.parallelism)
-            .build();
-        let result = self.inner.search(traversal).map_err(to_py_runtime_err)?;
+            .with_parallelism(traversal.parallel);
 
-        Ok(result.into())
+        if let Some(max_depth) = traversal.max_depth {
+            builder = builder.with_max_depth(max_depth);
+        }
+        if let Some(max_paths) = traversal.max_paths {
+            builder = builder.with_max_paths(max_paths);
+        }
+
+        PySearchResult::from_result(
+            py,
+            self.inner
+                .search(builder.build())
+                .map_err(to_py_runtime_err)?,
+        )
     }
 
     #[pyo3(signature = (start, max_depth = None))]
-    fn bfs(&self, start: u64, max_depth: Option<usize>) -> PyResult<Vec<u64>> {
-        self.inner.bfs(start, max_depth).map_err(to_py_value_err)
+    fn bfs(
+        &self,
+        py: Python<'_>,
+        start: PyGraphId,
+        max_depth: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        if let OwnedGraphId::U64(value) = &start.0
+            && let Some(ids) = self
+                .inner
+                .bfs_u64(*value, max_depth)
+                .map_err(to_py_value_err)?
+        {
+            return ids.into_py_any(py);
+        }
+        ids_to_py(
+            py,
+            self.inner
+                .bfs(start.0, max_depth)
+                .map_err(to_py_value_err)?,
+        )
     }
 
     #[pyo3(signature = (start, max_depth = None))]
-    fn dfs(&self, start: u64, max_depth: Option<usize>) -> PyResult<Vec<u64>> {
-        self.inner.dfs(start, max_depth).map_err(to_py_value_err)
+    fn dfs(
+        &self,
+        py: Python<'_>,
+        start: PyGraphId,
+        max_depth: Option<usize>,
+    ) -> PyResult<Py<PyAny>> {
+        if let OwnedGraphId::U64(value) = &start.0
+            && let Some(ids) = self
+                .inner
+                .dfs_u64(*value, max_depth)
+                .map_err(to_py_value_err)?
+        {
+            return ids.into_py_any(py);
+        }
+        ids_to_py(
+            py,
+            self.inner
+                .dfs(start.0, max_depth)
+                .map_err(to_py_value_err)?,
+        )
     }
 
-    fn reachable_nodes(&self, start: u64) -> PyResult<Vec<u64>> {
-        self.inner.reachable_nodes(start).map_err(to_py_value_err)
+    fn reachable_nodes(&self, py: Python<'_>, start: PyGraphId) -> PyResult<Py<PyAny>> {
+        if let OwnedGraphId::U64(value) = &start.0
+            && let Some(ids) = self
+                .inner
+                .reachable_nodes_u64(*value)
+                .map_err(to_py_value_err)?
+        {
+            return ids.into_py_any(py);
+        }
+        ids_to_py(
+            py,
+            self.inner
+                .reachable_nodes(start.0)
+                .map_err(to_py_value_err)?,
+        )
     }
 
-    fn shortest_path(&self, source: u64, target: u64) -> PyResult<Option<Vec<u64>>> {
+    fn shortest_path(
+        &self,
+        py: Python<'_>,
+        source: PyGraphId,
+        target: PyGraphId,
+    ) -> PyResult<Option<Py<PyAny>>> {
+        if let (OwnedGraphId::U64(source), OwnedGraphId::U64(target)) = (&source.0, &target.0)
+            && let Some(path) = self
+                .inner
+                .shortest_path_u64(*source, *target)
+                .map_err(to_py_value_err)?
+        {
+            return path.map(|path| path.into_py_any(py)).transpose();
+        }
         self.inner
-            .shortest_path(source, target)
-            .map_err(to_py_value_err)
+            .shortest_path(source.0, target.0)
+            .map_err(to_py_value_err)?
+            .map(|path| ids_to_py(py, path))
+            .transpose()
     }
 
     fn out_degrees(&self) -> Vec<usize> {
@@ -114,8 +170,11 @@ impl PyGraph {
         self.inner.degrees()
     }
 
-    fn weakly_connected_components(&self) -> Vec<Vec<u64>> {
-        self.inner.weakly_connected_components()
+    fn weakly_connected_components(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        if let Some(components) = self.inner.weakly_connected_components_u64() {
+            return components.into_py_any(py);
+        }
+        components_to_py(py, self.inner.weakly_connected_components())
     }
 
     #[getter]
@@ -127,6 +186,16 @@ impl PyGraph {
     fn edge_count(&self) -> usize {
         self.inner.edge_count()
     }
+}
+
+fn one_batch(table: PyTable, label: &str) -> PyResult<arrow::record_batch::RecordBatch> {
+    let (mut batches, _) = table.into_inner();
+    if batches.len() != 1 {
+        return Err(PyValueError::new_err(format!(
+            "{label} must be a single Arrow record batch"
+        )));
+    }
+    Ok(batches.remove(0))
 }
 
 #[pyclass(name = "Kernel", unsendable)]
@@ -169,7 +238,7 @@ impl PyKernel {
             .collect::<PyResult<Vec<_>>>()?;
 
         Ok(Self {
-            inner: DslKernel::new(
+            inner: DslKernel::from_polars_json(
                 &serialize_polars_expr(visit)?,
                 next_state,
                 &serialize_polars_expr(stop)?,
@@ -196,36 +265,24 @@ fn serialize_polars_expr(value: &Bound<'_, PyAny>) -> PyResult<String> {
 #[pyclass(name = "Traversal", unsendable)]
 struct PyTraversal {
     kernel: DslKernel,
-    start_nodes: Vec<u64>,
-    max_depth: usize,
-    max_paths: usize,
+    start_nodes: Vec<OwnedGraphId>,
+    max_depth: Option<usize>,
+    max_paths: Option<usize>,
     strategy: TraversalStrategy,
-    parallelism: Parallelism,
+    parallel: bool,
 }
 
 #[pymethods]
 impl PyTraversal {
     #[new]
-    #[pyo3(signature = (
-        kernel,
-        start_nodes,
-        max_depth,
-        max_paths,
-        strategy = "dfs",
-        parallel = "auto",
-        parallel_min_frontier = 512,
-        parallel_min_edges = 8192,
-    ))]
-    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true))]
     fn new(
         kernel: &PyKernel,
-        start_nodes: Vec<u64>,
-        max_depth: usize,
-        max_paths: usize,
+        start_nodes: Vec<PyGraphId>,
+        max_depth: Option<usize>,
+        max_paths: Option<usize>,
         strategy: &str,
-        parallel: &str,
-        parallel_min_frontier: usize,
-        parallel_min_edges: usize,
+        parallel: bool,
     ) -> PyResult<Self> {
         let strategy = match strategy {
             "dfs" => TraversalStrategy::DepthFirst,
@@ -236,34 +293,15 @@ impl PyTraversal {
                 )));
             }
         };
-        let parallelism = parse_parallelism(parallel, parallel_min_frontier, parallel_min_edges)?;
 
         Ok(Self {
             kernel: kernel.inner.clone(),
-            start_nodes,
+            start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
             max_depth,
             max_paths,
             strategy,
-            parallelism,
+            parallel,
         })
-    }
-}
-
-fn parse_parallelism(
-    parallel: &str,
-    min_frontier: usize,
-    min_edges: usize,
-) -> PyResult<Parallelism> {
-    match parallel {
-        "auto" => Ok(Parallelism::Auto),
-        "off" => Ok(Parallelism::Disabled),
-        "on" => Ok(Parallelism::Enabled {
-            min_frontier,
-            min_edges,
-        }),
-        other => Err(PyValueError::new_err(format!(
-            "unknown parallel mode {other:?}; expected 'auto', 'off', or 'on'"
-        ))),
     }
 }
 
@@ -275,12 +313,16 @@ struct PySearchResult {
     stats: PySearchStats,
 }
 
-impl From<SearchResult> for PySearchResult {
-    fn from(result: SearchResult) -> Self {
-        Self {
-            paths: result.paths.into_iter().map(Into::into).collect(),
+impl PySearchResult {
+    fn from_result(py: Python<'_>, result: SearchResult<'_>) -> PyResult<Self> {
+        Ok(Self {
+            paths: result
+                .paths
+                .into_iter()
+                .map(|path| PySearchPath::from_path(py, path))
+                .collect::<PyResult<_>>()?,
             stats: result.stats.into(),
-        }
+        })
     }
 }
 
@@ -288,15 +330,19 @@ impl From<SearchResult> for PySearchResult {
 #[derive(Clone)]
 struct PySearchStats {
     #[pyo3(get)]
-    visited_path_entries: usize,
+    start_nodes: usize,
+    #[pyo3(get)]
+    path_entries: usize,
     #[pyo3(get)]
     evaluated_edges: usize,
     #[pyo3(get)]
     accepted_edges: usize,
     #[pyo3(get)]
-    stopped_paths: usize,
+    rejected_edges: usize,
     #[pyo3(get)]
-    skipped_errors: usize,
+    skipped_revisits: usize,
+    #[pyo3(get)]
+    stopped_paths: usize,
     #[pyo3(get)]
     max_depth: usize,
 }
@@ -304,11 +350,13 @@ struct PySearchStats {
 impl From<SearchStats> for PySearchStats {
     fn from(stats: SearchStats) -> Self {
         Self {
-            visited_path_entries: stats.visited_path_entries,
+            start_nodes: stats.start_nodes,
+            path_entries: stats.path_entries,
             evaluated_edges: stats.evaluated_edges,
             accepted_edges: stats.accepted_edges,
+            rejected_edges: stats.rejected_edges,
+            skipped_revisits: stats.skipped_revisits,
             stopped_paths: stats.stopped_paths,
-            skipped_errors: stats.skipped_errors,
             max_depth: stats.max_depth,
         }
     }
@@ -317,21 +365,122 @@ impl From<SearchStats> for PySearchStats {
 #[pyclass(name = "SearchPath", frozen, skip_from_py_object)]
 #[derive(Clone)]
 struct PySearchPath {
-    #[pyo3(get)]
-    nodes: Vec<u64>,
-    #[pyo3(get)]
-    edges: Vec<EdgeId>,
-    #[pyo3(get)]
-    state: String,
+    nodes: Vec<OwnedGraphId>,
+    edges: Vec<OwnedGraphId>,
 }
 
-impl From<SearchPath> for PySearchPath {
-    fn from(path: SearchPath) -> Self {
-        Self {
-            nodes: path.nodes,
-            edges: path.edges,
-            state: path.state.to_string(),
+impl PySearchPath {
+    fn from_path(_py: Python<'_>, path: rxgraph::GraphPath<'_>) -> PyResult<Self> {
+        Ok(Self {
+            nodes: path.nodes.into_iter().map(GraphId::into_owned).collect(),
+            edges: path.edges.into_iter().map(GraphId::into_owned).collect(),
+        })
+    }
+}
+
+#[pymethods]
+impl PySearchPath {
+    #[getter]
+    fn nodes(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        owned_ids_to_py(py, &self.nodes)
+    }
+
+    #[getter]
+    fn edges(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        owned_ids_to_py(py, &self.edges)
+    }
+}
+
+struct PyGraphId(OwnedGraphId);
+
+impl FromPyObject<'_, '_> for PyGraphId {
+    type Error = PyErr;
+
+    fn extract(obj: Borrowed<'_, '_, PyAny>) -> Result<Self, Self::Error> {
+        if let Ok(value) = obj.extract::<u64>() {
+            return Ok(Self(OwnedGraphId::U64(value)));
         }
+        if let Ok(value) = obj.extract::<String>() {
+            return Ok(Self(OwnedGraphId::Str(value)));
+        }
+        Err(PyTypeError::new_err("graph IDs must be int or str"))
+    }
+}
+
+fn ids_to_py(py: Python<'_>, ids: Vec<GraphId<'_>>) -> PyResult<Py<PyAny>> {
+    if ids.iter().all(|id| matches!(id, GraphId::U64(_))) {
+        ids.into_iter()
+            .map(|id| match id {
+                GraphId::U64(value) => value,
+                GraphId::Str(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
+    } else {
+        ids.into_iter()
+            .map(|id| match id {
+                GraphId::Str(value) => value.to_owned(),
+                GraphId::U64(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
+    }
+}
+
+fn owned_ids_to_py(py: Python<'_>, ids: &[OwnedGraphId]) -> PyResult<Py<PyAny>> {
+    if ids.iter().all(|id| matches!(id, OwnedGraphId::U64(_))) {
+        ids.iter()
+            .map(|id| match id {
+                OwnedGraphId::U64(value) => *value,
+                OwnedGraphId::Str(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
+    } else {
+        ids.iter()
+            .map(|id| match id {
+                OwnedGraphId::Str(value) => value.clone(),
+                OwnedGraphId::U64(_) => unreachable!(),
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
+    }
+}
+
+fn components_to_py(py: Python<'_>, components: Vec<Vec<GraphId<'_>>>) -> PyResult<Py<PyAny>> {
+    let u64_mode = components
+        .iter()
+        .flat_map(|component| component.iter())
+        .all(|id| matches!(id, GraphId::U64(_)));
+
+    if u64_mode {
+        components
+            .into_iter()
+            .map(|component| {
+                component
+                    .into_iter()
+                    .map(|id| match id {
+                        GraphId::U64(value) => value,
+                        GraphId::Str(_) => unreachable!(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
+    } else {
+        components
+            .into_iter()
+            .map(|component| {
+                component
+                    .into_iter()
+                    .map(|id| match id {
+                        GraphId::Str(value) => value.to_owned(),
+                        GraphId::U64(_) => unreachable!(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_py_any(py)
     }
 }
 
@@ -362,9 +511,9 @@ fn py_to_scalar(value: &Bound<'_, PyAny>) -> PyResult<Scalar> {
 }
 
 fn to_py_value_err(err: anyhow::Error) -> PyErr {
-    PyValueError::new_err(err.to_string())
+    PyValueError::new_err(format!("{err:#}"))
 }
 
 fn to_py_runtime_err(err: anyhow::Error) -> PyErr {
-    PyRuntimeError::new_err(err.to_string())
+    PyRuntimeError::new_err(format!("{err:#}"))
 }
