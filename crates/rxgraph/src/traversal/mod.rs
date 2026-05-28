@@ -21,7 +21,7 @@
 mod algo;
 mod config;
 
-use crate::graph::GraphId;
+use crate::{dsl::StateRow, graph::GraphId};
 
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
 
@@ -36,7 +36,16 @@ pub struct GraphPath<'a> {
     pub nodes: Vec<GraphId<'a>>,
     /// Edge IDs in path order.
     pub edges: Vec<GraphId<'a>>,
-    // TODO: Final state + intermediate states(?)
+    /// Final named state after the last accepted edge.
+    ///
+    /// For a zero-edge path this is the kernel's initial state.
+    pub state: StateRow,
+    /// Optional per-node state history in path order.
+    ///
+    /// Present only when [`TraversalConfigBuilder::with_intermediate_states`]
+    /// is enabled. The first entry is the initial state at the start node; the
+    /// final entry equals [`GraphPath::state`].
+    pub intermediate_states: Option<Vec<StateRow>>,
 }
 
 /// Result of a graph traversal.

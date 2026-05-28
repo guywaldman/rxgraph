@@ -30,6 +30,8 @@
 //! );
 //! ```
 
+// TODO: Think of a better IR than JSON, and consider our own typed DSL.
+
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -495,6 +497,7 @@ pub(crate) struct BoundKernel {
     visit: Expr<BoundColumn>,
     next_state: Vec<(usize, Expr<BoundColumn>)>,
     stop: Expr<BoundColumn>,
+    names: Vec<String>,
     initial_state: StateValues,
 }
 
@@ -517,6 +520,7 @@ impl BoundKernel {
                 })
                 .collect::<Result<_>>()?,
             stop: kernel.stop.try_map_column(&mut bind)?,
+            names: names.clone(),
             initial_state: normalize_state(kernel.initial_state, &names),
         })
     }
@@ -539,6 +543,14 @@ impl BoundKernel {
 
     pub(crate) fn stop(&self, ctx: &EvalCtx<'_>) -> Result<bool> {
         self.stop.eval(ctx)?.truthy()
+    }
+
+    pub(crate) fn state_row(&self, state: &[Scalar]) -> StateRow {
+        self.names
+            .iter()
+            .cloned()
+            .zip(state.iter().cloned())
+            .collect()
     }
 }
 

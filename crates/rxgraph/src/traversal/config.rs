@@ -38,6 +38,11 @@ pub struct TraversalConfig {
     pub max_revisits_per_node: usize,
     /// Whether Rayon-backed parallel traversal is enabled.
     pub parallel: bool,
+    /// Whether returned paths include per-node state history.
+    ///
+    /// Final path state is always returned. Intermediate states clone state for
+    /// every node in each returned path, so this is disabled by default.
+    pub intermediate_states: bool,
 }
 
 /// Builder for a [`TraversalConfig`].
@@ -70,6 +75,7 @@ pub struct TraversalConfigBuilder {
     strategy: TraversalStrategy,
     max_revisits_per_node: usize,
     parallel: bool,
+    intermediate_states: bool,
 }
 
 impl TraversalConfigBuilder {
@@ -83,6 +89,7 @@ impl TraversalConfigBuilder {
             strategy: TraversalStrategy::DepthFirst,
             max_revisits_per_node: 0,
             parallel: true,
+            intermediate_states: false,
         }
     }
 
@@ -128,6 +135,15 @@ impl TraversalConfigBuilder {
         self
     }
 
+    /// Enables or disables per-node state history on returned paths.
+    ///
+    /// Final path state is always materialized. Enable this only when callers
+    /// need the state at each node along the returned path.
+    pub fn with_intermediate_states(mut self, enabled: bool) -> Self {
+        self.intermediate_states = enabled;
+        self
+    }
+
     /// Builds the immutable traversal configuration.
     pub fn build(self) -> TraversalConfig {
         TraversalConfig {
@@ -138,6 +154,7 @@ impl TraversalConfigBuilder {
             strategy: self.strategy,
             max_revisits_per_node: self.max_revisits_per_node,
             parallel: self.parallel,
+            intermediate_states: self.intermediate_states,
         }
     }
 }

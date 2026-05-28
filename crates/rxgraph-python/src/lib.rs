@@ -3,12 +3,12 @@ use pyo3::{
     conversion::IntoPyObjectExt,
     exceptions::{PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
-    types::{PyAny, PyDict, PyString},
+    types::{PyAny, PyDict, PyList, PyString},
 };
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
 use rxgraph::{
-    DslKernel, Graph, GraphId, OwnedGraphId, Scalar, SearchResult, SearchStats,
+    DslKernel, Graph, GraphId, OwnedGraphId, Scalar, SearchResult, SearchStats, StateRow,
     TraversalConfigBuilder, TraversalStrategy,
 };
 use std::thread;
@@ -57,7 +57,8 @@ impl PyGraph {
         let mut builder = TraversalConfigBuilder::new(traversal.kernel.clone())
             .with_start_nodes(traversal.start_nodes.clone())
             .with_strategy(traversal.strategy)
-            .with_parallelism(traversal.parallel);
+            .with_parallelism(traversal.parallel)
+            .with_intermediate_states(traversal.intermediate_states);
 
         if let Some(max_depth) = traversal.max_depth {
             builder = builder.with_max_depth(max_depth);
@@ -270,12 +271,13 @@ struct PyTraversal {
     max_paths: Option<usize>,
     strategy: TraversalStrategy,
     parallel: bool,
+    intermediate_states: bool,
 }
 
 #[pymethods]
 impl PyTraversal {
     #[new]
-    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true))]
+    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false))]
     fn new(
         kernel: &PyKernel,
         start_nodes: Vec<PyGraphId>,
@@ -283,6 +285,7 @@ impl PyTraversal {
         max_paths: Option<usize>,
         strategy: &str,
         parallel: bool,
+        intermediate_states: bool,
     ) -> PyResult<Self> {
         let strategy = match strategy {
             "dfs" => TraversalStrategy::DepthFirst,
@@ -301,6 +304,7 @@ impl PyTraversal {
             max_paths,
             strategy,
             parallel,
+            intermediate_states,
         })
     }
 }
@@ -367,6 +371,8 @@ impl From<SearchStats> for PySearchStats {
 struct PySearchPath {
     nodes: Vec<OwnedGraphId>,
     edges: Vec<OwnedGraphId>,
+    state: StateRow,
+    intermediate_states: Option<Vec<StateRow>>,
 }
 
 impl PySearchPath {
@@ -374,6 +380,8 @@ impl PySearchPath {
         Ok(Self {
             nodes: path.nodes.into_iter().map(GraphId::into_owned).collect(),
             edges: path.edges.into_iter().map(GraphId::into_owned).collect(),
+            state: path.state,
+            intermediate_states: path.intermediate_states,
         })
     }
 }
@@ -388,6 +396,19 @@ impl PySearchPath {
     #[getter]
     fn edges(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         owned_ids_to_py(py, &self.edges)
+    }
+
+    #[getter]
+    fn state(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        state_to_py(py, self.state.clone())
+    }
+
+    #[getter]
+    fn intermediate_states(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.intermediate_states
+            .as_ref()
+            .map(|states| states_to_py(py, states.clone()))
+            .transpose()
     }
 }
 
@@ -444,6 +465,33 @@ fn owned_ids_to_py(py: Python<'_>, ids: &[OwnedGraphId]) -> PyResult<Py<PyAny>> 
             })
             .collect::<Vec<_>>()
             .into_py_any(py)
+    }
+}
+
+fn states_to_py(py: Python<'_>, states: Vec<StateRow>) -> PyResult<Py<PyAny>> {
+    let values = states
+        .into_iter()
+        .map(|state| state_to_py(py, state))
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(PyList::new(py, values)?.into_any().unbind())
+}
+
+fn state_to_py(py: Python<'_>, state: StateRow) -> PyResult<Py<PyAny>> {
+    let dict = PyDict::new(py);
+    for (name, value) in state {
+        dict.set_item(name, scalar_to_py(py, value)?)?;
+    }
+    Ok(dict.into_any().unbind())
+}
+
+fn scalar_to_py(py: Python<'_>, value: Scalar) -> PyResult<Py<PyAny>> {
+    match value {
+        Scalar::Null => Ok(py.None()),
+        Scalar::Bool(value) => value.into_py_any(py),
+        Scalar::I64(value) => value.into_py_any(py),
+        Scalar::U64(value) => value.into_py_any(py),
+        Scalar::F64(value) => value.into_py_any(py),
+        Scalar::Str(value) => value.to_string().into_py_any(py),
     }
 }
 

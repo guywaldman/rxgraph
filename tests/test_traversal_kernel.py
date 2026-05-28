@@ -39,12 +39,18 @@ def test_polars_kernel_traversal() -> None:
         stop=pl.col("dest.id") == 2,
         initial_state={"spent": 0},
     )
-    traversal = rxg.Traversal(kernel, [0], 3, 10, "dfs")
+    traversal = rxg.Traversal(kernel, [0], 3, 10, "dfs", intermediate_states=True)
 
     result = graph.search(traversal)
 
     assert len(result.paths) == 1
     assert result.paths[0].nodes == [0, 1, 2]
+    assert result.paths[0].state == {"spent": 11}
+    assert result.paths[0].intermediate_states == [
+        {"spent": 0},
+        {"spent": 5},
+        {"spent": 11},
+    ]
     assert result.stats.evaluated_edges == 3
     assert result.stats.accepted_edges == 2
 

@@ -35,6 +35,7 @@ impl Graph {
             strategy,
             max_revisits_per_node,
             parallel,
+            intermediate_states,
         } = config;
         let kernel = kernel.bind(self)?;
         let cfg = RunConfig {
@@ -43,6 +44,7 @@ impl Graph {
             max_paths,
             strategy,
             max_revisits_per_node,
+            intermediate_states,
         };
 
         match (parallel, strategy) {
@@ -62,6 +64,7 @@ struct RunConfig {
     max_paths: Option<usize>,
     strategy: TraversalStrategy,
     max_revisits_per_node: usize,
+    intermediate_states: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +125,7 @@ fn search_serial<'a>(
             stats.max_depth = stats.max_depth.max(arena[child].depth);
 
             if stop {
-                paths.push(materialize(graph, &arena, child)?);
+                paths.push(materialize(graph, &arena, child, cfg, kernel)?);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
                     return Ok(SearchResult { paths, stats });
@@ -172,7 +175,7 @@ fn search_bfs_parallel<'a>(
                 stats.path_entries += 1;
                 stats.max_depth = stats.max_depth.max(arena[child].depth);
                 if stop {
-                    paths.push(materialize(graph, &arena, child)?);
+                    paths.push(materialize(graph, &arena, child, cfg, kernel)?);
                     stats.stopped_paths += 1;
                 } else {
                     next.push(child);
@@ -394,7 +397,7 @@ fn build_dfs_seeds<'a>(
         for (child, stop) in children {
             let child = push_task(&mut arena, 0, child);
             if stop {
-                paths.push(materialize_task(graph, &arena, child)?);
+                paths.push(materialize_task(graph, &arena, child, cfg, kernel)?);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
                     break;
@@ -436,7 +439,7 @@ fn dfs_seed<'a>(
                 let previous = found.fetch_add(1, Ordering::Relaxed);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_none_or(|max| previous < max) {
-                    paths.push(materialize_task(graph, &arena, child)?);
+                    paths.push(materialize_task(graph, &arena, child, cfg, kernel)?);
                 }
             } else {
                 stack.push(child);
@@ -562,9 +565,15 @@ fn materialize<'a>(
     graph: &'a Graph,
     arena: &[PathEntry],
     mut path: usize,
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
 ) -> Result<GraphPath<'a>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
+    let state = kernel.state_row(&arena[path].state);
+    let mut states = cfg
+        .intermediate_states
+        .then(|| Vec::with_capacity(nodes.capacity()));
 
     loop {
         nodes.push(
@@ -581,6 +590,9 @@ fn materialize<'a>(
                     .context("path references missing edge")?,
             );
         }
+        if let Some(states) = &mut states {
+            states.push(kernel.state_row(&arena[path].state));
+        }
         match arena[path].parent {
             Some(parent) => path = parent,
             None => break,
@@ -589,16 +601,30 @@ fn materialize<'a>(
 
     nodes.reverse();
     edges.reverse();
-    Ok(GraphPath { nodes, edges })
+    if let Some(states) = &mut states {
+        states.reverse();
+    }
+    Ok(GraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states: states,
+    })
 }
 
 fn materialize_task<'a>(
     graph: &'a Graph,
     arena: &[PathTask],
     mut path: usize,
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
 ) -> Result<GraphPath<'a>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
+    let state = kernel.state_row(&arena[path].state);
+    let mut states = cfg
+        .intermediate_states
+        .then(|| Vec::with_capacity(nodes.capacity()));
 
     loop {
         nodes.push(
@@ -615,6 +641,9 @@ fn materialize_task<'a>(
                     .context("path references missing edge")?,
             );
         }
+        if let Some(states) = &mut states {
+            states.push(kernel.state_row(&arena[path].state));
+        }
         match arena[path].parent {
             Some(parent) => path = parent,
             None => break,
@@ -623,7 +652,15 @@ fn materialize_task<'a>(
 
     nodes.reverse();
     edges.reverse();
-    Ok(GraphPath { nodes, edges })
+    if let Some(states) = &mut states {
+        states.reverse();
+    }
+    Ok(GraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states: states,
+    })
 }
 
 fn merge_stats(into: &mut SearchStats, from: SearchStats) {
@@ -748,6 +785,17 @@ mod tests {
         }
     }
 
+    fn state_u64(state: &[(String, Scalar)], name: &str) -> u64 {
+        match state
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value)
+        {
+            Some(Scalar::U64(value)) => *value,
+            other => panic!("expected {name} to be U64, got {other:?}"),
+        }
+    }
+
     #[test]
     fn returns_stopped_paths() {
         let graph = graph();
@@ -804,6 +852,52 @@ mod tests {
         assert_eq!(result.stats.accepted_edges, 1);
         assert_eq!(result.stats.rejected_edges, 1);
         assert_eq!(result.stats.max_depth, 1);
+    }
+
+    #[test]
+    fn returns_final_state_and_optional_intermediate_states() {
+        let kernel = DslKernel::new(
+            e::bool(true),
+            [("hops".into(), e::state("hops").plus(e::uint(1)))],
+            e::dest("kind").eq(e::string("end")),
+            [("hops".into(), Scalar::U64(0))],
+        );
+
+        let graph = graph();
+        let without_history = graph
+            .search(
+                TraversalConfigBuilder::new(kernel.clone())
+                    .with_start_nodes(["a".to_string()])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(state_u64(&without_history.paths[0].state, "hops"), 2);
+        assert!(without_history.paths[0].intermediate_states.is_none());
+
+        let with_history = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a".to_string()])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .with_intermediate_states(true)
+                    .build(),
+            )
+            .unwrap();
+
+        let states = with_history.paths[0].intermediate_states.as_ref().unwrap();
+        assert_eq!(states.len(), with_history.paths[0].nodes.len());
+        assert_eq!(
+            states
+                .iter()
+                .map(|state| state_u64(state, "hops"))
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(states.last().unwrap(), &with_history.paths[0].state);
     }
 
     #[test]

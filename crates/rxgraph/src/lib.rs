@@ -23,7 +23,7 @@ pub mod dsl;
 pub mod graph;
 pub mod traversal;
 
-pub use dsl::{DslExpr, DslKernel, Scalar};
+pub use dsl::{DslExpr, DslKernel, Scalar, StateRow};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
     GraphPath, SearchResult, SearchStats, TraversalConfig, TraversalConfigBuilder,

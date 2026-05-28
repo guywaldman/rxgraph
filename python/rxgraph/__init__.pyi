@@ -100,11 +100,13 @@ class Traversal:
         max_paths: int,
         strategy: Literal["dfs", "bfs"] = "dfs",
         parallel: bool | Literal["auto", "off", "on"] = True,
+        intermediate_states: bool = False,
     ) -> None:
         """Create a traversal.
 
         ``strategy`` is ``"dfs"`` or ``"bfs"``. ``parallel`` enables or disables
-        rxgraph parallel traversal.
+        rxgraph parallel traversal. ``intermediate_states`` stores per-node
+        state history on returned paths.
         """
         ...
 
@@ -136,7 +138,9 @@ class SearchPath:
     @property
     def edges(self) -> list[Any]: ...
     @property
-    def state(self) -> str: ...
+    def state(self) -> dict[str, Any]: ...
+    @property
+    def intermediate_states(self) -> list[dict[str, Any]] | None: ...
 
 class SearchResult:
     """Paths and stats returned by :meth:`Graph.search`."""

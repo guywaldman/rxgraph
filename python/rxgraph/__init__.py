@@ -150,6 +150,7 @@ class Traversal:
         max_paths: int,
         strategy: str = "dfs",
         parallel: bool | str = True,
+        intermediate_states: bool = False,
     ) -> None:
         self.kernel = kernel
         self.start_nodes = list(start_nodes)
@@ -157,6 +158,7 @@ class Traversal:
         self.max_paths = max_paths
         self.strategy = strategy
         self.parallel = _parallel_bool(parallel)
+        self.intermediate_states = intermediate_states
 
     def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
         return _rxgraph.Traversal(
@@ -166,6 +168,7 @@ class Traversal:
             self.max_paths,
             self.strategy,
             self.parallel,
+            self.intermediate_states,
         )
 
 
@@ -187,8 +190,12 @@ class SearchPath:
         return self._inner.edges
 
     @property
-    def state(self) -> str:
-        raise AttributeError("rxgraph paths do not materialize traversal state")
+    def state(self) -> dict[str, Any]:
+        return self._inner.state
+
+    @property
+    def intermediate_states(self) -> list[dict[str, Any]] | None:
+        return self._inner.intermediate_states
 
 
 class SearchResult:
