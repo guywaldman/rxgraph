@@ -1,3 +1,5 @@
+import json
+
 import polars as pl
 import pytest
 import rxgraph as rxg
@@ -33,15 +35,18 @@ def test_polars_kernel_traversal() -> None:
     s = lambda name: pl.col(f"state.{name}")
     d = lambda name: pl.col(f"dest.{name}")
     e = lambda name: pl.col(f"edge.{name}")
-    kernel = rxg.Kernel(
-        visit=(~d("closed")) & (e("kind") != "decoy") & ((s("spent") + e("price")) <= 12),
+    result = graph.search(
+        start_nodes=[0],
+        visit=(~d("closed"))
+        & (e("kind") != "decoy")
+        & ((s("spent") + e("price")) <= 12),
         next_state={"spent": s("spent") + e("price")},
         stop=pl.col("dest.id") == 2,
         initial_state={"spent": 0},
+        max_depth=3,
+        max_paths=10,
+        intermediate_states=True,
     )
-    traversal = rxg.Traversal(kernel, [0], 3, 10, "dfs", intermediate_states=True)
-
-    result = graph.search(traversal)
 
     assert len(result.paths) == 1
     assert result.paths[0].nodes == [0, 1, 2]
@@ -90,6 +95,76 @@ def test_search_accepts_kernel_params_and_list_state() -> None:
     ]
 
 
+def test_search_defaults_stop_when_max_paths_is_set() -> None:
+    graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
+
+    result = graph.search(start_nodes=["a"], max_paths=1)
+
+    assert result.paths[0].nodes == ["a", "b"]
+
+
+def test_search_requires_stop_or_max_paths() -> None:
+    graph = rxg.Graph.from_edges([("a", "b")])
+
+    with pytest.raises(TypeError, match="requires 'stop' or 'max_paths'"):
+        graph.search(start_nodes=["a"])
+
+
+def test_kernel_defaults_accept_and_never_stop() -> None:
+    assert json.loads(rxg.Kernel().visit.meta.serialize(format="json")) == {
+        "Literal": {"Scalar": {"Boolean": True}}
+    }
+    assert json.loads(rxg.Kernel().stop.meta.serialize(format="json")) == {
+        "Literal": {"Scalar": {"Boolean": False}}
+    }
+
+
+def test_search_defaults_stop_when_max_paths_is_set_even_if_kernel_does_not() -> None:
+    graph = rxg.Graph.from_edges([("a", "b")])
+    result = graph.search(start_nodes=["a"], max_depth=1, max_paths=1)
+
+    assert result.paths[0].nodes == ["a", "b"]
+
+
+def test_search_result_objects_do_not_expose_internals() -> None:
+    result = rxg.Graph.from_edges([("a", "b")]).search(
+        start_nodes=["a"],
+        max_paths=1,
+    )
+    path = result.paths[0]
+
+    assert not hasattr(result, "__dict__")
+    assert not hasattr(result, "_inner")
+    assert not hasattr(path, "__dict__")
+    assert not hasattr(path, "_inner")
+    assert not hasattr(path, "_id_to_label")
+    assert not hasattr(path, "_edge_id_to_label")
+    assert path.nodes == ["a", "b"]
+    assert path.edges == [0]
+
+
+def test_digraph_search_maps_reverse_edges_to_original_ids() -> None:
+    nodes = pl.DataFrame(
+        {"id": [1, 2, 3]},
+        schema={"id": pl.UInt64},
+    )
+    edges = pl.DataFrame(
+        {"id": [10, 11], "src": [1, 2], "dest": [2, 3]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    )
+    graph = rxg.DiGraph(nodes, edges)
+
+    result = graph.search(
+        start_nodes=[3],
+        stop=pl.col("dest.id") == 1,
+        max_depth=2,
+        max_paths=1,
+    )
+
+    assert result.paths[0].nodes == [3, 2, 1]
+    assert result.paths[0].edges == [11, 10]
+
+
 def test_search_docstrings_include_high_level_params() -> None:
     assert rxg.Graph.search.__doc__
     assert "visit" in rxg.Graph.search.__doc__
@@ -109,15 +184,24 @@ def test_parallel_bfs_matches_serial_bfs() -> None:
         schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
     )
     graph = rxg.Graph([("n", nodes)], [("e", edges)])
-    kernel = rxg.Kernel(
+    serial = graph.search(
+        start_nodes=[0],
         visit=~pl.col("dest.closed"),
-        next_state={},
         stop=pl.col("dest.id") == 3,
-        initial_state={},
+        max_depth=2,
+        max_paths=10,
+        strategy="bfs",
+        parallel="off",
     )
-
-    serial = graph.search(rxg.Traversal(kernel, [0], 2, 10, "bfs", "off"))
-    parallel = graph.search(rxg.Traversal(kernel, [0], 2, 10, "bfs", "on"))
+    parallel = graph.search(
+        start_nodes=[0],
+        visit=~pl.col("dest.closed"),
+        stop=pl.col("dest.id") == 3,
+        max_depth=2,
+        max_paths=10,
+        strategy="bfs",
+        parallel="on",
+    )
 
     assert parallel.paths[0].nodes == serial.paths[0].nodes
     assert parallel.stats.evaluated_edges == serial.stats.evaluated_edges
@@ -151,15 +235,14 @@ def test_kernel_schema_errors_are_informative() -> None:
         schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
     )
     graph = rxg.Graph([("n", nodes)], [("e", edges)])
-    kernel = rxg.Kernel(
-        visit=pl.col("edge.price") > 0,
-        next_state={},
-        stop=pl.col("dest.id") == 1,
-        initial_state={},
-    )
-
     with pytest.raises(
         RuntimeError,
         match='column "price" is missing',
     ):
-        graph.search(rxg.Traversal(kernel, [0], 1, 1, "dfs"))
+        graph.search(
+            start_nodes=[0],
+            visit=pl.col("edge.price") > 0,
+            stop=pl.col("dest.id") == 1,
+            max_depth=1,
+            max_paths=1,
+        )

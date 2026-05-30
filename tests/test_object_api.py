@@ -18,6 +18,19 @@ def test_from_edges_algorithms_return_labels() -> None:
     assert graph.weakly_connected_components() == [["a", "b", "c", "d"], ["isolated"]]
 
 
+def test_digraph_from_edges_traverses_both_directions() -> None:
+    graph = rxg.DiGraph.from_edges(
+        [("a", "b"), ("b", "c")],
+        nodes=["a", "b", "c", "isolated"],
+    )
+
+    assert graph.node_count == 4
+    assert graph.edge_count == 4
+    assert graph.shortest_path("c", "a") == ["c", "b", "a"]
+    assert graph.shortest_path("a", "c") == ["a", "b", "c"]
+    assert graph.reachable_nodes("isolated") == ["isolated"]
+
+
 def test_from_edges_accepts_integer_labels_that_are_not_internal_ids() -> None:
     graph = rxg.Graph.from_edges([(10, 20), (20, 30)])
 
@@ -42,14 +55,15 @@ def test_from_edges_traversal_uses_polars_reexports_and_returns_labels() -> None
     s = lambda name: rxg.col(f"state.{name}")
     d = lambda name: rxg.col(f"dest.{name}")
     e = lambda name: rxg.col(f"edge.{name}")
-    kernel = rxg.Kernel(
+    result = graph.search(
+        start_nodes=["a"],
         visit=(~d("closed")) & (e("kind") != "skip") & ((s("spent") + e("price")) < 20),
         next_state={"spent": s("spent") + e("price")},
         stop=rxg.col("dest.id") == rxg.lit(graph.node_id("c")),
         initial_state={"spent": 0},
+        max_depth=3,
+        max_paths=10,
     )
-
-    result = graph.search(rxg.Traversal(kernel, ["a"], max_depth=3, max_paths=10))
 
     assert len(result.paths) == 1
     assert result.paths[0].nodes == ["a", "b", "c"]

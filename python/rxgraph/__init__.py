@@ -4,12 +4,54 @@ from typing import Any, Self
 import polars as pl
 
 from . import _rxgraph
+from ._graph_tables import (
+    EdgeInput,
+    GraphTables,
+    NodeInput,
+    build_bidirectional_edges,
+    build_labeled_tables,
+    normalize_table,
+)
 
-Kernel = _rxgraph.Kernel
 SearchStats = _rxgraph.SearchStats
 col = pl.col
 lit = pl.lit
 rayon_thread_count = _rxgraph.rayon_thread_count
+DEFAULT_KERNEL_VISIT = pl.lit(True)
+DEFAULT_KERNEL_STOP = pl.lit(False)
+DEFAULT_SEARCH_STOP = pl.lit(True)
+
+
+class Kernel:
+    """Traversal kernel built from Polars expressions."""
+
+    __slots__ = ("visit", "next_state", "stop", "initial_state")
+
+    def __init__(
+        self,
+        visit: Any | None = None,
+        next_state: Mapping[str, Any] | None = None,
+        stop: Any | None = None,
+        initial_state: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Create a traversal kernel.
+
+        ``visit`` defaults to accepting every edge. ``stop`` defaults to never
+        emitting paths; :meth:`Graph.search` overrides this when ``max_paths`` is
+        supplied without an explicit ``stop``.
+        """
+        self.visit = DEFAULT_KERNEL_VISIT if visit is None else visit
+        self.next_state = dict(next_state or {})
+        self.stop = DEFAULT_KERNEL_STOP if stop is None else stop
+        self.initial_state = dict(initial_state or {})
+
+    def _to_inner(self) -> _rxgraph.Kernel:
+        return _rxgraph.Kernel(
+            self.visit,
+            self.next_state,
+            self.stop,
+            self.initial_state,
+        )
 
 
 class Graph:
@@ -22,66 +64,35 @@ class Graph:
         *,
         _label_to_id: dict[Hashable, int] | None = None,
         _id_to_label: list[Hashable] | None = None,
+        _edge_id_to_label: dict[Hashable, Hashable] | None = None,
     ) -> None:
-        self._inner = _rxgraph.Graph(_table(nodes), _table(edges))
+        self._inner = _rxgraph.Graph(normalize_table(nodes), normalize_table(edges))
         self._label_to_id = _label_to_id
         self._id_to_label = _id_to_label
+        self._edge_id_to_label = _edge_id_to_label
 
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[tuple[Hashable, Hashable] | tuple[Hashable, Hashable, Mapping[str, Any]]],
+        edges: Iterable[EdgeInput],
         *,
-        nodes: Iterable[Hashable | tuple[Hashable, Mapping[str, Any]]] | None = None,
+        nodes: Iterable[NodeInput] | None = None,
     ) -> Self:
-        label_to_id: dict[Hashable, int] = {}
-        id_to_label: list[Hashable] = []
-        node_attrs: list[dict[str, Any]] = []
+        tables = build_labeled_tables(edges, nodes)
+        return cls._from_tables(tables)
 
-        def add_node(label: Hashable, attrs: Mapping[str, Any] | None = None) -> int:
-            if label in label_to_id:
-                if attrs:
-                    node_attrs[label_to_id[label]].update(_attrs(attrs, "node"))
-                return label_to_id[label]
-
-            node_id = len(id_to_label)
-            label_to_id[label] = node_id
-            id_to_label.append(label)
-            node_attrs.append(_attrs(attrs or {}, "node"))
-            return node_id
-
-        if nodes is not None:
-            for node in nodes:
-                label, attrs = _parse_node(node)
-                add_node(label, attrs)
-
-        edge_srcs: list[int] = []
-        edge_dests: list[int] = []
-        edge_attrs: list[dict[str, Any]] = []
-        for edge in edges:
-            src, dest, attrs = _parse_edge(edge)
-            edge_srcs.append(add_node(src))
-            edge_dests.append(add_node(dest))
-            edge_attrs.append(_attrs(attrs or {}, "edge"))
-
-        node_data = _rows_to_columns(node_attrs)
-        node_data["id"] = list(range(len(id_to_label)))
-        edge_data = _rows_to_columns(edge_attrs)
-        edge_data["id"] = list(range(len(edge_srcs)))
-        edge_data["src"] = edge_srcs
-        edge_data["dest"] = edge_dests
-
-        node_table = pl.DataFrame(node_data, schema_overrides={"id": pl.UInt64})
-        edge_table = pl.DataFrame(
-            edge_data,
-            schema_overrides={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    @classmethod
+    def _from_tables(cls, tables: GraphTables) -> Self:
+        graph = cls.__new__(cls)
+        Graph.__init__(
+            graph,
+            tables.nodes,
+            tables.edges,
+            _label_to_id=tables.label_to_id,
+            _id_to_label=tables.id_to_label,
+            _edge_id_to_label=tables.edge_id_to_label,
         )
-        return cls(
-            node_table,
-            edge_table,
-            _label_to_id=label_to_id,
-            _id_to_label=id_to_label,
-        )
+        return graph
 
     @property
     def node_count(self) -> int:
@@ -100,13 +111,14 @@ class Graph:
         try:
             return self._label_to_id[label]
         except KeyError as exc:
-            raise ValueError(f"node label {label!r} is not present in the graph") from exc
+            raise ValueError(
+                f"node label {label!r} is not present in the graph"
+            ) from exc
 
     def search(
         self,
-        traversal: "Traversal | None" = None,
         *,
-        start_nodes: Iterable[Hashable] | None = None,
+        start_nodes: Iterable[Hashable],
         visit: Any | None = None,
         next_state: Mapping[str, Any] | None = None,
         stop: Any | None = None,
@@ -119,49 +131,38 @@ class Graph:
     ) -> "SearchResult":
         """Run a stateful traversal.
 
-        Pass an existing ``Traversal`` as the first argument, or pass traversal
-        parameters directly. ``visit`` is optional and defaults to accepting all
-        candidate edges. ``stop`` decides which accepted paths are returned.
-        ``next_state`` maps state names to Polars expressions evaluated after
-        each accepted edge. ``initial_state`` may contain scalars or Python
-        lists; list state can be updated with Polars list expressions such as
-        ``pl.concat_list``. ``strategy`` is ``"dfs"`` or ``"bfs"``.
+        ``visit`` defaults to accepting all candidate edges. ``stop`` decides
+        which accepted paths are returned; if omitted, ``max_paths`` is required
+        and every accepted edge is returned. ``next_state`` maps state names to
+        Polars expressions evaluated after each accepted edge. ``initial_state``
+        may contain scalars or Python lists; list state can be updated with
+        Polars list expressions such as ``pl.concat_list``. ``strategy`` is
+        ``"dfs"`` or ``"bfs"``.
+
+        >>> import rxgraph as rxg
+        >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
+        >>> result = graph.search(start_nodes=["a"], max_paths=1)
+        >>> result.paths[0].nodes
+        ['a', 'b']
         """
-        if traversal is None:
-            if start_nodes is None:
-                raise TypeError("search() missing required keyword argument: 'start_nodes'")
-            if stop is None:
-                raise TypeError("search() missing required keyword argument: 'stop'")
-            traversal = Traversal(
-                Kernel(
-                    pl.lit(True) if visit is None else visit,
-                    dict(next_state or {}),
-                    stop,
-                    dict(initial_state or {}),
-                ),
-                list(start_nodes),
-                max_depth,
-                max_paths,
-                strategy,
-                parallel,
-                intermediate_states,
-            )
-        elif any(
-            value is not None
-            for value in (
-                start_nodes,
+        stop = _default_stop(stop, max_paths)
+        traversal = Traversal(
+            Kernel(
                 visit,
                 next_state,
                 stop,
                 initial_state,
-                max_depth,
-                max_paths,
-            )
-        ) or strategy != "dfs" or parallel is not True or intermediate_states:
-            raise TypeError("search() accepts either a Traversal or traversal keyword arguments")
+            ),
+            list(start_nodes),
+            max_depth,
+            max_paths,
+            strategy,
+            parallel,
+            intermediate_states,
+        )
 
         inner = self._inner.search(traversal._to_inner(self))
-        return SearchResult(inner, self._id_to_label)
+        return SearchResult(inner, self._id_to_label, self._edge_id_to_label)
 
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         return self._map_nodes(self._inner.bfs(self.node_id(start), max_depth))
@@ -188,7 +189,10 @@ class Graph:
         return self._inner.degrees()
 
     def weakly_connected_components(self) -> list[list[Any]]:
-        return [self._map_nodes(component) for component in self._inner.weakly_connected_components()]
+        return [
+            self._map_nodes(component)
+            for component in self._inner.weakly_connected_components()
+        ]
 
     def _map_nodes(self, nodes: list[int]) -> list[Any]:
         if self._id_to_label is None:
@@ -196,12 +200,38 @@ class Graph:
         return [self._id_to_label[node] for node in nodes]
 
 
-class Traversal:
-    """Traversal configuration used by :meth:`Graph.search`.
+class DiGraph(Graph):
+    """Arrow-backed bidirectional graph."""
 
-    This class remains useful when the same traversal is reused. For one-off
-    searches, pass the same arguments directly to ``Graph.search``.
-    """
+    def __init__(
+        self,
+        nodes: Any,
+        edges: Any,
+    ) -> None:
+        edge_table, edge_id_to_label = build_bidirectional_edges(edges)
+        super().__init__(
+            nodes,
+            edge_table,
+            _edge_id_to_label=edge_id_to_label,
+        )
+
+    @classmethod
+    def from_edges(
+        cls,
+        edges: Iterable[EdgeInput],
+        *,
+        nodes: Iterable[NodeInput] | None = None,
+    ) -> Self:
+        tables = build_labeled_tables(
+            edges,
+            nodes,
+            bidirectional=True,
+        )
+        return cls._from_tables(tables)
+
+
+class Traversal:
+    """Low-level traversal configuration for the native engine."""
 
     def __init__(
         self,
@@ -232,7 +262,7 @@ class Traversal:
 
     def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
         return _rxgraph.Traversal(
-            self.kernel,
+            _inner_kernel(self.kernel),
             [graph.node_id(node) for node in self.start_nodes],
             self.max_depth,
             self.max_paths,
@@ -245,80 +275,56 @@ class Traversal:
 class SearchPath:
     """One stopped path returned by a traversal."""
 
-    def __init__(self, inner: _rxgraph.SearchPath, id_to_label: list[Hashable] | None) -> None:
-        self._inner = inner
-        self._id_to_label = id_to_label
+    __slots__ = ("nodes", "edges", "state", "intermediate_states")
 
-    @property
-    def nodes(self) -> list[Any]:
-        if self._id_to_label is None:
-            return self._inner.nodes
-        return [self._id_to_label[node] for node in self._inner.nodes]
-
-    @property
-    def edges(self) -> list[int]:
-        return self._inner.edges
-
-    @property
-    def state(self) -> dict[str, Any]:
-        return self._inner.state
-
-    @property
-    def intermediate_states(self) -> list[dict[str, Any]] | None:
-        return self._inner.intermediate_states
+    def __init__(
+        self,
+        inner: _rxgraph.SearchPath,
+        id_to_label: list[Hashable] | None,
+        edge_id_to_label: dict[Hashable, Hashable] | None,
+    ) -> None:
+        self.nodes = _map_search_nodes(inner.nodes, id_to_label)
+        self.edges = _map_search_edges(inner.edges, edge_id_to_label)
+        self.state = dict(inner.state)
+        self.intermediate_states = (
+            None
+            if inner.intermediate_states is None
+            else [dict(state) for state in inner.intermediate_states]
+        )
 
 
 class SearchResult:
     """Paths and stats returned by :meth:`Graph.search`."""
 
+    __slots__ = ("paths", "stats")
+
     def __init__(
         self,
         inner: _rxgraph.SearchResult,
         id_to_label: list[Hashable] | None,
+        edge_id_to_label: dict[Hashable, Hashable] | None,
     ) -> None:
-        self._inner = inner
-        self.paths = [SearchPath(path, id_to_label) for path in inner.paths]
+        self.paths = [
+            SearchPath(path, id_to_label, edge_id_to_label) for path in inner.paths
+        ]
         self.stats = inner.stats
 
 
-def _parse_node(
-    node: Hashable | tuple[Hashable, Mapping[str, Any]],
-) -> tuple[Hashable, Mapping[str, Any] | None]:
-    if isinstance(node, tuple) and len(node) == 2 and isinstance(node[1], Mapping):
-        return node[0], node[1]
-    return node, None
+def _map_search_nodes(
+    nodes: list[Any], id_to_label: list[Hashable] | None
+) -> list[Any]:
+    if id_to_label is None:
+        return list(nodes)
+    return [id_to_label[node] for node in nodes]
 
 
-def _parse_edge(
-    edge: tuple[Hashable, Hashable] | tuple[Hashable, Hashable, Mapping[str, Any]],
-) -> tuple[Hashable, Hashable, Mapping[str, Any] | None]:
-    if len(edge) == 2:
-        return edge[0], edge[1], None
-    if len(edge) == 3 and isinstance(edge[2], Mapping):
-        return edge[0], edge[1], edge[2]
-    raise ValueError("edges must be (src, dest) or (src, dest, attrs) tuples")
-
-
-def _attrs(attrs: Mapping[str, Any], kind: str) -> dict[str, Any]:
-    reserved = {"id"} if kind == "node" else {"id", "src", "dest"}
-    overlap = reserved.intersection(attrs)
-    if overlap:
-        names = ", ".join(sorted(overlap))
-        raise ValueError(f"{kind} attributes cannot use reserved keys: {names}")
-    return dict(attrs)
-
-
-def _rows_to_columns(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    keys = sorted({key for row in rows for key in row if any(r.get(key) is not None for r in rows)})
-    return {key: [row.get(key) for row in rows] for key in keys}
-
-
-def _table(value: Any) -> Any:
-    if isinstance(value, list):
-        if len(value) != 1:
-            raise ValueError("rxgraph expects one node DataFrame and one edge DataFrame")
-        return value[0][1]
-    return value
+def _map_search_edges(
+    edges: list[Any],
+    edge_id_to_label: dict[Hashable, Hashable] | None,
+) -> list[Any]:
+    if edge_id_to_label is None:
+        return list(edges)
+    return [edge_id_to_label[edge] for edge in edges]
 
 
 def _parallel_bool(value: bool | str) -> bool:
@@ -331,7 +337,22 @@ def _parallel_bool(value: bool | str) -> bool:
     raise ValueError("parallel must be a bool, or one of 'on', 'off', 'auto'")
 
 
+def _default_stop(stop: Any | None, max_paths: int | None) -> Any:
+    if stop is not None:
+        return stop
+    if max_paths is None:
+        raise TypeError("search() requires 'stop' or 'max_paths'")
+    return DEFAULT_SEARCH_STOP
+
+
+def _inner_kernel(kernel: Kernel | _rxgraph.Kernel) -> _rxgraph.Kernel:
+    if isinstance(kernel, Kernel):
+        return kernel._to_inner()
+    return kernel
+
+
 __all__ = [
+    "DiGraph",
     "Graph",
     "Kernel",
     "rayon_thread_count",

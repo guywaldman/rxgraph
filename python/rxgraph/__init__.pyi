@@ -1,5 +1,5 @@
 from collections.abc import Hashable, Iterable, Mapping
-from typing import Any, Literal, Self, TypeVar, overload
+from typing import Any, Literal, Self, TypeVar
 
 from polars import DataFrame, Expr, col as col, lit as lit
 
@@ -43,16 +43,13 @@ class Graph:
     def node_id(self, label: Hashable) -> GraphId:
         """Return the graph ID used by the engine for a node label."""
         ...
-    @overload
-    def search(self, traversal: Traversal) -> SearchResult: ...
-    @overload
     def search(
         self,
         *,
         start_nodes: Iterable[Hashable],
-        stop: Expr | str,
         visit: Expr | str | None = None,
         next_state: Mapping[str, Expr | str] | None = None,
+        stop: Expr | str | None = None,
         initial_state: Mapping[str, Any] | None = None,
         max_depth: int | None = None,
         max_paths: int | None = None,
@@ -85,26 +82,58 @@ class Graph:
         """Return weakly connected components, ignoring edge direction."""
         ...
 
-class Kernel:
-    """Traversal kernel built from Polars expressions."""
+class DiGraph(Graph):
+    """Arrow-backed bidirectional graph."""
 
     def __init__(
         self,
-        visit: Expr | str,
-        next_state: dict[str, Expr | str],
-        stop: Expr | str,
-        initial_state: Mapping[str, Any],
+        nodes: DataFrame | list[tuple[str, DataFrame]],
+        edges: DataFrame | list[tuple[str, DataFrame]],
+    ) -> None:
+        """Build a bidirectional graph from node and edge tables.
+
+        Each input edge is available in both directions. Reverse rows receive
+        synthetic engine IDs, but traversal path edges are mapped back to the
+        original input edge IDs.
+        """
+        ...
+
+    @classmethod
+    def from_edges(
+        cls,
+        edges: Iterable[tuple[Node, Node] | tuple[Node, Node, Mapping[str, Any]]],
+        *,
+        nodes: Iterable[Node | tuple[Node, Mapping[str, Any]]] | None = None,
+    ) -> Self:
+        """Build a bidirectional graph from Python node labels and edge tuples."""
+        ...
+
+class Kernel:
+    """Traversal kernel built from Polars expressions."""
+
+    visit: Expr | str
+    next_state: dict[str, Expr | str]
+    stop: Expr | str
+    initial_state: dict[str, Any]
+
+    def __init__(
+        self,
+        visit: Expr | str | None = None,
+        next_state: Mapping[str, Expr | str] | None = None,
+        stop: Expr | str | None = None,
+        initial_state: Mapping[str, Any] | None = None,
     ) -> None:
         """Create a kernel.
 
         ``visit`` decides whether an edge is accepted, ``next_state`` computes
         state updates for accepted edges, and ``stop`` decides whether an
-        accepted edge materializes a path.
+        accepted edge materializes a path. Defaults accept every edge, leave
+        state unchanged, never stop, and start with empty state.
         """
         ...
 
 class Traversal:
-    """Traversal configuration used by :meth:`Graph.search`."""
+    """Low-level traversal configuration for the native engine."""
 
     def __init__(
         self,
@@ -147,19 +176,13 @@ class SearchStats:
 class SearchPath:
     """One stopped path returned by a traversal."""
 
-    @property
-    def nodes(self) -> list[Any]: ...
-    @property
-    def edges(self) -> list[Any]: ...
-    @property
-    def state(self) -> dict[str, Any]: ...
-    @property
-    def intermediate_states(self) -> list[dict[str, Any]] | None: ...
+    nodes: list[Any]
+    edges: list[Any]
+    state: dict[str, Any]
+    intermediate_states: list[dict[str, Any]] | None
 
 class SearchResult:
     """Paths and stats returned by :meth:`Graph.search`."""
 
-    @property
-    def paths(self) -> list[SearchPath]: ...
-    @property
-    def stats(self) -> SearchStats: ...
+    paths: list[SearchPath]
+    stats: SearchStats
