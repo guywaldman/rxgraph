@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.8](https://github.com/guywaldman/rxgraph/compare/v0.0.7...v0.0.8) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** fix release pipeline trigger ([85c3978](https://github.com/guywaldman/rxgraph/commit/85c397824cab0980f4a41485059e99bef342c3dd))
+
 ## [0.0.7](https://github.com/guywaldman/rxgraph/compare/v0.0.6...v0.0.7) (2026-05-31)
 
 
