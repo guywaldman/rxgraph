@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.13](https://github.com/guywaldman/rxgraph/compare/v0.0.12...v0.0.13) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** explicitly set token in Cargo publish job ([999c281](https://github.com/guywaldman/rxgraph/commit/999c28163555e5d9e1216deb3e044f832a67c876))
+
 ## [0.0.12](https://github.com/guywaldman/rxgraph/compare/v0.0.11...v0.0.12) (2026-05-31)
 
 
