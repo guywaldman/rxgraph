@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.12](https://github.com/guywaldman/rxgraph/compare/v0.0.11...v0.0.12) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** attempt to resolve publishing & secret retrieval ([fb12050](https://github.com/guywaldman/rxgraph/commit/fb12050bc676917c00a894bb2997c4eab6996443))
+
 ## [0.0.11](https://github.com/guywaldman/rxgraph/compare/v0.0.10...v0.0.11) (2026-05-31)
 
 
