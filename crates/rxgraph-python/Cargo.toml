@@ -1,0 +1,18 @@
+[package]
+name = "rxgraph-python"
+version = "0.0.5"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "_rxgraph"
+crate-type = ["cdylib"]
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+pyo3 = { workspace = true, features = ["extension-module"] }
+pyo3-arrow.workspace = true
+rayon.workspace = true
+rxgraph.workspace = true

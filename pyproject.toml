@@ -1,16 +1,41 @@
 [build-system]
-requires = ["maturin>=1.13,<2.0"]
+requires = ["maturin>=1.13,<1.14"]
 build-backend = "maturin"
 
 [project]
 name = "rxgraph"
-requires-python = ">=3.8"
+description = "High-performance graph traversal and graph algorithms for Python"
+readme = "README.md"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
 ]
 dynamic = ["version"]
+dependencies = ["polars>=1.8.2,<1.41"]
 
 [tool.maturin]
+manifest-path = "crates/rxgraph-python/Cargo.toml"
+module-name = "rxgraph._rxgraph"
 python-source = "python"
+
+[tool.ruff.lint]
+ignore = [
+    "E731", # Do not assign a `lambda` expression, use a `def`
+]
+
+[dependency-groups]
+dev = [
+    "maturin>=1.13,<1.14",
+    "igraph>=0.11,<0.12",
+    "networkx>=3.1,<3.6",
+    "pyperf>=2.10,<2.11",
+    "prek>=0.4,<0.5",
+    "pytest>=8.3,<9.1",
+    "rich>=13.9,<14",
+    "ruff>=0.15,<0.16",
+]
