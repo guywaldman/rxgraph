@@ -1,22 +1,32 @@
 from collections.abc import Hashable, Iterable, Mapping
-from typing import Any, Literal, Self, TypeVar
+from typing import Generic, Literal, TypeAlias, TypeVar
 
 from polars import DataFrame, Expr, col as col, lit as lit
 
 Node = TypeVar("Node", bound=Hashable)
-GraphId = int | str
+
+GraphId: TypeAlias = int | str
+TableInput: TypeAlias = DataFrame | list[tuple[str, DataFrame]]
+_AttributeMap: TypeAlias = Mapping[str, object]
+NodeInput: TypeAlias = Node | tuple[Node, _AttributeMap]
+EdgeInput: TypeAlias = tuple[Node, Node] | tuple[Node, Node, _AttributeMap]
+ExpressionInput: TypeAlias = Expr | str
+StateValue: TypeAlias = None | bool | int | float | str | list["StateValue"]
+StateMap: TypeAlias = Mapping[str, StateValue]
+SearchStrategy: TypeAlias = Literal["dfs", "bfs"]
+ParallelMode: TypeAlias = bool | Literal["auto", "off", "on"]
 
 def rayon_thread_count() -> int:
     """Return the Rayon worker thread count used by rxgraph."""
     ...
 
-class Graph:
+class Graph(Generic[Node]):
     """Arrow-backed directed graph."""
 
     def __init__(
         self,
-        nodes: DataFrame | list[tuple[str, DataFrame]],
-        edges: DataFrame | list[tuple[str, DataFrame]],
+        nodes: TableInput,
+        edges: TableInput,
     ) -> None:
         """Build a graph from node and edge tables.
 
@@ -29,10 +39,10 @@ class Graph:
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[tuple[Node, Node] | tuple[Node, Node, Mapping[str, Any]]],
+        edges: Iterable[EdgeInput[Node]],
         *,
-        nodes: Iterable[Node | tuple[Node, Mapping[str, Any]]] | None = None,
-    ) -> Self:
+        nodes: Iterable[NodeInput[Node]] | None = None,
+    ) -> Graph[Node]:
         """Build a directed graph from Python node labels and edge tuples."""
         ...
 
@@ -40,33 +50,33 @@ class Graph:
     def node_count(self) -> int: ...
     @property
     def edge_count(self) -> int: ...
-    def node_id(self, label: Hashable) -> GraphId:
+    def node_id(self, label: Node) -> GraphId:
         """Return the graph ID used by the engine for a node label."""
         ...
     def search(
         self,
         *,
-        start_nodes: Iterable[Hashable],
-        visit: Expr | str | None = None,
-        next_state: Mapping[str, Expr | str] | None = None,
-        stop: Expr | str | None = None,
-        initial_state: Mapping[str, Any] | None = None,
+        start_nodes: Iterable[Node],
+        visit: ExpressionInput | None = None,
+        next_state: Mapping[str, ExpressionInput] | None = None,
+        stop: ExpressionInput | None = None,
+        initial_state: StateMap | None = None,
         max_depth: int | None = None,
         max_paths: int | None = None,
-        strategy: Literal["dfs", "bfs"] = "dfs",
-        parallel: bool | Literal["auto", "off", "on"] = True,
+        strategy: SearchStrategy = "dfs",
+        parallel: ParallelMode = True,
         intermediate_states: bool = False,
-    ) -> SearchResult: ...
-    def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+    ) -> SearchResult[Node]: ...
+    def bfs(self, start: Node, max_depth: int | None = None) -> list[Node]:
         """Return nodes reachable from ``start`` in breadth-first order."""
         ...
-    def dfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+    def dfs(self, start: Node, max_depth: int | None = None) -> list[Node]:
         """Return nodes reachable from ``start`` in depth-first pre-order."""
         ...
-    def reachable_nodes(self, start: Hashable) -> list[Any]:
+    def reachable_nodes(self, start: Node) -> list[Node]:
         """Return all nodes reachable from ``start``."""
         ...
-    def shortest_path(self, source: Hashable, target: Hashable) -> list[Any] | None:
+    def shortest_path(self, source: Node, target: Node) -> list[Node] | None:
         """Return an unweighted directed shortest path, if one exists."""
         ...
     def out_degrees(self) -> list[int]:
@@ -78,17 +88,17 @@ class Graph:
     def degrees(self) -> list[int]:
         """Return total directed degree for each node in node insertion order."""
         ...
-    def weakly_connected_components(self) -> list[list[Any]]:
+    def weakly_connected_components(self) -> list[list[Node]]:
         """Return weakly connected components, ignoring edge direction."""
         ...
 
-class DiGraph(Graph):
+class DiGraph(Graph[Node]):
     """Arrow-backed bidirectional graph."""
 
     def __init__(
         self,
-        nodes: DataFrame | list[tuple[str, DataFrame]],
-        edges: DataFrame | list[tuple[str, DataFrame]],
+        nodes: TableInput,
+        edges: TableInput,
     ) -> None:
         """Build a bidirectional graph from node and edge tables.
 
@@ -101,27 +111,27 @@ class DiGraph(Graph):
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[tuple[Node, Node] | tuple[Node, Node, Mapping[str, Any]]],
+        edges: Iterable[EdgeInput[Node]],
         *,
-        nodes: Iterable[Node | tuple[Node, Mapping[str, Any]]] | None = None,
-    ) -> Self:
+        nodes: Iterable[NodeInput[Node]] | None = None,
+    ) -> DiGraph[Node]:
         """Build a bidirectional graph from Python node labels and edge tuples."""
         ...
 
 class Kernel:
     """Traversal kernel built from Polars expressions."""
 
-    visit: Expr | str
-    next_state: dict[str, Expr | str]
-    stop: Expr | str
-    initial_state: dict[str, Any]
+    visit: ExpressionInput
+    next_state: dict[str, ExpressionInput]
+    stop: ExpressionInput
+    initial_state: dict[str, StateValue]
 
     def __init__(
         self,
-        visit: Expr | str | None = None,
-        next_state: Mapping[str, Expr | str] | None = None,
-        stop: Expr | str | None = None,
-        initial_state: Mapping[str, Any] | None = None,
+        visit: ExpressionInput | None = None,
+        next_state: Mapping[str, ExpressionInput] | None = None,
+        stop: ExpressionInput | None = None,
+        initial_state: StateMap | None = None,
     ) -> None:
         """Create a kernel.
 
@@ -132,17 +142,17 @@ class Kernel:
         """
         ...
 
-class Traversal:
+class Traversal(Generic[Node]):
     """Low-level traversal configuration for the native engine."""
 
     def __init__(
         self,
         kernel: Kernel,
-        start_nodes: list[Hashable],
-        max_depth: int,
-        max_paths: int,
-        strategy: Literal["dfs", "bfs"] = "dfs",
-        parallel: bool | Literal["auto", "off", "on"] = True,
+        start_nodes: list[Node],
+        max_depth: int | None,
+        max_paths: int | None,
+        strategy: SearchStrategy = "dfs",
+        parallel: ParallelMode = True,
         intermediate_states: bool = False,
     ) -> None:
         """Create a traversal.
@@ -173,16 +183,16 @@ class SearchStats:
     @property
     def max_depth(self) -> int: ...
 
-class SearchPath:
+class SearchPath(Generic[Node]):
     """One stopped path returned by a traversal."""
 
-    nodes: list[Any]
-    edges: list[Any]
-    state: dict[str, Any]
-    intermediate_states: list[dict[str, Any]] | None
+    nodes: list[Node]
+    edges: list[GraphId]
+    state: dict[str, StateValue]
+    intermediate_states: list[dict[str, StateValue]] | None
 
-class SearchResult:
+class SearchResult(Generic[Node]):
     """Paths and stats returned by :meth:`Graph.search`."""
 
-    paths: list[SearchPath]
+    paths: list[SearchPath[Node]]
     stats: SearchStats

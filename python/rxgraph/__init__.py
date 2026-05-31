@@ -1,17 +1,29 @@
+from __future__ import annotations
+
 from collections.abc import Hashable, Iterable, Mapping
-from typing import Any, Self
+from typing import Generic, Literal, Self, TypeAlias, TypeVar, cast
 
 import polars as pl
 
 from . import _rxgraph
 from ._graph_tables import (
     EdgeInput,
+    GraphId,
     GraphTables,
     NodeInput,
+    TableInput,
     build_bidirectional_edges,
     build_labeled_tables,
     normalize_table,
 )
+
+NodeT = TypeVar("NodeT", bound=Hashable)
+ExpressionInput: TypeAlias = pl.Expr | str
+StateValue: TypeAlias = None | bool | int | float | str | list["StateValue"]
+StateMap: TypeAlias = Mapping[str, StateValue]
+StateDict: TypeAlias = dict[str, StateValue]
+SearchStrategy: TypeAlias = Literal["dfs", "bfs"]
+ParallelMode: TypeAlias = bool | Literal["auto", "off", "on"]
 
 SearchStats = _rxgraph.SearchStats
 col = pl.col
@@ -29,10 +41,10 @@ class Kernel:
 
     def __init__(
         self,
-        visit: Any | None = None,
-        next_state: Mapping[str, Any] | None = None,
-        stop: Any | None = None,
-        initial_state: Mapping[str, Any] | None = None,
+        visit: ExpressionInput | None = None,
+        next_state: Mapping[str, ExpressionInput] | None = None,
+        stop: ExpressionInput | None = None,
+        initial_state: StateMap | None = None,
     ) -> None:
         """Create a traversal kernel.
 
@@ -54,17 +66,17 @@ class Kernel:
         )
 
 
-class Graph:
+class Graph(Generic[NodeT]):
     """Arrow-backed directed graph."""
 
     def __init__(
         self,
-        nodes: Any,
-        edges: Any,
+        nodes: TableInput,
+        edges: TableInput,
         *,
-        _label_to_id: dict[Hashable, int] | None = None,
-        _id_to_label: list[Hashable] | None = None,
-        _edge_id_to_label: dict[Hashable, Hashable] | None = None,
+        _label_to_id: dict[NodeT, int] | None = None,
+        _id_to_label: list[NodeT] | None = None,
+        _edge_id_to_label: dict[GraphId, GraphId] | None = None,
     ) -> None:
         self._inner = _rxgraph.Graph(normalize_table(nodes), normalize_table(edges))
         self._label_to_id = _label_to_id
@@ -74,15 +86,15 @@ class Graph:
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[EdgeInput],
+        edges: Iterable[EdgeInput[NodeT]],
         *,
-        nodes: Iterable[NodeInput] | None = None,
+        nodes: Iterable[NodeInput[NodeT]] | None = None,
     ) -> Self:
         tables = build_labeled_tables(edges, nodes)
         return cls._from_tables(tables)
 
     @classmethod
-    def _from_tables(cls, tables: GraphTables) -> Self:
+    def _from_tables(cls, tables: GraphTables[NodeT]) -> Self:
         graph = cls.__new__(cls)
         Graph.__init__(
             graph,
@@ -102,7 +114,7 @@ class Graph:
     def edge_count(self) -> int:
         return self._inner.edge_count
 
-    def node_id(self, label: Hashable) -> int:
+    def node_id(self, label: NodeT) -> GraphId:
         """Return the graph ID used by the engine for a label."""
         if self._label_to_id is None:
             if not isinstance(label, int | str):
@@ -118,17 +130,17 @@ class Graph:
     def search(
         self,
         *,
-        start_nodes: Iterable[Hashable],
-        visit: Any | None = None,
-        next_state: Mapping[str, Any] | None = None,
-        stop: Any | None = None,
-        initial_state: Mapping[str, Any] | None = None,
+        start_nodes: Iterable[NodeT],
+        visit: ExpressionInput | None = None,
+        next_state: Mapping[str, ExpressionInput] | None = None,
+        stop: ExpressionInput | None = None,
+        initial_state: StateMap | None = None,
         max_depth: int | None = None,
         max_paths: int | None = None,
-        strategy: str = "dfs",
-        parallel: bool | str = True,
+        strategy: SearchStrategy = "dfs",
+        parallel: ParallelMode = True,
         intermediate_states: bool = False,
-    ) -> "SearchResult":
+    ) -> SearchResult[NodeT]:
         """Run a stateful traversal.
 
         ``visit`` defaults to accepting all candidate edges. ``stop`` decides
@@ -164,16 +176,16 @@ class Graph:
         inner = self._inner.search(traversal._to_inner(self))
         return SearchResult(inner, self._id_to_label, self._edge_id_to_label)
 
-    def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+    def bfs(self, start: NodeT, max_depth: int | None = None) -> list[NodeT]:
         return self._map_nodes(self._inner.bfs(self.node_id(start), max_depth))
 
-    def dfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+    def dfs(self, start: NodeT, max_depth: int | None = None) -> list[NodeT]:
         return self._map_nodes(self._inner.dfs(self.node_id(start), max_depth))
 
-    def reachable_nodes(self, start: Hashable) -> list[Any]:
+    def reachable_nodes(self, start: NodeT) -> list[NodeT]:
         return self._map_nodes(self._inner.reachable_nodes(self.node_id(start)))
 
-    def shortest_path(self, source: Hashable, target: Hashable) -> list[Any] | None:
+    def shortest_path(self, source: NodeT, target: NodeT) -> list[NodeT] | None:
         path = self._inner.shortest_path(self.node_id(source), self.node_id(target))
         if path is None:
             return None
@@ -188,25 +200,25 @@ class Graph:
     def degrees(self) -> list[int]:
         return self._inner.degrees()
 
-    def weakly_connected_components(self) -> list[list[Any]]:
+    def weakly_connected_components(self) -> list[list[NodeT]]:
         return [
             self._map_nodes(component)
             for component in self._inner.weakly_connected_components()
         ]
 
-    def _map_nodes(self, nodes: list[int]) -> list[Any]:
+    def _map_nodes(self, nodes: list[GraphId]) -> list[NodeT]:
         if self._id_to_label is None:
-            return nodes
-        return [self._id_to_label[node] for node in nodes]
+            return cast(list[NodeT], nodes)
+        return [self._id_to_label[cast(int, node)] for node in nodes]
 
 
-class DiGraph(Graph):
+class DiGraph(Graph[NodeT]):
     """Arrow-backed bidirectional graph."""
 
     def __init__(
         self,
-        nodes: Any,
-        edges: Any,
+        nodes: TableInput,
+        edges: TableInput,
     ) -> None:
         edge_table, edge_id_to_label = build_bidirectional_edges(edges)
         super().__init__(
@@ -218,9 +230,9 @@ class DiGraph(Graph):
     @classmethod
     def from_edges(
         cls,
-        edges: Iterable[EdgeInput],
+        edges: Iterable[EdgeInput[NodeT]],
         *,
-        nodes: Iterable[NodeInput] | None = None,
+        nodes: Iterable[NodeInput[NodeT]] | None = None,
     ) -> Self:
         tables = build_labeled_tables(
             edges,
@@ -230,17 +242,17 @@ class DiGraph(Graph):
         return cls._from_tables(tables)
 
 
-class Traversal:
+class Traversal(Generic[NodeT]):
     """Low-level traversal configuration for the native engine."""
 
     def __init__(
         self,
         kernel: Kernel,
-        start_nodes: list[Hashable],
-        max_depth: int,
-        max_paths: int,
-        strategy: str = "dfs",
-        parallel: bool | str = True,
+        start_nodes: list[NodeT],
+        max_depth: int | None,
+        max_paths: int | None,
+        strategy: SearchStrategy = "dfs",
+        parallel: ParallelMode = True,
         intermediate_states: bool = False,
     ) -> None:
         """Create a reusable traversal configuration.
@@ -260,7 +272,7 @@ class Traversal:
         self.parallel = _parallel_bool(parallel)
         self.intermediate_states = intermediate_states
 
-    def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
+    def _to_inner(self, graph: Graph[NodeT]) -> _rxgraph.Traversal:
         return _rxgraph.Traversal(
             _inner_kernel(self.kernel),
             [graph.node_id(node) for node in self.start_nodes],
@@ -272,37 +284,45 @@ class Traversal:
         )
 
 
-class SearchPath:
+class SearchPath(Generic[NodeT]):
     """One stopped path returned by a traversal."""
+
+    nodes: list[NodeT]
+    edges: list[GraphId]
+    state: StateDict
+    intermediate_states: list[StateDict] | None
 
     __slots__ = ("nodes", "edges", "state", "intermediate_states")
 
     def __init__(
         self,
         inner: _rxgraph.SearchPath,
-        id_to_label: list[Hashable] | None,
-        edge_id_to_label: dict[Hashable, Hashable] | None,
+        id_to_label: list[NodeT] | None,
+        edge_id_to_label: dict[GraphId, GraphId] | None,
     ) -> None:
         self.nodes = _map_search_nodes(inner.nodes, id_to_label)
         self.edges = _map_search_edges(inner.edges, edge_id_to_label)
-        self.state = dict(inner.state)
+        self.state = cast(StateDict, dict(inner.state))
         self.intermediate_states = (
             None
             if inner.intermediate_states is None
-            else [dict(state) for state in inner.intermediate_states]
+            else [cast(StateDict, dict(state)) for state in inner.intermediate_states]
         )
 
 
-class SearchResult:
+class SearchResult(Generic[NodeT]):
     """Paths and stats returned by :meth:`Graph.search`."""
+
+    paths: list[SearchPath[NodeT]]
+    stats: SearchStats
 
     __slots__ = ("paths", "stats")
 
     def __init__(
         self,
         inner: _rxgraph.SearchResult,
-        id_to_label: list[Hashable] | None,
-        edge_id_to_label: dict[Hashable, Hashable] | None,
+        id_to_label: list[NodeT] | None,
+        edge_id_to_label: dict[GraphId, GraphId] | None,
     ) -> None:
         self.paths = [
             SearchPath(path, id_to_label, edge_id_to_label) for path in inner.paths
@@ -311,23 +331,23 @@ class SearchResult:
 
 
 def _map_search_nodes(
-    nodes: list[Any], id_to_label: list[Hashable] | None
-) -> list[Any]:
+    nodes: list[GraphId], id_to_label: list[NodeT] | None
+) -> list[NodeT]:
     if id_to_label is None:
-        return list(nodes)
-    return [id_to_label[node] for node in nodes]
+        return cast(list[NodeT], list(nodes))
+    return [id_to_label[cast(int, node)] for node in nodes]
 
 
 def _map_search_edges(
-    edges: list[Any],
-    edge_id_to_label: dict[Hashable, Hashable] | None,
-) -> list[Any]:
+    edges: list[GraphId],
+    edge_id_to_label: dict[GraphId, GraphId] | None,
+) -> list[GraphId]:
     if edge_id_to_label is None:
         return list(edges)
     return [edge_id_to_label[edge] for edge in edges]
 
 
-def _parallel_bool(value: bool | str) -> bool:
+def _parallel_bool(value: ParallelMode) -> bool:
     if isinstance(value, bool):
         return value
     if value in {"on", "auto"}:
@@ -337,7 +357,9 @@ def _parallel_bool(value: bool | str) -> bool:
     raise ValueError("parallel must be a bool, or one of 'on', 'off', 'auto'")
 
 
-def _default_stop(stop: Any | None, max_paths: int | None) -> Any:
+def _default_stop(
+    stop: ExpressionInput | None, max_paths: int | None
+) -> ExpressionInput:
     if stop is not None:
         return stop
     if max_paths is None:
