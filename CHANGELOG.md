@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.11](https://github.com/guywaldman/rxgraph/compare/v0.0.10...v0.0.11) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** migrate off PT for PyPI publishing ([5a80963](https://github.com/guywaldman/rxgraph/commit/5a809636040740625d2f1b0d58ff4b2ffba0a718))
+
 ## [0.0.10](https://github.com/guywaldman/rxgraph/compare/v0.0.9...v0.0.10) (2026-05-31)
 
 
