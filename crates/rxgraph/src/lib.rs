@@ -1,8 +1,14 @@
-//! Arrow-backed graph traversal.
+//! High-performance graph traversal.
 //!
-//! `rxgraph` stores node and edge tables as Arrow [`RecordBatch`](arrow::record_batch::RecordBatch)
-//! values and builds compact CSR topology for traversal. The graph schema is deliberately
-//! small:
+//! `rxgraph` provides fast topology queries, stateful path search, and explicit
+//! construction APIs for graphs stored in columnar tables.
+//!
+//! ## Architecture
+//!
+//! Internally, `rxgraph` stores node and edge tables as Arrow
+//! [`RecordBatch`](arrow::record_batch::RecordBatch) values, validates graph
+//! identity columns once, and builds compact CSR topology for traversal. The
+//! graph schema is deliberately small:
 //!
 //! - nodes require `id`
 //! - edges require `id`, `src`, and `dest`

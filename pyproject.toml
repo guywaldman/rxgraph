@@ -4,6 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "rxgraph"
+description = "High-performance graph traversal and graph algorithms for Python"
+readme = "README.md"
 requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Rust",
