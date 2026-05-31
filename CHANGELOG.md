@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.9](https://github.com/guywaldman/rxgraph/compare/v0.0.8...v0.0.9) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** publish Rust crate with token ([3432494](https://github.com/guywaldman/rxgraph/commit/3432494b8231a966bfd77f5bfd26000b57f6b41b))
+
 ## [0.0.8](https://github.com/guywaldman/rxgraph/compare/v0.0.7...v0.0.8) (2026-05-31)
 
 
