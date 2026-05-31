@@ -1,6 +1,6 @@
 [package]
 name = "rxgraph"
-version = "0.0.13"
+version = "0.0.14"
 edition.workspace = true
 rust-version.workspace = true
 description = "High-performance graph traversal engine"
