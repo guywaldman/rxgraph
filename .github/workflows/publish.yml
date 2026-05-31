@@ -21,9 +21,9 @@ jobs:
       #   id: auth
       #   uses: rust-lang/crates-io-auth-action@v1
       - name: Publish crate
-        run: cargo publish -p rxgraph --locked
+        run: cargo publish -p rxgraph --locked --token ${{ secrets.CARGO_REGISTRY_TOKEN }}
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
   wheels:
     name: Build wheels
