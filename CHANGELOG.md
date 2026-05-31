@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.10](https://github.com/guywaldman/rxgraph/compare/v0.0.9...v0.0.10) (2026-05-31)
+
+
+### Bug Fixes
+
+* **ci:** actually migrate crates.io publishing off TP ([dea883f](https://github.com/guywaldman/rxgraph/commit/dea883f8f73c021e4a75c7011425235f823ef068))
+
 ## [0.0.9](https://github.com/guywaldman/rxgraph/compare/v0.0.8...v0.0.9) (2026-05-31)
 
 
