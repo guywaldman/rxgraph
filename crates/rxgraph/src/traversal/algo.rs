@@ -318,6 +318,7 @@ fn eval_parent(
     Ok((parent, edges, stats))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn eval_arena_edge(
     graph: &Graph,
     arena: &[PathEntry],

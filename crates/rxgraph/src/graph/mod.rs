@@ -1,4 +1,5 @@
 mod csr;
+#[allow(clippy::module_inception)]
 mod graph;
 mod repo;
 

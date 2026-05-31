@@ -300,6 +300,7 @@ impl DslExpr {
     }
 
     /// Boolean negation.
+    #[allow(clippy::should_implement_trait)]
     pub fn not(self) -> Self {
         Self(Expr::Not(Box::new(self.0)))
     }

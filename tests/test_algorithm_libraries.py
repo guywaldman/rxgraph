@@ -41,7 +41,13 @@ def test_traversal_matches_reference_libraries() -> None:
     cases = travel_cases(data, max_paths=8)
     by_lib = {case.lib: case.run() for case in cases}
 
-    for library in ["rxgraph-df", "rxgraph-df-string-ids", "rxgraph-python", "networkx", "igraph"]:
+    for library in [
+        "rxgraph-df",
+        "rxgraph-df-string-ids",
+        "rxgraph-python",
+        "networkx",
+        "igraph",
+    ]:
         assert library in by_lib
 
     reference = sorted(reference_travel_paths(data, max_paths=8))
@@ -61,10 +67,22 @@ def test_benchmark_report_helpers_are_human_readable() -> None:
     assert plain_speedup(result("rxgraph-df", 1.04), 1.0) == "baseline"
     assert plain_speedup(result("networkx", 2.0), 1.0) == "2.0x slower"
     assert plain_speedup(result("networkx", 0.5), 1.0) == "2.0x faster"
-    assert best_by_bench([result("rxgraph-df", 1.0), result("rxgraph-python", 1.0)]) == {"bfs/low": "rxgraph-df"}
-    assert best_by_bench([result("rxgraph-df", 1.0), result("rxgraph-python", 0.96)]) == {"bfs/low": "rxgraph-python"}
-    assert best_by_bench([result("rxgraph-df", 1.0), result("igraph", 0.96), result("rxgraph-python", 0.98)]) == {"bfs/low": "igraph"}
-    assert best_by_bench([result("rxgraph-df", 1.0), result("rxgraph-python", 0.90)]) == {"bfs/low": "rxgraph-python"}
+    assert best_by_bench(
+        [result("rxgraph-df", 1.0), result("rxgraph-python", 1.0)]
+    ) == {"bfs/low": "rxgraph-df"}
+    assert best_by_bench(
+        [result("rxgraph-df", 1.0), result("rxgraph-python", 0.96)]
+    ) == {"bfs/low": "rxgraph-python"}
+    assert best_by_bench(
+        [
+            result("rxgraph-df", 1.0),
+            result("igraph", 0.96),
+            result("rxgraph-python", 0.98),
+        ]
+    ) == {"bfs/low": "igraph"}
+    assert best_by_bench(
+        [result("rxgraph-df", 1.0), result("rxgraph-python", 0.90)]
+    ) == {"bfs/low": "rxgraph-python"}
 
 
 def result(library: str, median: float) -> Result:
@@ -99,7 +117,9 @@ def reference_travel_paths(data, max_paths: int) -> list[tuple[int, ...]]:
                 "detours": state["detours"] + edge["detour_cost"],
             }
             next_path = (*path, dst)
-            paths.append(next_path) if dst == data.target else frontier.append((dst, next_path, next_state))
+            paths.append(next_path) if dst == data.target else frontier.append(
+                (dst, next_path, next_state)
+            )
             if len(paths) >= max_paths:
                 break
     return paths

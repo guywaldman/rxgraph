@@ -1,4 +1,4 @@
-set shell := ["zsh", "-cu"]
+set shell := ["sh", "-cu"]
 
 venv := ".venv"
 python := venv / "bin/python"

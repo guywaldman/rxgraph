@@ -241,6 +241,7 @@ struct Edges {
 }
 
 impl Edges {
+    #[allow(clippy::too_many_arguments)]
     fn push(
         &mut self,
         src: usize,
