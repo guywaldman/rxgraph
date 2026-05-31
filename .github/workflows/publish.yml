@@ -26,7 +26,7 @@ jobs:
       - name: Publish crate
         run: cargo publish -p rxgraph --locked
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
 
   wheels:
     name: Build wheels
