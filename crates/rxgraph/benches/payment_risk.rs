@@ -80,19 +80,19 @@ impl Workload {
 
     fn kernel(self) -> DslKernel {
         let visit = e::edge("kind")
-            .ne(e::string("noise"))
-            .and(e::edge("flagged").eq(e::bool(false)))
-            .and(e::edge("success").eq(e::bool(true)))
-            .and(e::dest("frozen").eq(e::bool(false)))
-            .and(e::state("hops").lt(e::int(self.depth() as i64)))
+            .ne(e::string_lit("noise"))
+            .and(e::edge("flagged").eq(e::bool_lit(false)))
+            .and(e::edge("success").eq(e::bool_lit(true)))
+            .and(e::dest("frozen").eq(e::bool_lit(false)))
+            .and(e::state("hops").lt(e::int_lit(self.depth() as i64)))
             .and(
                 e::state("amount")
                     .plus(e::edge("amount"))
-                    .le(e::int(self.limit() as i64)),
+                    .le(e::int_lit(self.limit() as i64)),
             )
             .and(e::edge("time").ge(e::state("time")))
-            .and(e::state("risk").plus(e::dest("risk")).le(e::int(85)));
-        let stop = e::dest("segment").eq(e::string("cashout"));
+            .and(e::state("risk").plus(e::dest("risk")).le(e::int_lit(85)));
+        let stop = e::dest("segment").eq(e::string_lit("cashout"));
 
         DslKernel::new(
             visit,
@@ -101,8 +101,8 @@ impl Workload {
                     "amount".to_string(),
                     e::state("amount").plus(e::edge("amount")),
                 ),
-                ("hops".to_string(), e::state("hops").plus(e::int(1))),
-                ("time".to_string(), e::edge("time").plus(e::int(1))),
+                ("hops".to_string(), e::state("hops").plus(e::int_lit(1))),
+                ("time".to_string(), e::edge("time").plus(e::int_lit(1))),
                 ("risk".to_string(), e::state("risk").plus(e::dest("risk"))),
             ],
             stop,

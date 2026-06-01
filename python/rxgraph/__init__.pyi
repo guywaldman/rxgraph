@@ -1,4 +1,5 @@
 from collections.abc import Hashable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, Self, TypeVar
 
 from polars import DataFrame, Expr, col as col, lit as lit
@@ -173,14 +174,16 @@ class SearchStats:
     @property
     def max_depth(self) -> int: ...
 
+@dataclass(slots=True)
 class SearchPath:
     """One stopped path returned by a traversal."""
 
     nodes: list[Any]
     edges: list[Any]
     state: dict[str, Any]
-    intermediate_states: list[dict[str, Any]] | None
+    intermediate_states: list[dict[str, Any]] | None = None
 
+@dataclass(slots=True)
 class SearchResult:
     """Paths and stats returned by :meth:`Graph.search`."""
 

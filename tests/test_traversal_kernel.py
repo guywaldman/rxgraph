@@ -95,6 +95,141 @@ def test_search_accepts_kernel_params_and_list_state() -> None:
     ]
 
 
+def test_search_supports_native_list_operations() -> None:
+    nodes = pl.DataFrame(
+        {
+            "id": [0, 1, 2],
+            "tags": [[10], [20, 21], [30, 31, None]],
+            "dupes": [[1, 1, 2], [2, 2, 3], [3, 3, None]],
+            "flags": [[True], [True, True], [True, False, None]],
+            "names": [["s"], ["a", "b"], ["x", "y"]],
+        },
+        schema={
+            "id": pl.UInt64,
+            "tags": pl.List(pl.Int64),
+            "dupes": pl.List(pl.Int64),
+            "flags": pl.List(pl.Boolean),
+            "names": pl.List(pl.String),
+        },
+    )
+    edges = pl.DataFrame(
+        {"id": [10, 11], "src": [0, 1], "dest": [1, 2]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    )
+    graph = rxg.Graph(nodes, edges)
+
+    tags = pl.col("dest.tags")
+    result = graph.search(
+        start_nodes=[0],
+        visit=tags.list.len() > 0,
+        next_state={
+            "tags": pl.concat_list([pl.col("state.tags"), tags]),
+            "contains": tags.list.contains(31),
+            "first": tags.list.first(),
+            "last": tags.list.last(),
+            "slice": tags.list.slice(0, 2),
+            "reverse": tags.list.reverse(),
+            "sort": tags.list.sort(),
+            "unique": pl.col("dest.dupes").list.unique(),
+            "drop_nulls": tags.list.drop_nulls(),
+            "sum": tags.list.sum(),
+            "min": tags.list.min(),
+            "max": tags.list.max(),
+            "mean": tags.list.mean(),
+            "median": tags.list.median(),
+            "any": pl.col("dest.flags").list.any(),
+            "all": pl.col("dest.flags").list.all(),
+            "count": tags.list.count_matches(31),
+            "n_unique": tags.list.n_unique(),
+            "join": pl.col("dest.names").list.join(","),
+            "shift": tags.list.shift(1),
+            "every": tags.list.gather_every(2),
+            "union": pl.col("state.tags").list.set_union(tags),
+            "intersection": pl.col("state.tags").list.set_intersection(tags),
+            "difference": pl.col("state.tags").list.set_difference(tags),
+            "symmetric": pl.col("state.tags").list.set_symmetric_difference(tags),
+            "inc": tags.list.eval(pl.element() + 1),
+            "filtered": tags.list.filter(pl.element() > 30),
+        },
+        stop=(pl.col("dest.id") == 2) & pl.col("state.contains"),
+        initial_state={"tags": [10]},
+        max_depth=2,
+        max_paths=1,
+    )
+
+    state = result.paths[0].state
+    assert result.paths[0].nodes == [0, 1, 2]
+    assert state["tags"] == [10, 20, 21, 30, 31, None]
+    assert state["first"] == 30
+    assert state["last"] is None
+    assert state["slice"] == [30, 31]
+    assert state["reverse"] == [None, 31, 30]
+    assert state["sort"] == [None, 30, 31]
+    assert state["unique"] == [3, None]
+    assert state["drop_nulls"] == [30, 31]
+    assert state["sum"] == 61
+    assert state["min"] == 30
+    assert state["max"] == 31
+    assert state["mean"] == 30.5
+    assert state["median"] == 30.5
+    assert state["any"] is True
+    assert state["all"] is False
+    assert state["count"] == 1
+    assert state["n_unique"] == 3
+    assert state["join"] == "x,y"
+    assert state["shift"] == [None, 30, 31]
+    assert state["every"] == [30, None]
+    assert state["union"] == [10, 20, 21, 30, 31, None]
+    assert state["intersection"] == []
+    assert state["difference"] == [10, 20, 21]
+    assert state["symmetric"] == [10, 20, 21, 30, 31, None]
+    assert state["inc"] == [31, 32, None]
+    assert state["filtered"] == [31]
+
+
+def test_search_supports_native_struct_operations() -> None:
+    nodes = (
+        pl.DataFrame(
+            {
+                "id": [0, 1, 2],
+                "score": [0, 5, 9],
+                "label": ["s", "a", "b"],
+            },
+            schema={"id": pl.UInt64, "score": pl.Int64, "label": pl.String},
+        )
+        .with_columns(pl.struct(["score", "label"]).alias("meta"))
+        .select("id", "score", "meta")
+    )
+    edges = pl.DataFrame(
+        {"id": [10, 11], "src": [0, 1], "dest": [1, 2]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    )
+    graph = rxg.Graph(nodes, edges)
+
+    meta = pl.col("dest.meta")
+    result = graph.search(
+        start_nodes=[0],
+        next_state={
+            "score": meta.struct.field("score"),
+            "renamed": meta.struct.rename_fields(["points", "name"]),
+            "extended": meta.struct.with_fields(
+                (pl.col("dest.score") + 1).alias("next_score")
+            ),
+            "json": meta.struct.json_encode(),
+        },
+        stop=pl.col("state.score") == 9,
+        initial_state={"score": 0},
+        max_depth=2,
+        max_paths=1,
+    )
+
+    state = result.paths[0].state
+    assert state["score"] == 9
+    assert state["renamed"] == {"points": 9, "name": "b"}
+    assert state["extended"] == {"score": 9, "label": "b", "next_score": 10}
+    assert json.loads(state["json"]) == {"score": 9, "label": "b"}
+
+
 def test_search_defaults_stop_when_max_paths_is_set() -> None:
     graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
 

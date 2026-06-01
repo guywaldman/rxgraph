@@ -499,6 +499,13 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
                 .collect::<PyResult<Vec<_>>>()?;
             Ok(PyList::new(py, values)?.into_any().unbind())
         }
+        Value::Struct(fields) => {
+            let dict = PyDict::new(py);
+            for (name, value) in fields {
+                dict.set_item(name, value_to_py(py, value)?)?;
+            }
+            Ok(dict.into_any().unbind())
+        }
     }
 }
 
@@ -564,6 +571,20 @@ fn py_to_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
             .map(|value| py_to_value(&value))
             .collect::<PyResult<Vec<_>>>()
             .map(Value::List);
+    }
+    if let Ok(fields) = value.cast::<PyDict>() {
+        return fields
+            .iter()
+            .map(|(key, value)| {
+                let key = key
+                    .cast::<PyString>()
+                    .map_err(|_| PyTypeError::new_err("struct keys must be strings"))?
+                    .to_str()?
+                    .to_string();
+                Ok((key, py_to_value(&value)?))
+            })
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Struct);
     }
 
     Err(PyTypeError::new_err(format!(

@@ -335,23 +335,14 @@ fn eval_arena_edge(
     }
 
     stats.evaluated_edges += 1;
-    let ctx = EvalCtx {
-        graph,
-        src: arena[parent].node,
-        dest,
-        edge,
-        state: &arena[parent].state,
-    };
+    let ctx = EvalCtx::new(graph, arena[parent].node, dest, edge, &arena[parent].state);
     if !kernel.visit(&ctx)? {
         stats.rejected_edges += 1;
         return Ok(None);
     }
 
     let state = kernel.next_state(&arena[parent].state, &ctx)?;
-    let stop = kernel.stop(&EvalCtx {
-        state: &state,
-        ..ctx
-    })?;
+    let stop = kernel.stop(&ctx.with_state(&state))?;
     Ok(Some(EdgeEval {
         edge,
         dest,
@@ -468,23 +459,14 @@ fn expand_task(
         }
 
         stats.evaluated_edges += 1;
-        let ctx = EvalCtx {
-            graph,
-            src: arena[task].node,
-            dest,
-            edge,
-            state: &arena[task].state,
-        };
+        let ctx = EvalCtx::new(graph, arena[task].node, dest, edge, &arena[task].state);
         if !kernel.visit(&ctx)? {
             stats.rejected_edges += 1;
             continue;
         }
 
         let state = kernel.next_state(&arena[task].state, &ctx)?;
-        let stop = kernel.stop(&EvalCtx {
-            state: &state,
-            ..ctx
-        })?;
+        let stop = kernel.stop(&ctx.with_state(&state))?;
         stats.accepted_edges += 1;
         stats.path_entries += 1;
         stats.max_depth = stats.max_depth.max(arena[task].depth + 1);
@@ -802,8 +784,8 @@ mod tests {
         let graph = graph();
         let result = graph
             .search(traversal(
-                e::bool(true),
-                e::dest("kind").eq(e::string("end")),
+                e::bool_lit(true),
+                e::dest("kind").eq(e::string_lit("end")),
             ))
             .unwrap();
         assert_eq!(result.paths.len(), 2);
@@ -833,7 +815,7 @@ mod tests {
     #[test]
     fn filters_edges_and_limits_depth() {
         let config =
-            TraversalConfigBuilder::new(DslKernel::new(e::edge("ok"), [], e::bool(true), []))
+            TraversalConfigBuilder::new(DslKernel::new(e::edge("ok"), [], e::bool_lit(true), []))
                 .with_start_nodes(["a".to_string()])
                 .with_max_depth(1)
                 .with_parallelism(false)
@@ -858,9 +840,9 @@ mod tests {
     #[test]
     fn returns_final_state_and_optional_intermediate_states() {
         let kernel = DslKernel::new(
-            e::bool(true),
-            [("hops".into(), e::state("hops").plus(e::uint(1)))],
-            e::dest("kind").eq(e::string("end")),
+            e::bool_lit(true),
+            [("hops".into(), e::state("hops").plus(e::uint_lit(1)))],
+            e::dest("kind").eq(e::string_lit("end")),
             [("hops".into(), Value::U64(0))],
         );
 
@@ -905,7 +887,7 @@ mod tests {
     fn rejects_revisits_by_default() {
         let graph = graph();
         let result = graph
-            .search(traversal(e::bool(true), e::bool(false)))
+            .search(traversal(e::bool_lit(true), e::bool_lit(false)))
             .unwrap();
         assert!(result.paths.is_empty());
         assert_eq!(result.stats.skipped_revisits, 1);
@@ -915,9 +897,9 @@ mod tests {
     #[test]
     fn reports_unknown_start_node() {
         let config = TraversalConfigBuilder::new(DslKernel::new(
-            e::bool(true),
+            e::bool_lit(true),
             [],
-            e::bool(true),
+            e::bool_lit(true),
             [("x".to_string(), Value::U64(0))],
         ))
         .with_start_nodes(["missing".to_string()])
@@ -938,9 +920,9 @@ mod tests {
         let result = graph
             .search(
                 TraversalConfigBuilder::new(DslKernel::new(
-                    e::bool(true),
+                    e::bool_lit(true),
                     [],
-                    e::dest_id().eq(e::uint(3)),
+                    e::dest_id().eq(e::uint_lit(3)),
                     [],
                 ))
                 .with_start_nodes([1u64])
@@ -966,8 +948,8 @@ mod tests {
         let graph = graph();
         let result = graph
             .search(traversal(
-                e::edge_id().ne(e::string("ac")),
-                e::dest_id().eq(e::string("d")),
+                e::edge_id().ne(e::string_lit("ac")),
+                e::dest_id().eq(e::string_lit("d")),
             ))
             .unwrap();
 
@@ -977,7 +959,12 @@ mod tests {
     #[test]
     fn parallel_bfs_matches_serial_path_set() {
         let graph = branching_graph();
-        let base = DslKernel::new(e::bool(true), [], e::dest("kind").eq(e::string("end")), []);
+        let base = DslKernel::new(
+            e::bool_lit(true),
+            [],
+            e::dest("kind").eq(e::string_lit("end")),
+            [],
+        );
         let serial = graph
             .search(
                 TraversalConfigBuilder::new(base.clone())
@@ -1011,9 +998,9 @@ mod tests {
         let result = graph
             .search(
                 TraversalConfigBuilder::new(DslKernel::new(
-                    e::bool(true),
+                    e::bool_lit(true),
                     [],
-                    e::dest("kind").eq(e::string("end")),
+                    e::dest("kind").eq(e::string_lit("end")),
                     [],
                 ))
                 .with_start_nodes(["s".to_string()])
@@ -1033,9 +1020,9 @@ mod tests {
         let result = graph
             .search(
                 TraversalConfigBuilder::new(DslKernel::new(
-                    e::bool(true),
+                    e::bool_lit(true),
                     [],
-                    e::dest("kind").eq(e::string("end")),
+                    e::dest("kind").eq(e::string_lit("end")),
                     [],
                 ))
                 .with_start_nodes(["s".to_string()])
@@ -1059,9 +1046,9 @@ mod tests {
         let result = graph
             .search(
                 TraversalConfigBuilder::new(DslKernel::new(
-                    e::bool(true),
+                    e::bool_lit(true),
                     [],
-                    e::dest("kind").eq(e::string("end")),
+                    e::dest("kind").eq(e::string_lit("end")),
                     [],
                 ))
                 .with_start_nodes(["s".to_string()])
@@ -1077,7 +1064,7 @@ mod tests {
 
     #[test]
     fn builder_parallelism_defaults_on_and_can_be_disabled() {
-        let kernel = DslKernel::new(e::bool(true), [], e::bool(true), []);
+        let kernel = DslKernel::new(e::bool_lit(true), [], e::bool_lit(true), []);
         assert!(TraversalConfigBuilder::new(kernel.clone()).build().parallel);
         assert!(
             !TraversalConfigBuilder::new(kernel)

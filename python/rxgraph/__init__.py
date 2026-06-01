@@ -1,4 +1,5 @@
 from collections.abc import Hashable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any, Self
 
 import polars as pl
@@ -135,9 +136,9 @@ class Graph:
         which accepted paths are returned; if omitted, ``max_paths`` is required
         and every accepted edge is returned. ``next_state`` maps state names to
         Polars expressions evaluated after each accepted edge. ``initial_state``
-        may contain scalars or Python lists; list state can be updated with
-        Polars list expressions such as ``pl.concat_list``. ``strategy`` is
-        ``"dfs"`` or ``"bfs"``.
+        may contain scalars, Python lists, or dict-like struct values. Search
+        kernels support native scalar, list, and struct Polars expressions.
+        ``strategy`` is ``"dfs"`` or ``"bfs"``.
 
         >>> import rxgraph as rxg
         >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
@@ -162,7 +163,9 @@ class Graph:
         )
 
         inner = self._inner.search(traversal._to_inner(self))
-        return SearchResult(inner, self._id_to_label, self._edge_id_to_label)
+        return SearchResult._from_inner(
+            inner, self._id_to_label, self._edge_id_to_label
+        )
 
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         return self._map_nodes(self._inner.bfs(self.node_id(start), max_depth))
@@ -272,42 +275,55 @@ class Traversal:
         )
 
 
+@dataclass(slots=True)
 class SearchPath:
     """One stopped path returned by a traversal."""
 
-    __slots__ = ("nodes", "edges", "state", "intermediate_states")
+    nodes: list[Any]
+    edges: list[Any]
+    state: dict[str, Any]
+    intermediate_states: list[dict[str, Any]] | None = None
 
-    def __init__(
-        self,
+    @classmethod
+    def _from_inner(
+        cls,
         inner: _rxgraph.SearchPath,
         id_to_label: list[Hashable] | None,
         edge_id_to_label: dict[Hashable, Hashable] | None,
-    ) -> None:
-        self.nodes = _map_search_nodes(inner.nodes, id_to_label)
-        self.edges = _map_search_edges(inner.edges, edge_id_to_label)
-        self.state = dict(inner.state)
-        self.intermediate_states = (
-            None
-            if inner.intermediate_states is None
-            else [dict(state) for state in inner.intermediate_states]
+    ) -> Self:
+        return cls(
+            nodes=_map_search_nodes(inner.nodes, id_to_label),
+            edges=_map_search_edges(inner.edges, edge_id_to_label),
+            state=dict(inner.state),
+            intermediate_states=(
+                None
+                if inner.intermediate_states is None
+                else [dict(state) for state in inner.intermediate_states]
+            ),
         )
 
 
+@dataclass(slots=True)
 class SearchResult:
     """Paths and stats returned by :meth:`Graph.search`."""
 
-    __slots__ = ("paths", "stats")
+    paths: list[SearchPath]
+    stats: SearchStats
 
-    def __init__(
-        self,
+    @classmethod
+    def _from_inner(
+        cls,
         inner: _rxgraph.SearchResult,
         id_to_label: list[Hashable] | None,
         edge_id_to_label: dict[Hashable, Hashable] | None,
-    ) -> None:
-        self.paths = [
-            SearchPath(path, id_to_label, edge_id_to_label) for path in inner.paths
-        ]
-        self.stats = inner.stats
+    ) -> Self:
+        return cls(
+            paths=[
+                SearchPath._from_inner(path, id_to_label, edge_id_to_label)
+                for path in inner.paths
+            ],
+            stats=inner.stats,
+        )
 
 
 def _map_search_nodes(

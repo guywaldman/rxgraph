@@ -5,7 +5,7 @@ python := venv / "bin/python"
 maturin := venv / "bin/maturin"
 ruff := venv / "bin/ruff"
 prek := venv / "bin/prek"
-py_sources := "python tests benches"
+py_sources := "python tests benches examples"
 python_manifest := "crates/rxgraph-python/Cargo.toml"
 
 default: test

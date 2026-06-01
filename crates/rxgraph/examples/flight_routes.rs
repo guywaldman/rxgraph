@@ -113,24 +113,24 @@ impl Workload {
 
     fn kernel(self) -> DslKernel {
         let visit = e::state("detours")
-            .eq(e::uint(0))
+            .eq(e::uint_lit(0))
             .and(e::dest("closed").not())
-            .and(e::edge("reliability").ge(e::int(70)))
-            .and(e::edge("route_kind").ne(e::string("decoy")))
-            .and(e::state("hops").lt(e::uint(Self::MAX_HOPS as u64)))
+            .and(e::edge("reliability").ge(e::int_lit(70)))
+            .and(e::edge("route_kind").ne(e::string_lit("decoy")))
+            .and(e::state("hops").lt(e::uint_lit(Self::MAX_HOPS as u64)))
             .and(
                 e::state("spent")
                     .plus(e::edge("price"))
-                    .le(e::uint(self.budget())),
+                    .le(e::uint_lit(self.budget())),
             )
             .and(e::edge("departure").ge(e::state("ready_at")))
-            .and(e::state("risk").plus(e::dest("risk")).le(e::int(90)));
+            .and(e::state("risk").plus(e::dest("risk")).le(e::int_lit(90)));
 
         DslKernel::new(
             visit,
             [
                 ("spent".into(), e::state("spent").plus(e::edge("price"))),
-                ("hops".into(), e::state("hops").plus(e::uint(1))),
+                ("hops".into(), e::state("hops").plus(e::uint_lit(1))),
                 (
                     "ready_at".into(),
                     e::edge("arrival").plus(e::dest("min_connection")),
@@ -141,7 +141,7 @@ impl Workload {
                     e::state("detours").plus(e::edge("detour_cost")),
                 ),
             ],
-            e::dest_id().eq(e::uint((self.airports - 1) as u64)),
+            e::dest_id().eq(e::uint_lit((self.airports - 1) as u64)),
             [
                 ("spent".into(), Value::U64(0)),
                 ("hops".into(), Value::U64(0)),
