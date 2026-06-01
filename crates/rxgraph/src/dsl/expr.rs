@@ -76,6 +76,15 @@ impl DslExpr {
         Self(Expr::Literal(value.into()))
     }
 
+    /// Returns `truthy` when `predicate` is true, otherwise `falsy`.
+    pub fn when(predicate: Self, truthy: Self, falsy: Self) -> Self {
+        Self(Expr::Ternary {
+            predicate: Box::new(predicate.0),
+            truthy: Box::new(truthy.0),
+            falsy: Box::new(falsy.0),
+        })
+    }
+
     /// Parses the supported Polars JSON expression subset.
     pub fn from_polars_json(json: &str) -> Result<Self> {
         Ok(Self(parse_polars_json(json)?))
@@ -215,6 +224,11 @@ pub(crate) enum Expr<C> {
     Element,
     Literal(Value),
     Alias(Box<Expr<C>>, String),
+    Ternary {
+        predicate: Box<Expr<C>>,
+        truthy: Box<Expr<C>>,
+        falsy: Box<Expr<C>>,
+    },
     Scalar(ScalarOp, Vec<Expr<C>>),
     String(StringOp, Vec<Expr<C>>),
     List(ListOp, Vec<Expr<C>>),
@@ -228,6 +242,15 @@ impl<C> Expr<C> {
             Self::Element => Expr::Element,
             Self::Literal(value) => Expr::Literal(value),
             Self::Alias(expr, name) => Expr::Alias(Box::new(expr.try_map_column(f)?), name),
+            Self::Ternary {
+                predicate,
+                truthy,
+                falsy,
+            } => Expr::Ternary {
+                predicate: Box::new(predicate.try_map_column(f)?),
+                truthy: Box::new(truthy.try_map_column(f)?),
+                falsy: Box::new(falsy.try_map_column(f)?),
+            },
             Self::Scalar(op, args) => Expr::Scalar(op, map_args(args, f)?),
             Self::String(op, args) => Expr::String(op, map_args(args, f)?),
             Self::List(op, args) => Expr::List(op, map_args(args, f)?),

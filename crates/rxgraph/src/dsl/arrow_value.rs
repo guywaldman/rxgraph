@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{io::Cursor, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow::{
@@ -8,6 +8,7 @@ use arrow::{
         StructArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     },
     datatypes::DataType,
+    ipc::reader::StreamReader,
     record_batch::RecordBatch,
 };
 
@@ -111,6 +112,27 @@ pub(crate) fn array_to_values(array: &dyn Array) -> Result<Vec<Value>> {
     (0..array.len())
         .map(|row| array_row_to_value(array, row))
         .collect()
+}
+
+pub(crate) fn ipc_list_literal_to_value(bytes: &[u8]) -> Result<Value> {
+    let mut reader = StreamReader::try_new(Cursor::new(bytes), None)
+        .context("invalid Polars Arrow IPC list literal")?;
+    let batch = reader
+        .next()
+        .transpose()
+        .context("invalid Polars Arrow IPC list literal batch")?
+        .context("Polars Arrow IPC list literal is empty")?;
+    if batch.num_columns() != 1 {
+        bail!(
+            "Polars Arrow IPC list literal expected one column, got {} columns",
+            batch.num_columns(),
+        );
+    }
+    let column = batch.column(0).as_ref();
+    (0..batch.num_rows())
+        .map(|row| array_row_to_value(column, row))
+        .collect::<Result<Vec<_>>>()
+        .map(Value::List)
 }
 
 fn array_row_to_value(array: &dyn Array, row: usize) -> Result<Value> {

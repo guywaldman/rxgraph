@@ -65,6 +65,17 @@ impl Expr<BoundColumn> {
                 .context("pl.element() is only valid inside list.eval/list.filter"),
             Self::Literal(value) => Ok(value.clone()),
             Self::Alias(expr, _) => expr.eval(ctx),
+            Self::Ternary {
+                predicate,
+                truthy,
+                falsy,
+            } => {
+                if predicate.eval(ctx)?.truthy()? {
+                    truthy.eval(ctx)
+                } else {
+                    falsy.eval(ctx)
+                }
+            }
             Self::Scalar(op, args) => {
                 let args = eval_args(args, ctx)?;
                 op.eval(&args)
