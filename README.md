@@ -143,6 +143,15 @@ assert path.state == {"spent": 11}
 Search supports DFS or BFS ordering, optional Rayon-backed parallel traversal,
 depth/path limits, and optional intermediate state materialization.
 
+Search kernels evaluate supported Polars scalar, list, and struct expressions
+natively in Rust. List and struct columns/state can be read and updated inside
+`visit`, `next_state`, and `stop`. Polars JSON list literals are intentionally
+not decoded yet; use list columns or list state for list-valued operands.
+
+See [`examples/nyc_taxi_zone_search.py`](examples/nyc_taxi_zone_search.py)
+for a public NYC TLC trip-record example that uses list and struct state over
+millions of raw trip edges.
+
 ## Architecture
 
 The Python package is backed by a Rust core. Internally, `rxgraph` stores node
