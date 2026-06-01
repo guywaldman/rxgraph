@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/guywaldman/rxgraph/compare/v0.0.14...v0.1.0) (2026-06-01)
+
+
+### Features
+
+* add support for list and struct operations ([#13](https://github.com/guywaldman/rxgraph/issues/13)) ([5b33577](https://github.com/guywaldman/rxgraph/commit/5b335772054d3aae777bedc37efd809209d5e714))
+
 ## [0.0.14](https://github.com/guywaldman/rxgraph/compare/v0.0.13...v0.0.14) (2026-05-31)
 
 
