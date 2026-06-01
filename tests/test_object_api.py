@@ -1,3 +1,5 @@
+from dataclasses import asdict, is_dataclass
+
 import pytest
 import rxgraph as rxg
 
@@ -66,6 +68,14 @@ def test_from_edges_traversal_uses_polars_reexports_and_returns_labels() -> None
     )
 
     assert len(result.paths) == 1
+    assert is_dataclass(result)
+    assert is_dataclass(result.paths[0])
+    assert asdict(result.paths[0]) == {
+        "nodes": ["a", "b", "c"],
+        "edges": [0, 1],
+        "state": {"spent": 11},
+        "intermediate_states": None,
+    }
     assert result.paths[0].nodes == ["a", "b", "c"]
     assert result.paths[0].edges == [0, 1]
 
