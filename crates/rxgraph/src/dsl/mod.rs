@@ -282,6 +282,35 @@ mod tests {
     }
 
     #[test]
+    fn typed_api_conditionals_are_lazy() {
+        let kernel = DslKernel::new(
+            DslExpr::bool_lit(true),
+            [(
+                "score".into(),
+                DslExpr::when(
+                    DslExpr::bool_lit(true),
+                    DslExpr::uint_lit(7),
+                    DslExpr::string_lit("unused").plus(DslExpr::uint_lit(1)),
+                ),
+            )],
+            DslExpr::state("score").eq(DslExpr::uint_lit(7)),
+            [("score".into(), Value::U64(0))],
+        );
+
+        let graph = string_graph();
+        let result = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a"])
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 2);
+    }
+
+    #[test]
     fn unsupported_json_ops_fail_clearly() {
         let err = DslExpr::from_polars_json(
             r#"{"BinaryExpr":{"left":{"Column":"dest.kind"},"op":"Pow","right":{"Literal":{"Dyn":{"String":"target"}}}}}"#,
@@ -333,6 +362,44 @@ mod tests {
                 .unwrap(),
             Value::List(vec![Value::I64(3), Value::Null])
         );
+        assert_eq!(
+            ListOp::Explode {
+                empty_as_null: true,
+                keep_nulls: true,
+            }
+            .eval(&[Value::List(vec![
+                Value::List(vec![Value::I64(1), Value::I64(2)]),
+                Value::I64(3),
+                Value::Null,
+                Value::List(vec![]),
+            ])])
+            .unwrap(),
+            Value::List(vec![
+                Value::I64(1),
+                Value::I64(2),
+                Value::I64(3),
+                Value::Null,
+                Value::Null,
+            ])
+        );
+        assert_eq!(
+            ListOp::Set(SetOp::Intersection)
+                .eval(&[
+                    Value::List(vec![Value::Struct(vec![
+                        ("protocol".into(), Value::Str("tcp".into())),
+                        ("from_port".into(), Value::U64(80)),
+                    ])]),
+                    Value::List(vec![Value::Struct(vec![
+                        ("from_port".into(), Value::U64(80)),
+                        ("protocol".into(), Value::Str("tcp".into())),
+                    ])]),
+                ])
+                .unwrap(),
+            Value::List(vec![Value::Struct(vec![
+                ("protocol".into(), Value::Str("tcp".into())),
+                ("from_port".into(), Value::U64(80)),
+            ])])
+        );
     }
 
     #[test]
@@ -372,6 +439,8 @@ mod tests {
             r#"{"Function":{"input":[{"Column":"state.x"},{"Literal":{"Dyn":{"Int":2}}}],"function":{"ListExpr":{"Contains":{"nulls_equal":true}}}}}"#,
             r#"{"Eval":{"expr":{"Column":"state.x"},"evaluation":{"BinaryExpr":{"left":"Element","op":"Plus","right":{"Literal":{"Dyn":{"Int":1}}}}},"variant":"List"}}"#,
             r#"{"Eval":{"expr":{"Column":"state.x"},"evaluation":{"Filter":{"input":{"Column":""},"by":{"BinaryExpr":{"left":"Element","op":"Gt","right":{"Literal":{"Dyn":{"Int":1}}}}}}},"variant":"List"}}"#,
+            r#"{"Ternary":{"predicate":{"Column":"state.ok"},"truthy":{"Literal":{"Dyn":{"Int":1}}},"falsy":{"Literal":{"Dyn":{"Int":0}}}}}"#,
+            r#"{"Explode":{"input":{"Column":"state.x"},"options":{"empty_as_null":true,"keep_nulls":true}}}"#,
             r#"{"Function":{"input":[{"Column":"state.s"}],"function":{"StructExpr":{"FieldByName":"score"}}}}"#,
             r#"{"StructEval":{"expr":{"Column":"state.s"},"evaluation":[{"Alias":[{"Literal":{"Dyn":{"Int":3}}},"extra"]}]}}"#,
         ] {

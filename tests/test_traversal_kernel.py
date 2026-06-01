@@ -230,6 +230,126 @@ def test_search_supports_native_struct_operations() -> None:
     assert json.loads(state["json"]) == {"score": 9, "label": "b"}
 
 
+def test_search_supports_conditionals_struct_filters_and_edge_state() -> None:
+    rule_dtype = pl.List(
+        pl.Struct(
+            {
+                "protocol": pl.String,
+                "from_port": pl.Int64,
+                "to_port": pl.Int64,
+            }
+        )
+    )
+    nodes = pl.DataFrame(
+        {
+            "id": [0, 1, 2],
+            "label": ["start", "transparent", "gate"],
+            "has_rules": [False, False, True],
+            "allow_rules": [
+                [],
+                [],
+                [
+                    {"protocol": "tcp", "from_port": 80, "to_port": 80},
+                    {"protocol": "udp", "from_port": 53, "to_port": 53},
+                ],
+            ],
+        },
+        schema={
+            "id": pl.UInt64,
+            "label": pl.String,
+            "has_rules": pl.Boolean,
+            "allow_rules": rule_dtype,
+        },
+    )
+    edges = pl.DataFrame(
+        {
+            "id": [10, 11],
+            "src": [0, 1],
+            "dest": [1, 2],
+            "map": [100, 3000],
+        },
+        schema={
+            "id": pl.UInt64,
+            "src": pl.UInt64,
+            "dest": pl.UInt64,
+            "map": pl.Int64,
+        },
+    )
+    graph = rxg.Graph(nodes, edges)
+
+    rules = pl.col("dest.allow_rules")
+    matching_rules = rules.list.filter(
+        pl.col("state.allowed_protocols").list.contains(
+            pl.element().struct.field("protocol")
+        )
+    )
+    result = graph.search(
+        start_nodes=[0],
+        visit=pl.when(pl.col("dest.has_rules"))
+        .then(matching_rules.list.len() > 0)
+        .otherwise(pl.lit(True)),
+        next_state={
+            "allowed_rules": pl.when(pl.col("dest.has_rules"))
+            .then(pl.col("state.allowed_rules").list.set_intersection(rules))
+            .otherwise(pl.col("state.allowed_rules")),
+            "last_edge_map": pl.col("edge.map"),
+            "lazy_guard": pl.when(pl.lit(True))
+            .then(pl.lit(1))
+            .otherwise(pl.col("dest.label") + 1),
+        },
+        stop=pl.col("dest.id") == 2,
+        initial_state={
+            "allowed_protocols": ["tcp"],
+            "allowed_rules": [{"to_port": 80, "protocol": "tcp", "from_port": 80}],
+            "last_edge_map": 0,
+            "lazy_guard": 0,
+        },
+        max_depth=2,
+        max_paths=1,
+    )
+
+    assert result.paths[0].nodes == [0, 1, 2]
+    assert result.paths[0].state["allowed_rules"] == [
+        {"to_port": 80, "protocol": "tcp", "from_port": 80}
+    ]
+    assert result.paths[0].state["last_edge_map"] == 3000
+    assert result.paths[0].state["lazy_guard"] == 1
+
+
+def test_search_supports_list_eval_when_literals_and_explode() -> None:
+    nodes = pl.DataFrame(
+        {
+            "id": [0, 1],
+            "protocols": [[], ["-1", "icmp"]],
+        },
+        schema={"id": pl.UInt64, "protocols": pl.List(pl.String)},
+    )
+    edges = pl.DataFrame(
+        {"id": [10], "src": [0], "dest": [1]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    )
+    graph = rxg.Graph(nodes, edges)
+
+    expanded = (
+        pl.col("dest.protocols")
+        .list.eval(
+            pl.when(pl.element() == "-1")
+            .then(pl.lit(["tcp", "udp"]))
+            .otherwise(pl.element())
+        )
+        .list.explode()
+    )
+    result = graph.search(
+        start_nodes=[0],
+        next_state={"expanded": expanded},
+        stop=pl.col("dest.id") == 1,
+        initial_state={"expanded": []},
+        max_paths=1,
+    )
+
+    assert result.paths[0].state["expanded"] == ["tcp", "udp", "icmp"]
+
+
 def test_search_defaults_stop_when_max_paths_is_set() -> None:
     graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
 

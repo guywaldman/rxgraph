@@ -5,6 +5,7 @@ use serde_json::Value as Json;
 
 use crate::dsl::{
     Value,
+    arrow_value::ipc_list_literal_to_value,
     expr::{ColumnRef, Expr},
     ops::{
         list::{ListOp, SetOp},
@@ -60,6 +61,9 @@ fn parse_expr(value: &Json) -> Result<Expr<ColumnRef>> {
             name.to_owned(),
         ));
     }
+    if let Some(ternary) = object.get("Ternary") {
+        return parse_ternary(ternary);
+    }
     if let Some(rx) = object.get("Rx") {
         return parse_rx_expr(rx);
     }
@@ -74,6 +78,9 @@ fn parse_expr(value: &Json) -> Result<Expr<ColumnRef>> {
     }
     if let Some(filter) = object.get("Filter") {
         return parse_filter(filter);
+    }
+    if let Some(explode) = object.get("Explode") {
+        return parse_explode(explode);
     }
     bail!("unsupported Polars expression JSON: {value}")
 }
@@ -165,10 +172,24 @@ fn parse_scalar_literal(value: &Json) -> Result<Value> {
             value.as_f64().context("Float literal must be f64")?,
         ));
     }
-    if object.contains_key("List") {
-        bail!("Polars JSON list literals are not supported; use list columns or state");
+    if let Some(value) = object.get("List") {
+        return ipc_list_literal_to_value(&parse_byte_array(value)?);
     }
     bail!("unsupported literal {value}")
+}
+
+fn parse_byte_array(value: &Json) -> Result<Vec<u8>> {
+    value
+        .as_array()
+        .context("List literal must be an Arrow IPC byte array")?
+        .iter()
+        .map(|value| {
+            let byte = value
+                .as_u64()
+                .context("Arrow IPC byte array entries must be unsigned integers")?;
+            u8::try_from(byte).context("Arrow IPC byte array entries must fit in u8")
+        })
+        .collect()
 }
 
 fn parse_function(value: &Json) -> Result<Expr<ColumnRef>> {
@@ -342,6 +363,43 @@ fn parse_eval(value: &Json) -> Result<Expr<ColumnRef>> {
         }
         variant => bail!("unsupported Eval variant {variant:?}"),
     }
+}
+
+fn parse_ternary(value: &Json) -> Result<Expr<ColumnRef>> {
+    let object = value.as_object().context("Ternary must be an object")?;
+    Ok(Expr::Ternary {
+        predicate: Box::new(parse_expr(
+            object
+                .get("predicate")
+                .context("Ternary missing predicate")?,
+        )?),
+        truthy: Box::new(parse_expr(
+            object.get("truthy").context("Ternary missing truthy")?,
+        )?),
+        falsy: Box::new(parse_expr(
+            object.get("falsy").context("Ternary missing falsy")?,
+        )?),
+    })
+}
+
+fn parse_explode(value: &Json) -> Result<Expr<ColumnRef>> {
+    let object = value.as_object().context("Explode must be an object")?;
+    let options = object.get("options").and_then(Json::as_object);
+    Ok(Expr::List(
+        ListOp::Explode {
+            empty_as_null: options
+                .and_then(|options| options.get("empty_as_null"))
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
+            keep_nulls: options
+                .and_then(|options| options.get("keep_nulls"))
+                .and_then(Json::as_bool)
+                .unwrap_or(true),
+        },
+        vec![parse_expr(
+            object.get("input").context("Explode missing input")?,
+        )?],
+    ))
 }
 
 fn parse_filter(value: &Json) -> Result<Expr<ColumnRef>> {
