@@ -16,11 +16,18 @@ pub(crate) enum SetOp {
 pub(crate) enum ListOp {
     Concat,
     Len,
-    Contains { nulls_equal: bool },
-    Get { null_on_oob: bool },
+    Contains {
+        nulls_equal: bool,
+    },
+    Get {
+        null_on_oob: bool,
+    },
     Slice,
     Reverse,
-    Sort { descending: bool, nulls_last: bool },
+    Sort {
+        descending: bool,
+        nulls_last: bool,
+    },
     Unique,
     DropNulls,
     Sum,
@@ -28,16 +35,26 @@ pub(crate) enum ListOp {
     Max,
     Mean,
     Median,
-    Any { ignore_nulls: bool },
-    All { ignore_nulls: bool },
+    Any {
+        ignore_nulls: bool,
+    },
+    All {
+        ignore_nulls: bool,
+    },
     CountMatches,
     NUnique,
-    Join { ignore_nulls: bool },
+    Join {
+        ignore_nulls: bool,
+    },
     Shift,
     GatherEvery,
     Set(SetOp),
     Eval,
     Filter,
+    Explode {
+        empty_as_null: bool,
+        keep_nulls: bool,
+    },
     ToStruct(Vec<String>),
 }
 
@@ -84,6 +101,10 @@ impl ListOp {
             Self::Shift => shift(args)?,
             Self::GatherEvery => gather_every(args)?,
             Self::Set(op) => set_operation(args, *op)?,
+            Self::Explode {
+                empty_as_null,
+                keep_nulls,
+            } => explode(args, *empty_as_null, *keep_nulls)?,
             Self::ToStruct(names) => to_struct(args, names)?,
             Self::Eval | Self::Filter => bail!("list op requires expression context"),
         })
@@ -426,6 +447,26 @@ fn gather_every(args: &[Value]) -> Result<Value> {
     while index < values.len() {
         out.push(values[index].clone());
         index += n as usize;
+    }
+    Ok(Value::List(out))
+}
+
+fn explode(args: &[Value], empty_as_null: bool, keep_nulls: bool) -> Result<Value> {
+    let Some(values) = list_arg(args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let mut out = Vec::new();
+    for value in values {
+        match value {
+            Value::List(inner) if inner.is_empty() && empty_as_null => out.push(Value::Null),
+            Value::List(inner) => out.extend(inner.iter().cloned()),
+            Value::Null if keep_nulls => out.push(Value::Null),
+            Value::Null => {}
+            value => out.push(value.clone()),
+        }
+    }
+    if out.is_empty() && empty_as_null {
+        out.push(Value::Null);
     }
     Ok(Value::List(out))
 }

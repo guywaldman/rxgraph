@@ -139,10 +139,12 @@ impl Value {
             }
             (Self::Struct(left), Self::Struct(right)) => {
                 left.len() == right.len()
-                    && left
-                        .iter()
-                        .zip(right)
-                        .all(|((ln, lv), (rn, rv))| ln == rn && lv.eq_value(rv))
+                    && left.iter().all(|(name, value)| {
+                        right
+                            .iter()
+                            .find(|(right_name, _)| right_name == name)
+                            .is_some_and(|(_, right_value)| value.eq_value(right_value))
+                    })
             }
             _ => self
                 .as_f64()
