@@ -187,6 +187,18 @@ impl PyGraph {
     fn edge_count(&self) -> usize {
         self.inner.edge_count()
     }
+
+    /// Replaces the payload tables in place, reusing the existing topology.
+    ///
+    /// Used by lazy graphs to have column-projected payload batches before a search.
+    /// This is only used for optimizations, for example in cases where nodes/edges contain many columns
+    /// and we want to lazily pull their payloads to reduce memory strain.
+    /// Each table must have one row per node/edge in internal-ID order.
+    fn set_payloads(&mut self, nodes: PyTable, edges: PyTable) -> PyResult<()> {
+        self.inner
+            .set_payloads(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
+            .map_err(to_py_value_err)
+    }
 }
 
 fn one_batch(table: PyTable, label: &str) -> PyResult<arrow::record_batch::RecordBatch> {

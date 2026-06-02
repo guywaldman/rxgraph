@@ -1,17 +1,29 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::repo::{EdgeId, NodeId};
 
+/// Type used for CSR row offsets. `u32` keeps per-node overhead small; edge counts are
+/// already bounded by `EdgeId = u32`, so offsets cannot exceed `u32::MAX`.
+pub(crate) type Offset = u32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Csr {
-    pub(crate) offsets: Vec<usize>,
+    pub(crate) offsets: Vec<Offset>,
     pub(crate) edge_ids: Vec<EdgeId>,
     pub(crate) dests: Vec<NodeId>,
 }
 
 /// Constructs a CSR (Compressed Sparse Row) data structure for outgoing edges.
 pub(crate) fn build_csr(node_count: usize, edges: &[(NodeId, NodeId)]) -> Result<Csr> {
-    let mut offsets = vec![0usize; node_count + 1];
+    if edges.len() > Offset::MAX as usize {
+        bail!(
+            "too many edges for u32 CSR offsets ({} > {})",
+            edges.len(),
+            Offset::MAX
+        );
+    }
+
+    let mut offsets = vec![0 as Offset; node_count + 1];
 
     for &(src, _dest) in edges {
         offsets[src as usize + 1] += 1;
@@ -26,8 +38,7 @@ pub(crate) fn build_csr(node_count: usize, edges: &[(NodeId, NodeId)]) -> Result
     let mut cursor = offsets.clone();
 
     for (edge_id, &(src, dest)) in edges.iter().enumerate() {
-        let pos = cursor[src as usize];
-        // TODO: Check?
+        let pos = cursor[src as usize] as usize;
         edge_ids[pos] = edge_id as EdgeId;
         dests[pos] = dest;
         cursor[src as usize] += 1;

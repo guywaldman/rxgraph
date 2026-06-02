@@ -49,7 +49,7 @@ package-rust:
 package-python: setup
     {{maturin}} build --manifest-path {{python_manifest}} --release --out dist
 
-ci: lock-check fmt-check lint test package-rust package-python
+ci: lock-check fmt-check lint test package-rust package-python memcheck
 
 precommit: setup
     {{prek}} run --all-files
@@ -59,6 +59,12 @@ install-hooks: setup
 
 bench *args: build-maturin
     {{python}} -m benches.main {{args}}
+
+bench-memory-rust *args: build-maturin
+    cargo bench -p rxgraph --bench memory
+
+memcheck *args: build-maturin
+    {{python}} -m benches.memory_rss {{args}}
 
 profile script: setup
     @command -v flamegraph >/dev/null || { echo "Install cargo-flamegraph first: cargo install flamegraph"; exit 1; }

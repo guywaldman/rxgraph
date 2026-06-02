@@ -35,6 +35,11 @@ impl Graph {
         })
     }
 
+    /// Replaces the payload (attribute) tables, reusing the existing topology.
+    pub fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
+        self.repo.set_payloads(nodes, edges)
+    }
+
     /// Number of node rows.
     pub fn node_count(&self) -> usize {
         self.repo.nodes.num_rows()
@@ -211,6 +216,8 @@ impl Graph {
     pub fn weakly_connected_components(&self) -> Vec<Vec<GraphId<'_>>> {
         let mut visited = vec![0u8; self.node_count()];
         let mut components = Vec::new();
+        // Reused across components to reduce allocations.
+        let mut frontier = Vec::new();
 
         for start in 0..self.node_count() {
             if visited[start] != 0 {
@@ -218,7 +225,8 @@ impl Graph {
             }
 
             let mut component = Vec::new();
-            let mut frontier = vec![start as NodeId];
+            frontier.clear();
+            frontier.push(start as NodeId);
             let mut head = 0;
             visited[start] = 1;
 
@@ -253,6 +261,8 @@ impl Graph {
     pub fn weakly_connected_components_u64(&self) -> Option<Vec<Vec<u64>>> {
         let mut visited = vec![0u8; self.node_count()];
         let mut components = Vec::new();
+        // Reused across components to reduce allocations.
+        let mut frontier = Vec::new();
 
         for start in 0..self.node_count() {
             if visited[start] != 0 {
@@ -260,7 +270,8 @@ impl Graph {
             }
 
             let mut component = Vec::new();
-            let mut frontier = vec![start as NodeId];
+            frontier.clear();
+            frontier.push(start as NodeId);
             let mut head = 0;
             visited[start] = 1;
 

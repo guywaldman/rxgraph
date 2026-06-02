@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::OnceLock};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -8,13 +8,13 @@ use arrow_schema::DataType;
 
 use crate::{
     arrow::validate_field_exists,
-    graph::csr::{Csr, build_csr},
+    graph::csr::{Csr, Offset, build_csr},
 };
 
-/// Compact internal node identifier used by traversal code.
+/// Compact internal node identifier used for traversal.
 pub type NodeId = u32;
 
-/// Compact internal edge identifier used by traversal code.
+/// Compact internal edge identifier used for traversal.
 pub type EdgeId = u32;
 
 pub const ID_COL: &str = "id";
@@ -100,17 +100,34 @@ pub trait GraphRepo {
 
 #[derive(Debug)]
 pub(crate) struct Repo {
-    csr_offsets: Vec<usize>,
+    csr_offsets: Vec<Offset>,
     csr_dests: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
-    incoming_offsets: Vec<usize>,
-    incoming_srcs: Vec<NodeId>,
-    out_degrees: Vec<usize>,
-    in_degrees: Vec<usize>,
-    degrees: Vec<usize>,
+
     identity: Identity,
     pub nodes: RecordBatch,
     pub edges: RecordBatch,
+
+    /// Reverse adjacency (incoming edges).
+    /// Used for optimization - only some searches require it and it's built lazily on first use
+    /// to keep construction memory and time low (and proportional) foraward only workloads
+    /// (like BFS, as opposed to WCC or degrees).
+    incoming: OnceLock<IncomingCsr>,
+    /// Endpoints retained to build the reverse CSR lazily without re-reading Arrow columns.
+    edge_endpoints: Vec<(NodeId, NodeId)>,
+
+    /// Degree vectors, only used when whole-graph degree query and cached after.
+    /// Search-only workloads never touch these, so construction stays cheap;
+    /// degree-heavy workloads pay the O(n) build once instead of on every call.
+    out_degrees: OnceLock<Vec<usize>>,
+    in_degrees: OnceLock<Vec<usize>>,
+    degrees: OnceLock<Vec<usize>>,
+}
+
+#[derive(Debug)]
+struct IncomingCsr {
+    offsets: Vec<Offset>,
+    srcs: Vec<NodeId>,
 }
 
 #[derive(Debug)]
@@ -203,6 +220,33 @@ impl Repo {
         self.identity.is_contiguous_u64()
     }
 
+    /// Replaces the payload (attribute) tables without rebuilding topology.
+    ///
+    /// Used by lazy graphs to swap in column-projected payload batches for a single search.
+    /// The new batches must keep the original row order and count: DSL column reads index
+    /// payload arrays by internal node/edge ID, which equals the Arrow row position.
+    /// Identity (`id`/`src`/`dest`) is resolved from the precomputed mapping, not these
+    /// batches, so the projected batches only need the columns the kernel references.
+    pub(crate) fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
+        if nodes.num_rows() != self.nodes.num_rows() {
+            bail!(
+                "projected nodes table has {} rows but topology expects {}",
+                nodes.num_rows(),
+                self.nodes.num_rows()
+            );
+        }
+        if edges.num_rows() != self.edges.num_rows() {
+            bail!(
+                "projected edges table has {} rows but topology expects {}",
+                edges.num_rows(),
+                self.edges.num_rows()
+            );
+        }
+        self.nodes = nodes;
+        self.edges = edges;
+        Ok(())
+    }
+
     pub(crate) fn internal_node_u64(&self, external: u64) -> Option<NodeId> {
         self.identity.internal_node_u64(external)
     }
@@ -215,8 +259,8 @@ impl Repo {
 impl GraphRepo for Repo {
     fn outgoing(&self, node: NodeId) -> impl Iterator<Item = (EdgeId, NodeId)> {
         let i = node as usize;
-        let start = self.csr_offsets[i];
-        let end = self.csr_offsets[i + 1];
+        let start = self.csr_offsets[i] as usize;
+        let end = self.csr_offsets[i + 1] as usize;
 
         self.edge_ids[start..end]
             .iter()
@@ -226,16 +270,17 @@ impl GraphRepo for Repo {
 
     fn outgoing_slice(&self, node: NodeId) -> (&[EdgeId], &[NodeId]) {
         let i = node as usize;
-        let start = self.csr_offsets[i];
-        let end = self.csr_offsets[i + 1];
+        let start = self.csr_offsets[i] as usize;
+        let end = self.csr_offsets[i + 1] as usize;
         (&self.edge_ids[start..end], &self.csr_dests[start..end])
     }
 
     fn incoming(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+        let incoming = self.incoming();
         let i = node as usize;
-        let start = self.incoming_offsets[i];
-        let end = self.incoming_offsets[i + 1];
-        self.incoming_srcs[start..end].iter().copied()
+        let start = incoming.offsets[i] as usize;
+        let end = incoming.offsets[i + 1] as usize;
+        incoming.srcs[start..end].iter().copied()
     }
 
     fn internal_node(&self, external: GraphId<'_>) -> Option<NodeId> {
@@ -251,25 +296,61 @@ impl GraphRepo for Repo {
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
-        self.out_degrees[node as usize]
+        let i = node as usize;
+        (self.csr_offsets[i + 1] - self.csr_offsets[i]) as usize
     }
 
     fn in_degree(&self, node: NodeId) -> usize {
-        self.in_degrees[node as usize]
+        let incoming = self.incoming();
+        let i = node as usize;
+        (incoming.offsets[i + 1] - incoming.offsets[i]) as usize
     }
 }
 
 impl Repo {
+    /// Returns the reverse-adjacency CSR, building it on first use.
+    fn incoming(&self) -> &IncomingCsr {
+        self.incoming.get_or_init(|| {
+            let incoming_edges = self
+                .edge_endpoints
+                .iter()
+                .map(|&(src, dest)| (dest, src))
+                .collect::<Vec<_>>();
+            let Csr { offsets, dests, .. } = build_csr(self.nodes.num_rows(), &incoming_edges)
+                .expect("incoming CSR has the same edge count as the forward CSR");
+            IncomingCsr {
+                offsets,
+                srcs: dests,
+            }
+        })
+    }
+
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
-        self.out_degrees.clone()
+        self.out_degrees
+            .get_or_init(|| degrees_from_offsets(&self.csr_offsets))
+            .clone()
     }
 
     pub(crate) fn in_degrees(&self) -> Vec<usize> {
-        self.in_degrees.clone()
+        self.in_degrees
+            .get_or_init(|| degrees_from_offsets(&self.incoming().offsets))
+            .clone()
     }
 
     pub(crate) fn degrees(&self) -> Vec<usize> {
-        self.degrees.clone()
+        self.degrees.get_or_init(|| self.compute_degrees()).clone()
+    }
+
+    fn compute_degrees(&self) -> Vec<usize> {
+        let out = &self.csr_offsets;
+        let incoming = &self.incoming().offsets;
+        (0..self.nodes.num_rows())
+            .map(|i| {
+                let out_deg = (out[i + 1] - out[i]) as usize;
+                let in_deg = (incoming[i + 1] - incoming[i]) as usize;
+                out_deg + in_deg
+            })
+            .collect()
     }
 }
 
@@ -285,23 +366,6 @@ impl Repo {
             edge_ids,
             dests: csr_dests,
         } = build_csr(nodes.num_rows(), &edge_endpoints).context("failed to construct CSR")?;
-        let incoming_edges = edge_endpoints
-            .iter()
-            .map(|&(src, dest)| (dest, src))
-            .collect::<Vec<_>>();
-        let Csr {
-            offsets: incoming_offsets,
-            dests: incoming_srcs,
-            ..
-        } = build_csr(nodes.num_rows(), &incoming_edges)
-            .context("failed to construct incoming CSR")?;
-        let out_degrees = degrees_from_offsets(&csr_offsets);
-        let in_degrees = degrees_from_offsets(&incoming_offsets);
-        let degrees = out_degrees
-            .iter()
-            .zip(&in_degrees)
-            .map(|(out, incoming)| out + incoming)
-            .collect();
 
         Ok(Self {
             nodes,
@@ -309,18 +373,21 @@ impl Repo {
             csr_offsets,
             csr_dests,
             edge_ids,
-            incoming_offsets,
-            incoming_srcs,
-            out_degrees,
-            in_degrees,
-            degrees,
+            incoming: OnceLock::new(),
+            edge_endpoints,
             identity,
+            out_degrees: OnceLock::new(),
+            in_degrees: OnceLock::new(),
+            degrees: OnceLock::new(),
         })
     }
 }
 
-fn degrees_from_offsets(offsets: &[usize]) -> Vec<usize> {
-    offsets.windows(2).map(|pair| pair[1] - pair[0]).collect()
+fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
+    offsets
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]) as usize)
+        .collect()
 }
 
 struct Preprocessed {
@@ -687,5 +754,57 @@ mod tests {
                 .to_string()
                 .contains("missing dest")
         );
+    }
+
+    #[test]
+    fn set_payloads_swaps_columns_and_keeps_topology() {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0, 1]),
+            (EDGE_SRC_COL, UInt64, [0, 1]),
+            (EDGE_DEST_COL, UInt64, [1, 2])
+        )
+        .unwrap();
+        let mut repo = Repo::from_tables(nodes, edges).unwrap();
+
+        // Project to a different set of payload columns (same row counts).
+        let new_nodes =
+            record_batch!((ID_COL, UInt64, [0, 1, 2]), ("score", Int64, [10, 20, 30])).unwrap();
+        let new_edges = record_batch!(
+            (ID_COL, UInt64, [0, 1]),
+            (EDGE_SRC_COL, UInt64, [0, 1]),
+            (EDGE_DEST_COL, UInt64, [1, 2])
+        )
+        .unwrap();
+        repo.set_payloads(new_nodes, new_edges).unwrap();
+
+        // Topology is unchanged after the swap.
+        assert_eq!(outgoing_for(&repo, GraphId::U64(0)), vec![GraphId::U64(1)]);
+        assert!(repo.nodes.column_by_name("score").is_some());
+    }
+
+    #[test]
+    fn set_payloads_rejects_row_count_mismatch() {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0]),
+            (EDGE_SRC_COL, UInt64, [0]),
+            (EDGE_DEST_COL, UInt64, [1])
+        )
+        .unwrap();
+        let mut repo = Repo::from_tables(nodes, edges).unwrap();
+
+        let bad_nodes = record_batch!((ID_COL, UInt64, [0, 1])).unwrap();
+        let same_edges = record_batch!(
+            (ID_COL, UInt64, [0]),
+            (EDGE_SRC_COL, UInt64, [0]),
+            (EDGE_DEST_COL, UInt64, [1])
+        )
+        .unwrap();
+        let err = repo
+            .set_payloads(bad_nodes, same_edges)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("projected nodes table has 2 rows"));
     }
 }

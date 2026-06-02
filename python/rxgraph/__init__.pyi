@@ -2,7 +2,7 @@ from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, Self, TypeVar
 
-from polars import DataFrame, Expr, col as col, lit as lit
+from polars import DataFrame, Expr, LazyFrame, col as col, lit as lit
 
 Node = TypeVar("Node", bound=Hashable)
 GraphId = int | str
@@ -35,6 +35,17 @@ class Graph:
         nodes: Iterable[Node | tuple[Node, Mapping[str, Any]]] | None = None,
     ) -> Self:
         """Build a directed graph from Python node labels and edge tuples."""
+        ...
+
+    @classmethod
+    def from_lazy(cls, nodes: LazyFrame, edges: LazyFrame) -> Self:
+        """Build a graph from Polars ``LazyFrame``s, deferring payload columns.
+
+        Only identity/topology columns (``id`` for nodes; ``id``/``src``/``dest``
+        for edges, plus optional ``type``) are collected at construction. Payload
+        columns are pulled lazily at :meth:`search` time, projected to only the
+        columns the kernel references, bounding resident payload memory.
+        """
         ...
 
     @property
