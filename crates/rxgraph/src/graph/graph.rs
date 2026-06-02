@@ -35,6 +35,11 @@ impl Graph {
         })
     }
 
+    /// Replaces the payload (attribute) tables, reusing the existing topology.
+    pub fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
+        self.repo.set_payloads(nodes, edges)
+    }
+
     /// Number of node rows.
     pub fn node_count(&self) -> usize {
         self.repo.nodes.num_rows()

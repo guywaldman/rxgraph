@@ -10,12 +10,7 @@
 //! It builds a large, sparse graph where only a small subset is reachable from the source,
 //! and reports bytes allocated/RSS.
 
-use std::{
-    alloc::System,
-    hint::black_box,
-    sync::Arc,
-    time::Instant,
-};
+use std::{alloc::System, hint::black_box, sync::Arc, time::Instant};
 
 use arrow::{
     array::{ArrayRef, UInt64Array},
@@ -23,7 +18,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 use rxgraph::Graph;
-use stats_alloc::{Region, StatsAlloc, INSTRUMENTED_SYSTEM};
+use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
@@ -71,28 +66,35 @@ fn mib(bytes: isize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
-/// Runs the received callback inside an allocation-tracking region and reports the net change.
+/// Runs the received callback inside an allocation-tracking region and reports memory use.
+///
+/// Two distinct numbers are reported:
+/// - `retained`: net bytes still held after the call returns (allocated minus freed). This
+///   is what grows the resident set. A value that escapes the closure (e.g. the graph)
+///   counts here; a result that is dropped inside the closure does not.
+/// - `churn`: total bytes allocated during the call, regardless of whether they were freed
+///   again before returning. High churn with ~zero retained means lots of short-lived
+///   allocations (e.g. WCC building one Vec per component, then handing it back and dropping
+///   it), not a memory leak.
 fn measure<T>(label: &str, f: impl FnOnce() -> T) -> T {
     let region = Region::new(GLOBAL);
     let started = Instant::now();
     let value = f();
     let stats = region.change();
     let elapsed = started.elapsed();
-    let resident = stats.bytes_allocated as isize - stats.bytes_deallocated as isize;
+    let retained = stats.bytes_allocated as isize - stats.bytes_deallocated as isize;
     eprintln!(
-        "{label:<28} resident={:>9.2} MiB  allocations={:<8} (alloc={:.2} MiB, dealloc={:.2} MiB)  {elapsed:?}",
-        mib(resident),
-        stats.allocations,
+        "{label:<28} retained={:>9.2} MiB  churn={:>8.2} MiB in {:<8} allocs (freed={:.2} MiB)  {elapsed:?}",
+        mib(retained),
         mib(stats.bytes_allocated as isize),
+        stats.allocations,
         mib(stats.bytes_deallocated as isize),
     );
     value
 }
 
 fn main() {
-    eprintln!(
-        "memory profile: nodes={NODES} reachable_chain={REACHABLE_CHAIN}\n"
-    );
+    eprintln!("memory profile: nodes={NODES} reachable_chain={REACHABLE_CHAIN}\n");
 
     let (nodes, edges) = tables();
 

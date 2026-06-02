@@ -6,6 +6,9 @@ import polars as pl
 
 from . import _rxgraph
 from ._graph_tables import (
+    DEST_COL,
+    ID_COL,
+    SRC_COL,
     EdgeInput,
     GraphTables,
     NodeInput,
@@ -13,6 +16,8 @@ from ._graph_tables import (
     build_labeled_tables,
     normalize_table,
 )
+
+TYPE_COL = "type"
 
 SearchStats = _rxgraph.SearchStats
 col = pl.col
@@ -71,6 +76,13 @@ class Graph:
         self._label_to_id = _label_to_id
         self._id_to_label = _id_to_label
         self._edge_id_to_label = _edge_id_to_label
+        # Lazy payload sources. Set only by ``from_lazy``; ``None`` for eager graphs.
+        self._lazy_nodes: pl.LazyFrame | None = None
+        self._lazy_edges: pl.LazyFrame | None = None
+        # Payload columns currently installed in the native graph (avoids re-projecting
+        # the same columns across repeated searches).
+        self._loaded_node_cols: frozenset[str] | None = None
+        self._loaded_edge_cols: frozenset[str] | None = None
 
     @classmethod
     def from_edges(
@@ -81,6 +93,47 @@ class Graph:
     ) -> Self:
         tables = build_labeled_tables(edges, nodes)
         return cls._from_tables(tables)
+
+    @classmethod
+    def from_lazy(
+        cls,
+        nodes: "pl.LazyFrame",
+        edges: "pl.LazyFrame",
+    ) -> Self:
+        """Build a graph from Polars ``LazyFrame``s.
+
+        This should be used e.g. in cases where you read from Parquet (`pl.scan_parquet(...)`A.)
+
+        Only the identity/topology columns (``id`` for nodes; ``id``/``src``/``dest``
+        for edges, plus an optional ``type``) are collected eagerly to build the graph
+        topology.
+        Wide attribute (payload of the nodes/edges) columns are **not** materialized at
+        construction. They are pulled lazily at search time, projected down to
+        only the columns the search kernel references, which bounds resident payload
+        memory to ``referenced_columns x rows`` instead of ``all_columns x rows``.
+
+        The lazy frames must keep a stable row order across collects (one row per
+        node/edge), since payload reads index by row position.
+        """
+        node_schema = nodes.collect_schema()
+        edge_schema = edges.collect_schema()
+
+        node_topo = [ID_COL] + ([TYPE_COL] if TYPE_COL in node_schema else [])
+        edge_topo = [ID_COL, SRC_COL, DEST_COL] + (
+            [TYPE_COL] if TYPE_COL in edge_schema else []
+        )
+
+        graph = cls.__new__(cls)
+        Graph.__init__(
+            graph,
+            nodes.select(node_topo).collect(),
+            edges.select(edge_topo).collect(),
+        )
+        graph._lazy_nodes = nodes
+        graph._lazy_edges = edges
+        graph._loaded_node_cols = frozenset()
+        graph._loaded_edge_cols = frozenset()
+        return graph
 
     @classmethod
     def _from_tables(cls, tables: GraphTables) -> Self:
@@ -147,13 +200,15 @@ class Graph:
         ['a', 'b']
         """
         stop = _default_stop(stop, max_paths)
+        kernel = Kernel(
+            visit,
+            next_state,
+            stop,
+            initial_state,
+        )
+        self._ensure_payloads(kernel)
         traversal = Traversal(
-            Kernel(
-                visit,
-                next_state,
-                stop,
-                initial_state,
-            ),
+            kernel,
             list(start_nodes),
             max_depth,
             max_paths,
@@ -166,6 +221,27 @@ class Graph:
         return SearchResult._from_inner(
             inner, self._id_to_label, self._edge_id_to_label
         )
+
+    def _ensure_payloads(self, kernel: Kernel) -> None:
+        """Project and "install" the payload columns a lazy graph's kernel references.
+
+        For lazy graphs, collects only the ``src``/``dest``
+        (node) and ``edge`` columns the kernel reads, and swaps them into the native
+        graph. Skips re-projection when the required columns are already loaded.
+        No-op for eager graphs.
+        """
+        if self._lazy_nodes is None or self._lazy_edges is None:
+            return
+
+        node_cols, edge_cols = _referenced_payload_columns(kernel)
+        if node_cols == self._loaded_node_cols and edge_cols == self._loaded_edge_cols:
+            return
+
+        nodes = self._lazy_nodes.select([ID_COL, *sorted(node_cols)]).collect()
+        edges = self._lazy_edges.select([ID_COL, *sorted(edge_cols)]).collect()
+        self._inner.set_payloads(nodes, edges)
+        self._loaded_node_cols = node_cols
+        self._loaded_edge_cols = edge_cols
 
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         return self._map_nodes(self._inner.bfs(self.node_id(start), max_depth))
@@ -365,6 +441,37 @@ def _inner_kernel(kernel: Kernel | _rxgraph.Kernel) -> _rxgraph.Kernel:
     if isinstance(kernel, Kernel):
         return kernel._to_inner()
     return kernel
+
+
+def _referenced_payload_columns(
+    kernel: Kernel,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Return the (node_columns, edge_columns) a kernel reads.
+
+    DSL columns are scoped: ``src.<field>``/``dest.<field>`` resolve to node payload
+    columns and ``edge.<field>`` to edge payload columns. ``state.*`` and ``*.id``
+    columns need no payload projection and are ignored.
+    """
+    node_cols: set[str] = set()
+    edge_cols: set[str] = set()
+
+    exprs: list[Any] = [kernel.visit, kernel.stop]
+    exprs.extend(kernel.next_state.values())
+    exprs.extend(kernel.initial_state.values())
+
+    for expr in exprs:
+        if not isinstance(expr, pl.Expr):
+            continue
+        for name in expr.meta.root_names():
+            scope, _, field = name.partition(".")
+            if not field or field == ID_COL:
+                continue
+            if scope in ("src", "dest"):
+                node_cols.add(field)
+            elif scope == "edge":
+                edge_cols.add(field)
+
+    return frozenset(node_cols), frozenset(edge_cols)
 
 
 __all__ = [

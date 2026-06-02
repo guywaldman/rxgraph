@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use super::repo::{EdgeId, NodeId};
 
@@ -16,11 +16,11 @@ pub(crate) struct Csr {
 /// Constructs a CSR (Compressed Sparse Row) data structure for outgoing edges.
 pub(crate) fn build_csr(node_count: usize, edges: &[(NodeId, NodeId)]) -> Result<Csr> {
     if edges.len() > Offset::MAX as usize {
-        return Err(anyhow::anyhow!(
+        bail!(
             "too many edges for u32 CSR offsets ({} > {})",
             edges.len(),
             Offset::MAX
-        ));
+        );
     }
 
     let mut offsets = vec![0 as Offset; node_count + 1];

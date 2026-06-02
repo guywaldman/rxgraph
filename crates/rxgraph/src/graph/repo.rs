@@ -11,10 +11,10 @@ use crate::{
     graph::csr::{Csr, Offset, build_csr},
 };
 
-/// Compact internal node identifier used by traversal code.
+/// Compact internal node identifier used for traversal.
 pub type NodeId = u32;
 
-/// Compact internal edge identifier used by traversal code.
+/// Compact internal edge identifier used for traversal.
 pub type EdgeId = u32;
 
 pub const ID_COL: &str = "id";
@@ -109,12 +109,19 @@ pub(crate) struct Repo {
     pub edges: RecordBatch,
 
     /// Reverse adjacency (incoming edges).
-    /// Used for optimization - only some searches require it,
-    /// so it is built lazily on first use to keep construction memory and time proportional
-    /// to forward-only workloads (like BFS, as opposed WCC or `in_degree`, for example).
+    /// Used for optimization - only some searches require it and it's built lazily on first use
+    /// to keep construction memory and time low (and proportional) foraward only workloads
+    /// (like BFS, as opposed to WCC or degrees).
     incoming: OnceLock<IncomingCsr>,
     /// Endpoints retained to build the reverse CSR lazily without re-reading Arrow columns.
     edge_endpoints: Vec<(NodeId, NodeId)>,
+
+    /// Degree vectors, only used when whole-graph degree query and cached after.
+    /// Search-only workloads never touch these, so construction stays cheap;
+    /// degree-heavy workloads pay the O(n) build once instead of on every call.
+    out_degrees: OnceLock<Vec<usize>>,
+    in_degrees: OnceLock<Vec<usize>>,
+    degrees: OnceLock<Vec<usize>>,
 }
 
 #[derive(Debug)]
@@ -213,6 +220,33 @@ impl Repo {
         self.identity.is_contiguous_u64()
     }
 
+    /// Replaces the payload (attribute) tables without rebuilding topology.
+    ///
+    /// Used by lazy graphs to swap in column-projected payload batches for a single search.
+    /// The new batches must keep the original row order and count: DSL column reads index
+    /// payload arrays by internal node/edge ID, which equals the Arrow row position.
+    /// Identity (`id`/`src`/`dest`) is resolved from the precomputed mapping, not these
+    /// batches, so the projected batches only need the columns the kernel references.
+    pub(crate) fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
+        if nodes.num_rows() != self.nodes.num_rows() {
+            bail!(
+                "projected nodes table has {} rows but topology expects {}",
+                nodes.num_rows(),
+                self.nodes.num_rows()
+            );
+        }
+        if edges.num_rows() != self.edges.num_rows() {
+            bail!(
+                "projected edges table has {} rows but topology expects {}",
+                edges.num_rows(),
+                self.edges.num_rows()
+            );
+        }
+        self.nodes = nodes;
+        self.edges = edges;
+        Ok(())
+    }
+
     pub(crate) fn internal_node_u64(&self, external: u64) -> Option<NodeId> {
         self.identity.internal_node_u64(external)
     }
@@ -292,14 +326,22 @@ impl Repo {
     }
 
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
-        degrees_from_offsets(&self.csr_offsets)
+        self.out_degrees
+            .get_or_init(|| degrees_from_offsets(&self.csr_offsets))
+            .clone()
     }
 
     pub(crate) fn in_degrees(&self) -> Vec<usize> {
-        degrees_from_offsets(&self.incoming().offsets)
+        self.in_degrees
+            .get_or_init(|| degrees_from_offsets(&self.incoming().offsets))
+            .clone()
     }
 
     pub(crate) fn degrees(&self) -> Vec<usize> {
+        self.degrees.get_or_init(|| self.compute_degrees()).clone()
+    }
+
+    fn compute_degrees(&self) -> Vec<usize> {
         let out = &self.csr_offsets;
         let incoming = &self.incoming().offsets;
         (0..self.nodes.num_rows())
@@ -334,6 +376,9 @@ impl Repo {
             incoming: OnceLock::new(),
             edge_endpoints,
             identity,
+            out_degrees: OnceLock::new(),
+            in_degrees: OnceLock::new(),
+            degrees: OnceLock::new(),
         })
     }
 }
@@ -709,5 +754,57 @@ mod tests {
                 .to_string()
                 .contains("missing dest")
         );
+    }
+
+    #[test]
+    fn set_payloads_swaps_columns_and_keeps_topology() {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0, 1]),
+            (EDGE_SRC_COL, UInt64, [0, 1]),
+            (EDGE_DEST_COL, UInt64, [1, 2])
+        )
+        .unwrap();
+        let mut repo = Repo::from_tables(nodes, edges).unwrap();
+
+        // Project to a different set of payload columns (same row counts).
+        let new_nodes =
+            record_batch!((ID_COL, UInt64, [0, 1, 2]), ("score", Int64, [10, 20, 30])).unwrap();
+        let new_edges = record_batch!(
+            (ID_COL, UInt64, [0, 1]),
+            (EDGE_SRC_COL, UInt64, [0, 1]),
+            (EDGE_DEST_COL, UInt64, [1, 2])
+        )
+        .unwrap();
+        repo.set_payloads(new_nodes, new_edges).unwrap();
+
+        // Topology is unchanged after the swap.
+        assert_eq!(outgoing_for(&repo, GraphId::U64(0)), vec![GraphId::U64(1)]);
+        assert!(repo.nodes.column_by_name("score").is_some());
+    }
+
+    #[test]
+    fn set_payloads_rejects_row_count_mismatch() {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0]),
+            (EDGE_SRC_COL, UInt64, [0]),
+            (EDGE_DEST_COL, UInt64, [1])
+        )
+        .unwrap();
+        let mut repo = Repo::from_tables(nodes, edges).unwrap();
+
+        let bad_nodes = record_batch!((ID_COL, UInt64, [0, 1])).unwrap();
+        let same_edges = record_batch!(
+            (ID_COL, UInt64, [0]),
+            (EDGE_SRC_COL, UInt64, [0]),
+            (EDGE_DEST_COL, UInt64, [1])
+        )
+        .unwrap();
+        let err = repo
+            .set_payloads(bad_nodes, same_edges)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("projected nodes table has 2 rows"));
     }
 }
