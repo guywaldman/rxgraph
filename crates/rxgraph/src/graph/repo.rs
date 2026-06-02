@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::HashMap, fmt, sync::OnceLock};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
@@ -8,7 +8,7 @@ use arrow_schema::DataType;
 
 use crate::{
     arrow::validate_field_exists,
-    graph::csr::{Csr, build_csr},
+    graph::csr::{Csr, Offset, build_csr},
 };
 
 /// Compact internal node identifier used by traversal code.
@@ -100,17 +100,27 @@ pub trait GraphRepo {
 
 #[derive(Debug)]
 pub(crate) struct Repo {
-    csr_offsets: Vec<usize>,
+    csr_offsets: Vec<Offset>,
     csr_dests: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
-    incoming_offsets: Vec<usize>,
-    incoming_srcs: Vec<NodeId>,
-    out_degrees: Vec<usize>,
-    in_degrees: Vec<usize>,
-    degrees: Vec<usize>,
+
     identity: Identity,
     pub nodes: RecordBatch,
     pub edges: RecordBatch,
+
+    /// Reverse adjacency (incoming edges).
+    /// Used for optimization - only some searches require it,
+    /// so it is built lazily on first use to keep construction memory and time proportional
+    /// to forward-only workloads (like BFS, as opposed WCC or `in_degree`, for example).
+    incoming: OnceLock<IncomingCsr>,
+    /// Endpoints retained to build the reverse CSR lazily without re-reading Arrow columns.
+    edge_endpoints: Vec<(NodeId, NodeId)>,
+}
+
+#[derive(Debug)]
+struct IncomingCsr {
+    offsets: Vec<Offset>,
+    srcs: Vec<NodeId>,
 }
 
 #[derive(Debug)]
@@ -215,8 +225,8 @@ impl Repo {
 impl GraphRepo for Repo {
     fn outgoing(&self, node: NodeId) -> impl Iterator<Item = (EdgeId, NodeId)> {
         let i = node as usize;
-        let start = self.csr_offsets[i];
-        let end = self.csr_offsets[i + 1];
+        let start = self.csr_offsets[i] as usize;
+        let end = self.csr_offsets[i + 1] as usize;
 
         self.edge_ids[start..end]
             .iter()
@@ -226,16 +236,17 @@ impl GraphRepo for Repo {
 
     fn outgoing_slice(&self, node: NodeId) -> (&[EdgeId], &[NodeId]) {
         let i = node as usize;
-        let start = self.csr_offsets[i];
-        let end = self.csr_offsets[i + 1];
+        let start = self.csr_offsets[i] as usize;
+        let end = self.csr_offsets[i + 1] as usize;
         (&self.edge_ids[start..end], &self.csr_dests[start..end])
     }
 
     fn incoming(&self, node: NodeId) -> impl Iterator<Item = NodeId> {
+        let incoming = self.incoming();
         let i = node as usize;
-        let start = self.incoming_offsets[i];
-        let end = self.incoming_offsets[i + 1];
-        self.incoming_srcs[start..end].iter().copied()
+        let start = incoming.offsets[i] as usize;
+        let end = incoming.offsets[i + 1] as usize;
+        incoming.srcs[start..end].iter().copied()
     }
 
     fn internal_node(&self, external: GraphId<'_>) -> Option<NodeId> {
@@ -251,25 +262,53 @@ impl GraphRepo for Repo {
     }
 
     fn out_degree(&self, node: NodeId) -> usize {
-        self.out_degrees[node as usize]
+        let i = node as usize;
+        (self.csr_offsets[i + 1] - self.csr_offsets[i]) as usize
     }
 
     fn in_degree(&self, node: NodeId) -> usize {
-        self.in_degrees[node as usize]
+        let incoming = self.incoming();
+        let i = node as usize;
+        (incoming.offsets[i + 1] - incoming.offsets[i]) as usize
     }
 }
 
 impl Repo {
+    /// Returns the reverse-adjacency CSR, building it on first use.
+    fn incoming(&self) -> &IncomingCsr {
+        self.incoming.get_or_init(|| {
+            let incoming_edges = self
+                .edge_endpoints
+                .iter()
+                .map(|&(src, dest)| (dest, src))
+                .collect::<Vec<_>>();
+            let Csr { offsets, dests, .. } = build_csr(self.nodes.num_rows(), &incoming_edges)
+                .expect("incoming CSR has the same edge count as the forward CSR");
+            IncomingCsr {
+                offsets,
+                srcs: dests,
+            }
+        })
+    }
+
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
-        self.out_degrees.clone()
+        degrees_from_offsets(&self.csr_offsets)
     }
 
     pub(crate) fn in_degrees(&self) -> Vec<usize> {
-        self.in_degrees.clone()
+        degrees_from_offsets(&self.incoming().offsets)
     }
 
     pub(crate) fn degrees(&self) -> Vec<usize> {
-        self.degrees.clone()
+        let out = &self.csr_offsets;
+        let incoming = &self.incoming().offsets;
+        (0..self.nodes.num_rows())
+            .map(|i| {
+                let out_deg = (out[i + 1] - out[i]) as usize;
+                let in_deg = (incoming[i + 1] - incoming[i]) as usize;
+                out_deg + in_deg
+            })
+            .collect()
     }
 }
 
@@ -285,23 +324,6 @@ impl Repo {
             edge_ids,
             dests: csr_dests,
         } = build_csr(nodes.num_rows(), &edge_endpoints).context("failed to construct CSR")?;
-        let incoming_edges = edge_endpoints
-            .iter()
-            .map(|&(src, dest)| (dest, src))
-            .collect::<Vec<_>>();
-        let Csr {
-            offsets: incoming_offsets,
-            dests: incoming_srcs,
-            ..
-        } = build_csr(nodes.num_rows(), &incoming_edges)
-            .context("failed to construct incoming CSR")?;
-        let out_degrees = degrees_from_offsets(&csr_offsets);
-        let in_degrees = degrees_from_offsets(&incoming_offsets);
-        let degrees = out_degrees
-            .iter()
-            .zip(&in_degrees)
-            .map(|(out, incoming)| out + incoming)
-            .collect();
 
         Ok(Self {
             nodes,
@@ -309,18 +331,18 @@ impl Repo {
             csr_offsets,
             csr_dests,
             edge_ids,
-            incoming_offsets,
-            incoming_srcs,
-            out_degrees,
-            in_degrees,
-            degrees,
+            incoming: OnceLock::new(),
+            edge_endpoints,
             identity,
         })
     }
 }
 
-fn degrees_from_offsets(offsets: &[usize]) -> Vec<usize> {
-    offsets.windows(2).map(|pair| pair[1] - pair[0]).collect()
+fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
+    offsets
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]) as usize)
+        .collect()
 }
 
 struct Preprocessed {

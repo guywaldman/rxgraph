@@ -60,6 +60,9 @@ install-hooks: setup
 bench *args: build-maturin
     {{python}} -m benches.main {{args}}
 
+bench-memory-rust *args: build-maturin
+    cargo bench -p rxgraph --bench memory
+
 profile script: setup
     @command -v flamegraph >/dev/null || { echo "Install cargo-flamegraph first: cargo install flamegraph"; exit 1; }
     @{{maturin}} develop --manifest-path {{python_manifest}} --profile profiling

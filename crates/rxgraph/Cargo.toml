@@ -40,3 +40,7 @@ harness = false
 [[bench]]
 name = "flight_routes"
 harness = false
+
+[[bench]]
+name = "memory"
+harness = false
