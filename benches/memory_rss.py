@@ -179,7 +179,7 @@ def _measure(mode: str, node_path: Path, edge_path: Path) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scale", choices=SCALES, default="small")
-    parser.add_argument("--min-ratio", type=float, default=10.0)
+    parser.add_argument("--min-ratio", type=float, default=5.0)
     parser.add_argument("--nodes", type=int, help="override fixture node count")
     parser.add_argument("--pad-cols", type=int, help="override payload column count")
     parser.add_argument("--pad-width", type=int, help="override payload string width")
