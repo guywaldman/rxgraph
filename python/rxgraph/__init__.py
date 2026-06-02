@@ -40,11 +40,13 @@ class Kernel:
         stop: Any | None = None,
         initial_state: Mapping[str, Any] | None = None,
     ) -> None:
-        """Create a traversal kernel.
+        """
+        Create a traversal kernel (defines the logic for visiting and aggregating when traversing the graph).
 
-        ``visit`` defaults to accepting every edge. ``stop`` defaults to never
-        emitting paths; :meth:`Graph.search` overrides this when ``max_paths`` is
-        supplied without an explicit ``stop``.
+        :param visit: Predicate per candidate edge. Defaults to true (accepting every edge).
+        :param next_state: Returns the next state, with each field in the dict being a Polars expression. Evaluated after each accepted edge.
+        :param stop: Polars expression which is evaluated per node, and if it returns true, means to stop traversing and "bail out" on that node.
+        :param initial_state: Dict with each field value (scalar/list/struct) being a Polars expression, representing the starting state values
         """
         self.visit = DEFAULT_KERNEL_VISIT if visit is None else visit
         self.next_state = dict(next_state or {})
@@ -76,7 +78,7 @@ class Graph:
         self._label_to_id = _label_to_id
         self._id_to_label = _id_to_label
         self._edge_id_to_label = _edge_id_to_label
-        # Lazy payload sources. Set only by ``from_lazy``; ``None`` for eager graphs.
+        # Lazy payload sources. Set only by ``from_lazy``. ``None`` for eager graphs.
         self._lazy_nodes: pl.LazyFrame | None = None
         self._lazy_edges: pl.LazyFrame | None = None
         # Payload columns currently installed in the native graph (avoids re-projecting
@@ -100,20 +102,22 @@ class Graph:
         nodes: "pl.LazyFrame",
         edges: "pl.LazyFrame",
     ) -> Self:
-        """Build a graph from Polars ``LazyFrame``s.
+        """
+        Build a graph from Polars ``LazyFrame``s, deferring payload columns.
 
-        This should be used e.g. in cases where you read from Parquet (`pl.scan_parquet(...)`A.)
+        Similar to ``Graph(nodes=..., edges=...)`` but for LazyFrames.
 
-        Only the identity/topology columns (``id`` for nodes; ``id``/``src``/``dest``
-        for edges, plus an optional ``type``) are collected eagerly to build the graph
-        topology.
-        Wide attribute (payload of the nodes/edges) columns are **not** materialized at
-        construction. They are pulled lazily at search time, projected down to
-        only the columns the search kernel references, which bounds resident payload
-        memory to ``referenced_columns x rows`` instead of ``all_columns x rows``.
+        Use this with lazy I/O sources (e.g. ``pl.scan_parquet(...)``) to reduce I/O strain
+        and also to cap memory.
+        Ideal for scenarios of traversing over a large and complex graph, where the working set/frontier may be
+        a lot smaller than the actual node count.
 
-        The lazy frames must keep a stable row order across collects (one row per
+        IMPORTANT: The LazyFrames *must* keep a stable row order across collects (one row per
         node/edge), since payload reads index by row position.
+        Sort the nodes by the ``id`` column, and edges at least by ``src`` and ``dest``.
+
+        :param nodes: Lazy DataFrame for the nodes, with at least an ``id`` column.
+        :param edges: Lazy DataFrame for the edges, with at least ``id``, ``src``, and ``dest`` columns.
         """
         node_schema = nodes.collect_schema()
         edge_schema = edges.collect_schema()
@@ -157,7 +161,10 @@ class Graph:
         return self._inner.edge_count
 
     def node_id(self, label: Hashable) -> int:
-        """Return the graph ID used by the engine for a label."""
+        """Return the engine graph ID for a node label.
+
+        :param label: Node label, or the raw integer/string ID for table-backed graphs.
+        """
         if self._label_to_id is None:
             if not isinstance(label, int | str):
                 raise ValueError("table-backed graph ids must be integers or strings")
@@ -182,16 +189,24 @@ class Graph:
         strategy: str = "dfs",
         parallel: bool | str = True,
         intermediate_states: bool = False,
+        progress: bool = False,
     ) -> "SearchResult":
         """Run a stateful traversal.
 
-        ``visit`` defaults to accepting all candidate edges. ``stop`` decides
-        which accepted paths are returned; if omitted, ``max_paths`` is required
-        and every accepted edge is returned. ``next_state`` maps state names to
-        Polars expressions evaluated after each accepted edge. ``initial_state``
-        may contain scalars, Python lists, or dict-like struct values. Search
-        kernels support native scalar, list, and struct Polars expressions.
-        ``strategy`` is ``"dfs"`` or ``"bfs"``.
+        API is similar to ``Graph.search``.
+
+
+
+        :param visit: Predicate per candidate edge. Defaults to true (accepting every edge).
+        :param next_state: Returns the next state, with each field in the dict being a Polars expression. Evaluated after each accepted edge.
+        :param stop: Polars expression which is evaluated per node, and if it returns true, means to stop traversing and "bail out" on that node.
+        :param initial_state: Dict with each field value (scalar/list/struct) being a Polars expression, representing the starting state values
+        :param max_depth: Maximum accepted-edge depth per path.
+        :param max_paths: Stop the search once this many paths have been returned.
+        :param strategy: ``"dfs"`` or ``"bfs"``.
+        :param parallel: ``True``/``False`` or one of ``"on"``/``"off"``/``"auto"``.
+        :param intermediate_states: Whether to include per-node state history on returned paths (false by default).
+        :param progress: Whether to report running counters on stderr (live spinner on a terminal/TTY, plain log lines otherwise).
 
         >>> import rxgraph as rxg
         >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
@@ -215,6 +230,7 @@ class Graph:
             strategy,
             parallel,
             intermediate_states,
+            progress,
         )
 
         inner = self._inner.search(traversal._to_inner(self))
@@ -244,15 +260,34 @@ class Graph:
         self._loaded_edge_cols = edge_cols
 
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+        """Breadth-first node order from ``start``.
+
+        :param start: Node to start from.
+        :param max_depth: Optional depth limit.
+        """
         return self._map_nodes(self._inner.bfs(self.node_id(start), max_depth))
 
     def dfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
+        """Depth-first node order from ``start``.
+
+        :param start: Node to start from.
+        :param max_depth: Optional depth limit.
+        """
         return self._map_nodes(self._inner.dfs(self.node_id(start), max_depth))
 
     def reachable_nodes(self, start: Hashable) -> list[Any]:
+        """All nodes reachable from ``start``.
+
+        :param start: Node to start from.
+        """
         return self._map_nodes(self._inner.reachable_nodes(self.node_id(start)))
 
     def shortest_path(self, source: Hashable, target: Hashable) -> list[Any] | None:
+        """Shortest path between two nodes, or ``None`` if unreachable.
+
+        :param source: Start node.
+        :param target: End node.
+        """
         path = self._inner.shortest_path(self.node_id(source), self.node_id(target))
         if path is None:
             return None
@@ -321,15 +356,19 @@ class Traversal:
         strategy: str = "dfs",
         parallel: bool | str = True,
         intermediate_states: bool = False,
+        progress: bool = False,
     ) -> None:
         """Create a reusable traversal configuration.
 
-        ``kernel`` contains visit/state/stop expressions. ``start_nodes`` are
-        external graph node IDs or labels. ``max_depth`` limits accepted-edge
-        depth, and ``max_paths`` limits returned paths. ``strategy`` is
-        ``"dfs"`` or ``"bfs"``. ``parallel`` accepts ``True``/``False`` or
-        ``"on"``/``"off"``/``"auto"``. ``intermediate_states`` stores per-node
-        state history on returned paths and is disabled by default.
+        :param kernel: Visit/state/stop expressions.
+        :param start_nodes: Node IDs or labels where traversal begins.
+        :param max_depth: Maximum accepted-edge depth per path.
+        :param max_paths: Maximum number of returned paths.
+        :param strategy: ``"dfs"`` or ``"bfs"``.
+        :param parallel: ``True``/``False`` or one of ``"on"``/``"off"``/``"auto"``.
+        :param intermediate_states: Include per-node state history on returned paths.
+        :param progress: Report progress on stderr (spinner on a terminal, log lines
+            otherwise).
         """
         self.kernel = kernel
         self.start_nodes = list(start_nodes)
@@ -338,6 +377,7 @@ class Traversal:
         self.strategy = strategy
         self.parallel = _parallel_bool(parallel)
         self.intermediate_states = intermediate_states
+        self.progress = progress
 
     def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
         return _rxgraph.Traversal(
@@ -348,6 +388,7 @@ class Traversal:
             self.strategy,
             self.parallel,
             self.intermediate_states,
+            self.progress,
         )
 
 
