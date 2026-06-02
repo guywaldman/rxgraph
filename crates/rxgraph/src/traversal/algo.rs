@@ -12,6 +12,7 @@ use crate::{
     traversal::{
         GraphPath, SearchResult, SearchStats,
         config::{TraversalConfig, TraversalStrategy},
+        progress::Progress,
     },
 };
 
@@ -36,6 +37,7 @@ impl Graph {
             max_revisits_per_node,
             parallel,
             intermediate_states,
+            progress,
         } = config;
         let kernel = kernel.bind(self)?;
         let cfg = RunConfig {
@@ -45,6 +47,7 @@ impl Graph {
             strategy,
             max_revisits_per_node,
             intermediate_states,
+            progress,
         };
 
         match (parallel, strategy) {
@@ -65,6 +68,7 @@ struct RunConfig {
     strategy: TraversalStrategy,
     max_revisits_per_node: usize,
     intermediate_states: bool,
+    progress: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -104,8 +108,10 @@ fn search_serial<'a>(
 ) -> Result<SearchResult<'a>> {
     let (mut arena, mut frontier, mut stats) = initial_arena(graph, cfg, kernel)?;
     let mut paths = Vec::new();
+    let mut progress = Progress::new(cfg.progress);
 
     while let Some(parent) = pop(&mut frontier, cfg.strategy) {
+        progress.tick(&stats);
         if arena[parent].depth >= cfg.max_depth {
             continue;
         }
@@ -128,6 +134,7 @@ fn search_serial<'a>(
                 paths.push(materialize(graph, &arena, child, cfg, kernel)?);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
+                    progress.finish(&stats);
                     return Ok(SearchResult { paths, stats });
                 }
             } else {
@@ -136,6 +143,7 @@ fn search_serial<'a>(
         }
     }
 
+    progress.finish(&stats);
     Ok(SearchResult { paths, stats })
 }
 
@@ -147,8 +155,10 @@ fn search_bfs_parallel<'a>(
     let (mut arena, frontier, mut stats) = initial_arena(graph, cfg, kernel)?;
     let mut frontier = frontier.into_iter().collect::<Vec<_>>();
     let mut paths = Vec::new();
+    let mut progress = Progress::new(cfg.progress);
 
     while !frontier.is_empty() {
+        progress.tick(&stats);
         let edge_count = frontier
             .iter()
             .map(|&p| graph.repo.out_degree(arena[p].node))
@@ -187,11 +197,13 @@ fn search_bfs_parallel<'a>(
             && paths.len() >= max
         {
             paths.truncate(max);
+            progress.finish(&stats);
             return Ok(SearchResult { paths, stats });
         }
         frontier = next;
     }
 
+    progress.finish(&stats);
     Ok(SearchResult { paths, stats })
 }
 
@@ -202,12 +214,16 @@ fn search_dfs_parallel<'a>(
 ) -> Result<SearchResult<'a>> {
     let (queue, mut stats) = initial_tasks(graph, cfg, kernel)?;
     let mut seed_paths = Vec::new();
+    let mut progress = Progress::new(cfg.progress);
+    progress.tick(&stats);
     let seeds = build_dfs_seeds(graph, cfg, kernel, queue, &mut seed_paths, &mut stats)?;
+    progress.tick(&stats);
 
     if let Some(max) = cfg.max_paths
         && seed_paths.len() >= max
     {
         seed_paths.truncate(max);
+        progress.finish(&stats);
         return Ok(SearchResult {
             paths: seed_paths,
             stats,
@@ -235,6 +251,7 @@ fn search_dfs_parallel<'a>(
     if let Some(max) = cfg.max_paths {
         paths.truncate(max);
     }
+    progress.finish(&stats);
     Ok(SearchResult { paths, stats })
 }
 

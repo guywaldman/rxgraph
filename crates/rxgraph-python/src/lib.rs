@@ -58,7 +58,8 @@ impl PyGraph {
             .with_start_nodes(traversal.start_nodes.clone())
             .with_strategy(traversal.strategy)
             .with_parallelism(traversal.parallel)
-            .with_intermediate_states(traversal.intermediate_states);
+            .with_intermediate_states(traversal.intermediate_states)
+            .with_progress(traversal.progress);
 
         if let Some(max_depth) = traversal.max_depth {
             builder = builder.with_max_depth(max_depth);
@@ -284,12 +285,13 @@ struct PyTraversal {
     strategy: TraversalStrategy,
     parallel: bool,
     intermediate_states: bool,
+    progress: bool,
 }
 
 #[pymethods]
 impl PyTraversal {
     #[new]
-    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false))]
+    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false))]
     fn new(
         kernel: &PyKernel,
         start_nodes: Vec<PyGraphId>,
@@ -298,6 +300,7 @@ impl PyTraversal {
         strategy: &str,
         parallel: bool,
         intermediate_states: bool,
+        progress: bool,
     ) -> PyResult<Self> {
         let strategy = match strategy {
             "dfs" => TraversalStrategy::DepthFirst,
@@ -317,6 +320,7 @@ impl PyTraversal {
             strategy,
             parallel,
             intermediate_states,
+            progress,
         })
     }
 }

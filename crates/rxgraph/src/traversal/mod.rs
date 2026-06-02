@@ -20,6 +20,7 @@
 
 mod algo;
 mod config;
+mod progress;
 
 use crate::{dsl::StateRow, graph::GraphId};
 

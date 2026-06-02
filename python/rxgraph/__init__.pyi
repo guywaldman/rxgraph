@@ -68,6 +68,7 @@ class Graph:
         strategy: Literal["dfs", "bfs"] = "dfs",
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
+        progress: bool = False,
     ) -> SearchResult: ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
@@ -156,6 +157,7 @@ class Traversal:
         strategy: Literal["dfs", "bfs"] = "dfs",
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
+        progress: bool = False,
     ) -> None:
         """Create a traversal.
 

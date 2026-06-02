@@ -43,6 +43,9 @@ pub struct TraversalConfig {
     /// Final path state is always returned. Intermediate states clone state for
     /// every node in each returned path, so this is disabled by default.
     pub intermediate_states: bool,
+    /// Whether to report search progress on stderr (spinner on a terminal, plain
+    /// log lines otherwise).
+    pub progress: bool,
 }
 
 /// Builder for a [`TraversalConfig`].
@@ -76,6 +79,7 @@ pub struct TraversalConfigBuilder {
     max_revisits_per_node: usize,
     parallel: bool,
     intermediate_states: bool,
+    progress: bool,
 }
 
 impl TraversalConfigBuilder {
@@ -90,6 +94,7 @@ impl TraversalConfigBuilder {
             max_revisits_per_node: 0,
             parallel: true,
             intermediate_states: false,
+            progress: false,
         }
     }
 
@@ -144,6 +149,15 @@ impl TraversalConfigBuilder {
         self
     }
 
+    /// Reports search progress on stderr.
+    ///
+    /// Disabled by default. On a terminal this is a live spinner; otherwise it is
+    /// plain periodic log lines suitable for captured/piped logs.
+    pub fn with_progress(mut self, enabled: bool) -> Self {
+        self.progress = enabled;
+        self
+    }
+
     /// Builds the immutable traversal configuration.
     pub fn build(self) -> TraversalConfig {
         TraversalConfig {
@@ -155,6 +169,7 @@ impl TraversalConfigBuilder {
             max_revisits_per_node: self.max_revisits_per_node,
             parallel: self.parallel,
             intermediate_states: self.intermediate_states,
+            progress: self.progress,
         }
     }
 }
