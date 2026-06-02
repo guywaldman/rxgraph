@@ -292,6 +292,8 @@ struct PyTraversal {
 impl PyTraversal {
     #[new]
     #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false))]
+    // Internal and mirrors the Python keyword API, so OK to have a lot of variables
+    #[allow(clippy::too_many_arguments)]
     fn new(
         kernel: &PyKernel,
         start_nodes: Vec<PyGraphId>,

@@ -1,9 +1,8 @@
 //! Progress reporting for long-running searches.
 //! When enabled, reports live search counters to stderr.
-//! 
+//!
 //! When the FD is a terminal (TTY), it has an interactive spinner for a nice UX.
 //! Otherwise, it logs.
-//! It only prints the 
 //!
 //! Search has no known total upfront, so no percentage or ETA is shown.
 
