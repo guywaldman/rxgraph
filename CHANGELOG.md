@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/guywaldman/rxgraph/compare/v0.2.0...v0.3.0) (2026-06-02)
+
+
+### Features
+
+* heavily optimize/cap RSS & introduce `from_lazy` ([#19](https://github.com/guywaldman/rxgraph/issues/19)) ([9ae9536](https://github.com/guywaldman/rxgraph/commit/9ae95362d1b6024ac47ed79c737619d354f861bc))
+* introduce support for optionally reporting on progress ([#21](https://github.com/guywaldman/rxgraph/issues/21)) ([9dbd5f3](https://github.com/guywaldman/rxgraph/commit/9dbd5f3f6e92bd1b43be663f3c3265fcfa339079))
+
 ## [0.2.0](https://github.com/guywaldman/rxgraph/compare/v0.1.0...v0.2.0) (2026-06-01)
 
 
