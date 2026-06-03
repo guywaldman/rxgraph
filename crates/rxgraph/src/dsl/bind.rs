@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 
 use crate::{
     dsl::{
-        DslKernel, StateRow, StateValues, Value,
+        DslKernel, StateRow, StateValue, StateValues, Value,
         arrow_value::ColumnReader,
         eval::EvalCtx,
         expr::{ColumnRef, Expr},
@@ -51,10 +51,14 @@ impl BoundKernel {
         self.visit.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn next_state(&self, current: &[Value], ctx: &EvalCtx<'_>) -> Result<StateValues> {
+    pub(crate) fn next_state(
+        &self,
+        current: &[StateValue],
+        ctx: &EvalCtx<'_>,
+    ) -> Result<StateValues> {
         let mut next = current.iter().cloned().collect::<StateValues>();
         for (index, expr) in &self.next_state {
-            next[*index] = expr.eval(ctx)?;
+            next[*index] = StateValue::new(expr.eval(ctx)?);
         }
         Ok(next)
     }
@@ -63,11 +67,11 @@ impl BoundKernel {
         self.stop.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn state_row(&self, state: &[Value]) -> StateRow {
+    pub(crate) fn state_row(&self, state: &[StateValue]) -> StateRow {
         self.names
             .iter()
             .cloned()
-            .zip(state.iter().cloned())
+            .zip(state.iter().map(StateValue::to_value))
             .collect()
     }
 }
@@ -122,7 +126,7 @@ impl BoundColumn {
             Self::Src(reader) => reader.value(ctx.src as usize),
             Self::Dest(reader) => reader.value(ctx.dest as usize),
             Self::Edge(reader) => reader.value(ctx.edge as usize),
-            Self::State(index) => Ok(ctx.state[*index].clone()),
+            Self::State(index) => Ok(ctx.state[*index].to_value()),
             Self::MissingState => Ok(Value::Null),
         }
     }
@@ -174,8 +178,8 @@ fn normalize_state(state: StateRow, names: &[String]) -> StateValues {
             state
                 .binary_search_by(|(key, _)| key.as_str().cmp(name))
                 .ok()
-                .map(|i| state[i].1.clone())
-                .unwrap_or(Value::Null)
+                .map(|i| StateValue::new(state[i].1.clone()))
+                .unwrap_or_else(|| StateValue::new(Value::Null))
         })
         .collect::<StateValues>()
 }

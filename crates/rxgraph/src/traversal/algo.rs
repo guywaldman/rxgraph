@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
@@ -20,6 +20,8 @@ const MIN_PAR_FRONTIER: usize = 512;
 const MIN_PAR_EDGES: usize = 8_192;
 const DFS_SEEDS_PER_THREAD: usize = 8;
 const MIN_PAR_DFS_PATHS: usize = 64;
+
+type VisitCounts = HashMap<NodeId, usize>;
 
 impl Graph {
     /// Runs a configured DSL traversal and materializes matching paths.
@@ -128,9 +130,19 @@ fn search_serial<'a>(
         }
 
         let (edges, dests) = graph.repo.outgoing_slice(arena[parent].node);
+        let visit_counts = visit_counts_arena(&arena, parent, edges.len());
         for (&edge, &dest) in edges.iter().zip(dests) {
-            let Some(edge) =
-                eval_arena_edge(graph, &arena, parent, edge, dest, cfg, kernel, &mut stats)?
+            let Some(edge) = eval_arena_edge(
+                graph,
+                &arena,
+                parent,
+                edge,
+                dest,
+                cfg,
+                kernel,
+                &mut stats,
+                visit_counts.as_ref(),
+            )?
             else {
                 continue;
             };
@@ -174,33 +186,25 @@ fn search_bfs_parallel<'a>(
             .iter()
             .map(|&p| graph.repo.out_degree(arena[p].node))
             .sum::<usize>();
-        let parents = if frontier.len() >= MIN_PAR_FRONTIER || edge_count >= MIN_PAR_EDGES {
-            frontier
-                .par_iter()
-                .map(|&parent| eval_parent(graph, &arena, parent, cfg, kernel))
-                .collect::<Result<Vec<_>>>()?
+        let (edges, local) = if frontier.len() >= MIN_PAR_FRONTIER || edge_count >= MIN_PAR_EDGES {
+            eval_frontier_parallel(graph, &arena, &frontier, cfg, kernel)?
         } else {
-            frontier
-                .iter()
-                .map(|&parent| eval_parent(graph, &arena, parent, cfg, kernel))
-                .collect::<Result<Vec<_>>>()?
+            eval_frontier_serial(graph, &arena, &frontier, edge_count, cfg, kernel)?
         };
+        merge_stats(&mut stats, local);
 
-        let mut next = Vec::new();
-        for (parent, edges, local) in parents {
-            merge_stats(&mut stats, local);
-            for edge in edges {
-                let stop = edge.stop;
-                let child = push_entry(&mut arena, parent, edge);
-                stats.accepted_edges += 1;
-                stats.path_entries += 1;
-                stats.max_depth = stats.max_depth.max(arena[child].depth);
-                if stop {
-                    paths.push(materialize(graph, &arena, child, cfg, kernel)?);
-                    stats.stopped_paths += 1;
-                } else {
-                    next.push(child);
-                }
+        let mut next = Vec::with_capacity(edges.len());
+        for (parent, edge) in edges {
+            let stop = edge.stop;
+            let child = push_entry(&mut arena, parent, edge);
+            stats.accepted_edges += 1;
+            stats.path_entries += 1;
+            stats.max_depth = stats.max_depth.max(arena[child].depth);
+            if stop {
+                paths.push(materialize(graph, &arena, child, cfg, kernel)?);
+                stats.stopped_paths += 1;
+            } else {
+                next.push(child);
             }
         }
 
@@ -325,28 +329,84 @@ fn initial_tasks(
     Ok((queue, stats))
 }
 
-fn eval_parent(
+fn eval_frontier_serial(
+    graph: &Graph,
+    arena: &[PathEntry],
+    frontier: &[usize],
+    edge_count: usize,
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
+) -> Result<(Vec<(usize, EdgeEval)>, SearchStats)> {
+    let mut edges = Vec::with_capacity(edge_count);
+    let mut stats = SearchStats::default();
+
+    for &parent in frontier {
+        let local = eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges)?;
+        merge_stats(&mut stats, local);
+    }
+
+    Ok((edges, stats))
+}
+
+fn eval_frontier_parallel(
+    graph: &Graph,
+    arena: &[PathEntry],
+    frontier: &[usize],
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
+) -> Result<(Vec<(usize, EdgeEval)>, SearchStats)> {
+    frontier
+        .par_iter()
+        .try_fold(
+            || (Vec::new(), SearchStats::default()),
+            |(mut edges, mut stats), &parent| {
+                let local = eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges)?;
+                merge_stats(&mut stats, local);
+                Ok((edges, stats))
+            },
+        )
+        .try_reduce(
+            || (Vec::new(), SearchStats::default()),
+            |(mut left_edges, mut left_stats), (right_edges, right_stats)| {
+                left_edges.extend(right_edges);
+                merge_stats(&mut left_stats, right_stats);
+                Ok((left_edges, left_stats))
+            },
+        )
+}
+
+fn eval_parent_into(
     graph: &Graph,
     arena: &[PathEntry],
     parent: usize,
     cfg: &RunConfig,
     kernel: &BoundKernel,
-) -> Result<(usize, Vec<EdgeEval>, SearchStats)> {
+    out: &mut Vec<(usize, EdgeEval)>,
+) -> Result<SearchStats> {
     let mut stats = SearchStats::default();
-    let mut edges = Vec::new();
 
     if arena[parent].depth < cfg.max_depth {
         let (edge_ids, dests) = graph.repo.outgoing_slice(arena[parent].node);
+        out.reserve(edge_ids.len());
+        let visit_counts = visit_counts_arena(arena, parent, edge_ids.len());
         for (&edge, &dest) in edge_ids.iter().zip(dests) {
-            if let Some(edge) =
-                eval_arena_edge(graph, arena, parent, edge, dest, cfg, kernel, &mut stats)?
-            {
-                edges.push(edge);
+            if let Some(edge) = eval_arena_edge(
+                graph,
+                arena,
+                parent,
+                edge,
+                dest,
+                cfg,
+                kernel,
+                &mut stats,
+                visit_counts.as_ref(),
+            )? {
+                out.push((parent, edge));
             }
         }
     }
 
-    Ok((parent, edges, stats))
+    Ok(stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -359,8 +419,9 @@ fn eval_arena_edge(
     cfg: &RunConfig,
     kernel: &BoundKernel,
     stats: &mut SearchStats,
+    visit_counts: Option<&VisitCounts>,
 ) -> Result<Option<EdgeEval>> {
-    if !can_visit_arena(arena, parent, dest, cfg.max_revisits_per_node) {
+    if !can_visit_arena(arena, parent, dest, cfg.max_revisits_per_node, visit_counts) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
@@ -482,10 +543,17 @@ fn expand_task(
     task: usize,
     stats: &mut SearchStats,
 ) -> Result<Vec<(EdgeEval, bool)>> {
-    let mut children = Vec::new();
     let (edge_ids, dests) = graph.repo.outgoing_slice(arena[task].node);
+    let mut children = Vec::with_capacity(edge_ids.len());
+    let visit_counts = visit_counts_task(arena, task, edge_ids.len());
     for (&edge, &dest) in edge_ids.iter().zip(dests) {
-        if !can_visit_task(arena, task, dest, cfg.max_revisits_per_node) {
+        if !can_visit_task(
+            arena,
+            task,
+            dest,
+            cfg.max_revisits_per_node,
+            visit_counts.as_ref(),
+        ) {
             stats.skipped_revisits += 1;
             continue;
         }
@@ -567,12 +635,55 @@ fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
         && cfg.start_nodes.len() >= rayon::current_num_threads()
 }
 
+fn visit_counts_arena(
+    arena: &[PathEntry],
+    mut path: usize,
+    edge_count: usize,
+) -> Option<VisitCounts> {
+    if edge_count <= 1 {
+        return None;
+    }
+
+    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
+    loop {
+        *counts.entry(arena[path].node).or_insert(0) += 1;
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => return Some(counts),
+        }
+    }
+}
+
+fn visit_counts_task(
+    arena: &[PathTask],
+    mut path: usize,
+    edge_count: usize,
+) -> Option<VisitCounts> {
+    if edge_count <= 1 {
+        return None;
+    }
+
+    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
+    loop {
+        *counts.entry(arena[path].node).or_insert(0) += 1;
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => return Some(counts),
+        }
+    }
+}
+
 fn can_visit_arena(
     arena: &[PathEntry],
     mut path: usize,
     node: NodeId,
     max_revisits: usize,
+    visit_counts: Option<&VisitCounts>,
 ) -> bool {
+    if let Some(visit_counts) = visit_counts {
+        return visit_counts.get(&node).copied().unwrap_or(0) <= max_revisits;
+    }
+
     let mut visits = 0usize;
     loop {
         if arena[path].node == node {
@@ -588,7 +699,17 @@ fn can_visit_arena(
     }
 }
 
-fn can_visit_task(arena: &[PathTask], mut path: usize, node: NodeId, max_revisits: usize) -> bool {
+fn can_visit_task(
+    arena: &[PathTask],
+    mut path: usize,
+    node: NodeId,
+    max_revisits: usize,
+    visit_counts: Option<&VisitCounts>,
+) -> bool {
+    if let Some(visit_counts) = visit_counts {
+        return visit_counts.get(&node).copied().unwrap_or(0) <= max_revisits;
+    }
+
     let mut visits = 0usize;
     loop {
         if arena[path].node == node {

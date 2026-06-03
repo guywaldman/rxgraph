@@ -18,6 +18,8 @@ mod ops;
 mod polars_json;
 mod value;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use smallvec::SmallVec;
 
@@ -102,8 +104,34 @@ impl DslKernel {
 /// Named state carried by each path.
 pub type StateRow = Vec<(String, Value)>;
 
+#[derive(Debug, Clone)]
+pub(crate) enum StateValue {
+    Inline(Value),
+    Shared(Arc<Value>),
+}
+
+impl StateValue {
+    pub(crate) fn new(value: Value) -> Self {
+        match value {
+            Value::List(_) | Value::Struct(_) => Self::Shared(Arc::new(value)),
+            value => Self::Inline(value),
+        }
+    }
+
+    pub(crate) fn as_value(&self) -> &Value {
+        match self {
+            Self::Inline(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+
+    pub(crate) fn to_value(&self) -> Value {
+        self.as_value().clone()
+    }
+}
+
 // Bound state drops names so every state read/write is an index lookup.
-pub(crate) type StateValues = SmallVec<[Value; 8]>;
+pub(crate) type StateValues = SmallVec<[StateValue; 8]>;
 
 #[cfg(test)]
 mod tests {

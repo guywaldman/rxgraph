@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 
 use crate::{
-    dsl::{Value, bind::BoundColumn, expr::Expr, ops::scalar::ScalarOp},
+    dsl::{StateValue, Value, bind::BoundColumn, expr::Expr, ops::scalar::ScalarOp},
     graph::{EdgeId, Graph, NodeId},
 };
 
@@ -10,7 +10,7 @@ pub(crate) struct EvalCtx<'a> {
     pub(crate) src: NodeId,
     pub(crate) dest: NodeId,
     pub(crate) edge: EdgeId,
-    pub(crate) state: &'a [Value],
+    pub(crate) state: &'a [StateValue],
     element: Option<&'a Value>,
 }
 
@@ -20,7 +20,7 @@ impl<'a> EvalCtx<'a> {
         src: NodeId,
         dest: NodeId,
         edge: EdgeId,
-        state: &'a [Value],
+        state: &'a [StateValue],
     ) -> Self {
         Self {
             graph,
@@ -32,7 +32,7 @@ impl<'a> EvalCtx<'a> {
         }
     }
 
-    pub(crate) fn with_state<'b>(&'b self, state: &'b [Value]) -> EvalCtx<'b> {
+    pub(crate) fn with_state<'b>(&'b self, state: &'b [StateValue]) -> EvalCtx<'b> {
         EvalCtx {
             graph: self.graph,
             src: self.src,
