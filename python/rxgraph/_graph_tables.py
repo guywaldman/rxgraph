@@ -48,11 +48,10 @@ def build_labeled_tables(
             label, attrs = _parse_node(node)
             builder.add_node(label, attrs)
 
-    parsed_edges = [_parse_edge(edge) for edge in edges]
-    for edge_id, (src, dest, attrs) in enumerate(parsed_edges):
+    for edge_id, edge in enumerate(edges):
+        src, dest, attrs = _parse_edge(edge)
         builder.add_edge(src, dest, attrs, edge_id)
-    if bidirectional:
-        for edge_id, (src, dest, attrs) in enumerate(parsed_edges):
+        if bidirectional:
             builder.add_edge(dest, src, attrs, edge_id)
 
     return builder.build()
@@ -176,12 +175,7 @@ def _attrs(attrs: Mapping[str, Any], kind: str) -> dict[str, Any]:
 
 def _rows_to_columns(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
     keys = sorted(
-        {
-            key
-            for row in rows
-            for key in row
-            if any(r.get(key) is not None for r in rows)
-        }
+        {key for row in rows for key, value in row.items() if value is not None}
     )
     return {key: [row.get(key) for row in rows] for key in keys}
 

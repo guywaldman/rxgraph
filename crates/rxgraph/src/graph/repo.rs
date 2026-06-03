@@ -310,19 +310,8 @@ impl GraphRepo for Repo {
 impl Repo {
     /// Returns the reverse-adjacency CSR, building it on first use.
     fn incoming(&self) -> &IncomingCsr {
-        self.incoming.get_or_init(|| {
-            let incoming_edges = self
-                .edge_endpoints
-                .iter()
-                .map(|&(src, dest)| (dest, src))
-                .collect::<Vec<_>>();
-            let Csr { offsets, dests, .. } = build_csr(self.nodes.num_rows(), &incoming_edges)
-                .expect("incoming CSR has the same edge count as the forward CSR");
-            IncomingCsr {
-                offsets,
-                srcs: dests,
-            }
-        })
+        self.incoming
+            .get_or_init(|| build_incoming_csr(self.nodes.num_rows(), &self.edge_endpoints))
     }
 
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
@@ -388,6 +377,33 @@ fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
         .windows(2)
         .map(|pair| (pair[1] - pair[0]) as usize)
         .collect()
+}
+
+fn build_incoming_csr(node_count: usize, edge_endpoints: &[(NodeId, NodeId)]) -> IncomingCsr {
+    if edge_endpoints.len() > Offset::MAX as usize {
+        panic!(
+            "too many edges for u32 CSR offsets ({} > {})",
+            edge_endpoints.len(),
+            Offset::MAX
+        );
+    }
+
+    let mut offsets = vec![0 as Offset; node_count + 1];
+    for &(_, dest) in edge_endpoints {
+        offsets[dest as usize + 1] += 1;
+    }
+    for i in 1..offsets.len() {
+        offsets[i] += offsets[i - 1];
+    }
+
+    let mut srcs = vec![0; edge_endpoints.len()];
+    let mut cursor = offsets.clone();
+    for &(src, dest) in edge_endpoints {
+        let pos = cursor[dest as usize] as usize;
+        srcs[pos] = src;
+        cursor[dest as usize] += 1;
+    }
+    IncomingCsr { offsets, srcs }
 }
 
 struct Preprocessed {

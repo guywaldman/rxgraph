@@ -145,6 +145,18 @@ class BuiltGraph:
 
 
 @dataclass(frozen=True, slots=True)
+class LibraryFilter:
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+    def matches(self, library: Lib | str) -> bool:
+        name = library.lower()
+        included = not self.include or any(term in name for term in self.include)
+        excluded = any(term in name for term in self.exclude)
+        return included and not excluded
+
+
+@dataclass(frozen=True, slots=True)
 class Result:
     case: Case
     scale: Scale
@@ -193,7 +205,7 @@ def args_parser() -> argparse.ArgumentParser:
     for name, default in [
         ("low_nodes", 10_000),
         ("mid_nodes", 100_000),
-        ("high_nodes", 1_000_000),
+        ("high_nodes", 10_000_000),
         ("extra_edges", 4),
         ("runs", 10),
         ("warmups", 3),
@@ -205,6 +217,11 @@ def args_parser() -> argparse.ArgumentParser:
         "--include",
         default="",
         help="Comma-separated library name substrings to include, e.g. rxgraph,igraph.",
+    )
+    p.add_argument(
+        "--exclude",
+        default="",
+        help="Comma-separated library name substrings to exclude, e.g. networkx,igraph.",
     )
     p.add_argument(
         "--cache",
@@ -226,7 +243,7 @@ def make_scales(args: argparse.Namespace) -> list[Scale]:
 
 
 def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
-    terms = library_terms(args.include)
+    libraries = library_filter(args)
     cache_root = benchmark_cache_root(args)
     simple, travel = (
         cached_data(
@@ -248,7 +265,9 @@ def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
             lambda: travel_data(scale.nodes, args.traversal_fanout),
         ),
     )
-    cases = simple_cases(simple, terms) + travel_cases(travel, args.max_paths, terms)
+    cases = simple_cases(simple, libraries) + travel_cases(
+        travel, args.max_paths, libraries
+    )
     return [
         measure(
             case,
@@ -265,8 +284,8 @@ def library_terms(value: str) -> tuple[str, ...]:
     return tuple(term.strip().lower() for term in value.split(",") if term.strip())
 
 
-def matches_library_terms(library: Lib | str, terms: tuple[str, ...]) -> bool:
-    return not terms or any(term in library.lower() for term in terms)
+def library_filter(args: argparse.Namespace) -> LibraryFilter:
+    return LibraryFilter(library_terms(args.include), library_terms(args.exclude))
 
 
 def benchmark_cache_root(args: argparse.Namespace) -> Path | None:
@@ -452,15 +471,17 @@ def build_graph(build: Callable[[], Any]) -> BuiltGraph:
     return BuiltGraph(graph, (time.perf_counter() - start,))
 
 
-def simple_cases(data: Data, terms: tuple[str, ...] = ()) -> list[Case]:
+def simple_cases(data: Data, libraries: LibraryFilter = LibraryFilter()) -> list[Case]:
     return [
         case
-        for lib, built in simple_graphs(data, terms).items()
+        for lib, built in simple_graphs(data, libraries).items()
         for case in alg_cases(lib, built.graph, data, built.build_times)
     ]
 
 
-def simple_graphs(data: Data, terms: tuple[str, ...] = ()) -> dict[Lib, BuiltGraph]:
+def simple_graphs(
+    data: Data, libraries: LibraryFilter = LibraryFilter()
+) -> dict[Lib, BuiltGraph]:
     graphs = {}
     pairs = None
 
@@ -470,19 +491,19 @@ def simple_graphs(data: Data, terms: tuple[str, ...] = ()) -> dict[Lib, BuiltGra
             pairs = data.pairs
         return pairs
 
-    if matches_library_terms(Lib.RX_DF, terms):
+    if libraries.matches(Lib.RX_DF):
         graphs[Lib.RX_DF] = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
-    if matches_library_terms(Lib.RX_DF_STRING_IDS, terms):
+    if libraries.matches(Lib.RX_DF_STRING_IDS):
         graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
-    if matches_library_terms(Lib.RX_PYTHON, terms):
+    if libraries.matches(Lib.RX_PYTHON):
         graphs[Lib.RX_PYTHON] = build_graph(
             lambda: rxg.Graph.from_edges(edge_pairs(), nodes=range(data.nodes.height))
         )
-    if matches_library_terms(Lib.NETWORKX, terms) and (nx := opt(Lib.NETWORKX)):
+    if libraries.matches(Lib.NETWORKX) and (nx := opt(Lib.NETWORKX)):
         graphs[Lib.NETWORKX] = build_graph(
             lambda: simple_networkx_graph(nx, data.nodes.height, edge_pairs())
         )
-    if matches_library_terms(Lib.IGRAPH, terms) and (ig := opt(Lib.IGRAPH)):
+    if libraries.matches(Lib.IGRAPH) and (ig := opt(Lib.IGRAPH)):
         graphs[Lib.IGRAPH] = build_graph(
             lambda: ig.Graph(n=data.nodes.height, edges=edge_pairs(), directed=True)
         )
@@ -589,8 +610,10 @@ def alg_cases(
     ]
 
 
-def travel_cases(data: Data, max_paths: int, terms: tuple[str, ...] = ()) -> list[Case]:
-    graphs = travel_graphs(data, terms)
+def travel_cases(
+    data: Data, max_paths: int, libraries: LibraryFilter = LibraryFilter()
+) -> list[Case]:
+    graphs = travel_graphs(data, libraries)
     traversal = travel_search_kwargs(data.target, [0], max_paths)
     string_traversal = travel_search_kwargs(str(data.target), ["0"], max_paths)
     cases = []
@@ -659,7 +682,9 @@ def travel_cases(data: Data, max_paths: int, terms: tuple[str, ...] = ()) -> lis
     return cases
 
 
-def travel_graphs(data: Data, terms: tuple[str, ...] = ()) -> dict[Lib, BuiltGraph]:
+def travel_graphs(
+    data: Data, libraries: LibraryFilter = LibraryFilter()
+) -> dict[Lib, BuiltGraph]:
     graphs = {}
     nodes = None
     edges = None
@@ -670,15 +695,15 @@ def travel_graphs(data: Data, terms: tuple[str, ...] = ()) -> dict[Lib, BuiltGra
             nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
         return nodes, edges
 
-    if matches_library_terms(Lib.RX_DF, terms):
+    if libraries.matches(Lib.RX_DF):
         graphs[Lib.RX_DF] = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
-    if matches_library_terms(Lib.RX_DF_STRING_IDS, terms):
+    if libraries.matches(Lib.RX_DF_STRING_IDS):
         graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
-    if matches_library_terms(Lib.RX_PYTHON, terms):
+    if libraries.matches(Lib.RX_PYTHON):
         graphs[Lib.RX_PYTHON] = build_graph(lambda: travel_rxgraph_python_graph(rows()))
-    if matches_library_terms(Lib.NETWORKX, terms) and (nx := opt(Lib.NETWORKX)):
+    if libraries.matches(Lib.NETWORKX) and (nx := opt(Lib.NETWORKX)):
         graphs[Lib.NETWORKX] = build_graph(lambda: travel_networkx_graph(nx, rows()))
-    if matches_library_terms(Lib.IGRAPH, terms) and (ig := opt(Lib.IGRAPH)):
+    if libraries.matches(Lib.IGRAPH) and (ig := opt(Lib.IGRAPH)):
         graphs[Lib.IGRAPH] = build_graph(
             lambda: travel_igraph_graph(ig, data.nodes.height, rows())
         )
@@ -701,15 +726,15 @@ def travel_rxgraph_python_graph(
 ) -> Any:
     node_rows, edge_rows = rows
     return rxg.Graph.from_edges(
-        [
+        (
             (
                 e[Field.SRC],
                 e[Field.DEST],
                 omit(e, Field.ID, Field.SRC, Field.DEST),
             )
             for e in edge_rows
-        ],
-        nodes=[(n[Field.ID], omit(n, Field.ID)) for n in node_rows],
+        ),
+        nodes=((n[Field.ID], omit(n, Field.ID)) for n in node_rows),
     )
 
 
@@ -853,7 +878,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
         ("Result size", "right"),
     ]:
         table.add_column(name, justify=justify, no_wrap=True)
-    best, baselines = best_by_bench(results), rx_baselines(results)
+    best, baselines = best_by_bench(results), speedup_baselines(results)
     ordered = sorted(results, key=sort_key)
     for i, r in enumerate(ordered):
         is_best = r.case.lib == best[r.bench]
@@ -930,22 +955,30 @@ def lib_order(library: Lib | str) -> int:
     return LIB_ORDER.index(library)
 
 
-def rx_baselines(results: list[Result]) -> dict[str, float]:
+def speedup_baselines(results: list[Result]) -> dict[str, Result]:
+    by_bench = {r.bench: [] for r in results}
+    for r in results:
+        by_bench[r.bench].append(r)
     return {
-        b: next(r.median for r in results if r.bench == b and r.case.lib == Lib.RX_DF)
-        for b in {r.bench for r in results}
+        bench: min(
+            [r for r in rows if is_rx(r.case.lib)] or rows,
+            key=lambda r: (r.median, lib_order(r.case.lib)),
+        )
+        for bench, rows in by_bench.items()
     }
 
 
-def plain_speedup(r: Result, baseline: float) -> str:
-    ratio = r.median / baseline
+def plain_speedup(r: Result, baseline: Result | float) -> str:
+    baseline_median = baseline.median if isinstance(baseline, Result) else baseline
+    baseline_lib = baseline.case.lib if isinstance(baseline, Result) else Lib.RX_DF
+    ratio = r.median / baseline_median
     if 1 / SAME < ratio < SAME:
-        return "baseline" if r.case.lib == Lib.RX_DF else "same"
+        return "baseline" if r.case.lib == baseline_lib else "same"
     return f"{(1 / ratio if ratio < 1 else ratio):.1f}x {'faster' if ratio < 1 else 'slower'}"
 
 
-def speed(r: Result, baseline: float) -> Text:
-    label, ratio = plain_speedup(r, baseline), r.median / baseline
+def speed(r: Result, baseline: Result) -> Text:
+    label, ratio = plain_speedup(r, baseline), r.median / baseline.median
     fast, ratio = ratio < 1, (1 / ratio if ratio < 1 else ratio)
     style = (
         "bold"
