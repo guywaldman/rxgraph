@@ -1,4 +1,4 @@
-use std::{io::Cursor, sync::Arc};
+use std::{cmp::Ordering, io::Cursor, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use arrow::{
@@ -12,7 +12,7 @@ use arrow::{
     record_batch::RecordBatch,
 };
 
-use crate::dsl::Value;
+use crate::dsl::{Value, ops::scalar::ScalarOp};
 
 #[derive(Debug, Clone)]
 pub(crate) enum ColumnReader {
@@ -33,6 +33,13 @@ pub(crate) enum ColumnReader {
     List(ListArray),
     LargeList(LargeListArray),
     Struct(StructArray),
+}
+
+enum ScalarValueRef<'a> {
+    Null,
+    Bool(bool),
+    Number(f64),
+    Str(&'a str),
 }
 
 impl ColumnReader {
@@ -105,6 +112,164 @@ impl ColumnReader {
             }
             Self::Struct(array) => nullable!(array, struct_row_to_value(array, row)?),
         })
+    }
+
+    pub(crate) fn eval_scalar_literal(
+        &self,
+        row: usize,
+        op: ScalarOp,
+        literal: &Value,
+        reverse: bool,
+    ) -> Result<Option<Value>> {
+        let Some(value) = self.scalar_value(row) else {
+            return Ok(None);
+        };
+        Ok(Some(match value {
+            ScalarValueRef::Null => eval_null_literal(op, literal),
+            ScalarValueRef::Bool(value) => eval_bool_literal(value, op, literal, reverse)?,
+            ScalarValueRef::Number(value) => eval_number_literal(value, op, literal, reverse)?,
+            ScalarValueRef::Str(value) => eval_str_literal(value, op, literal, reverse)?,
+        }))
+    }
+
+    fn scalar_value(&self, row: usize) -> Option<ScalarValueRef<'_>> {
+        macro_rules! nullable {
+            ($array:expr, $value:expr) => {
+                if $array.is_null(row) {
+                    ScalarValueRef::Null
+                } else {
+                    $value
+                }
+            };
+        }
+
+        Some(match self {
+            Self::Bool(array) => nullable!(array, ScalarValueRef::Bool(array.value(row))),
+            Self::I8(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::I16(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::I32(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::I64(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::U8(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::U16(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::U32(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::U64(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::F32(array) => nullable!(array, ScalarValueRef::Number(array.value(row) as f64)),
+            Self::F64(array) => nullable!(array, ScalarValueRef::Number(array.value(row))),
+            Self::Utf8(array) => nullable!(array, ScalarValueRef::Str(array.value(row))),
+            Self::LargeUtf8(array) => nullable!(array, ScalarValueRef::Str(array.value(row))),
+            Self::Utf8View(array) => nullable!(array, ScalarValueRef::Str(array.value(row))),
+            Self::List(_) | Self::LargeList(_) | Self::Struct(_) => return None,
+        })
+    }
+}
+
+fn eval_null_literal(op: ScalarOp, literal: &Value) -> Value {
+    match op {
+        ScalarOp::Eq => Value::Bool(literal.is_null()),
+        ScalarOp::NotEq => Value::Bool(!literal.is_null()),
+        ScalarOp::Lt | ScalarOp::LtEq | ScalarOp::Gt | ScalarOp::GtEq => Value::Null,
+        _ => unreachable!("fast scalar literal only handles comparison ops"),
+    }
+}
+
+fn eval_non_null_null_literal(op: ScalarOp) -> Value {
+    match op {
+        ScalarOp::Eq => Value::Bool(false),
+        ScalarOp::NotEq => Value::Bool(true),
+        ScalarOp::Lt | ScalarOp::LtEq | ScalarOp::Gt | ScalarOp::GtEq => Value::Null,
+        _ => unreachable!("fast scalar literal only handles comparison ops"),
+    }
+}
+
+fn eval_bool_literal(value: bool, op: ScalarOp, literal: &Value, reverse: bool) -> Result<Value> {
+    if literal.is_null() {
+        return Ok(eval_non_null_null_literal(op));
+    }
+    let Some(rhs) = literal_bool(literal) else {
+        return eval_incomparable_literal(op);
+    };
+    Ok(eval_ordering_or_eq(
+        op,
+        value == rhs,
+        value.cmp(&rhs),
+        reverse,
+    ))
+}
+
+fn eval_number_literal(value: f64, op: ScalarOp, literal: &Value, reverse: bool) -> Result<Value> {
+    if literal.is_null() {
+        return Ok(eval_non_null_null_literal(op));
+    }
+    let Some(rhs) = literal.as_f64() else {
+        return eval_incomparable_literal(op);
+    };
+    match op {
+        ScalarOp::Eq => Ok(Value::Bool(value == rhs)),
+        ScalarOp::NotEq => Ok(Value::Bool(value != rhs)),
+        ScalarOp::Lt | ScalarOp::LtEq | ScalarOp::Gt | ScalarOp::GtEq => {
+            let ordering = value.partial_cmp(&rhs).context("cannot compare values")?;
+            Ok(Value::Bool(apply_ordering(op, ordering, reverse)))
+        }
+        _ => unreachable!("fast scalar literal only handles comparison ops"),
+    }
+}
+
+fn eval_str_literal(value: &str, op: ScalarOp, literal: &Value, reverse: bool) -> Result<Value> {
+    if literal.is_null() {
+        return Ok(eval_non_null_null_literal(op));
+    }
+    let Value::Str(rhs) = literal else {
+        return eval_incomparable_literal(op);
+    };
+    Ok(eval_ordering_or_eq(
+        op,
+        value == rhs.as_ref(),
+        value.cmp(rhs.as_ref()),
+        reverse,
+    ))
+}
+
+fn literal_bool(literal: &Value) -> Option<bool> {
+    match literal {
+        Value::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn eval_incomparable_literal(op: ScalarOp) -> Result<Value> {
+    match op {
+        ScalarOp::Eq => Ok(Value::Bool(false)),
+        ScalarOp::NotEq => Ok(Value::Bool(true)),
+        ScalarOp::Lt | ScalarOp::LtEq | ScalarOp::Gt | ScalarOp::GtEq => {
+            bail!("cannot compare values")
+        }
+        _ => unreachable!("fast scalar literal only handles comparison ops"),
+    }
+}
+
+fn eval_ordering_or_eq(op: ScalarOp, equal: bool, ordering: Ordering, reverse: bool) -> Value {
+    match op {
+        ScalarOp::Eq => Value::Bool(equal),
+        ScalarOp::NotEq => Value::Bool(!equal),
+        ScalarOp::Lt | ScalarOp::LtEq | ScalarOp::Gt | ScalarOp::GtEq => {
+            Value::Bool(apply_ordering(op, ordering, reverse))
+        }
+        _ => unreachable!("fast scalar literal only handles comparison ops"),
+    }
+}
+
+fn apply_ordering(op: ScalarOp, ordering: Ordering, reverse: bool) -> bool {
+    let ordering = if reverse {
+        ordering.reverse()
+    } else {
+        ordering
+    };
+    match op {
+        ScalarOp::Lt => ordering.is_lt(),
+        ScalarOp::LtEq => ordering.is_le(),
+        ScalarOp::Gt => ordering.is_gt(),
+        ScalarOp::GtEq => ordering.is_ge(),
+        _ => unreachable!("fast scalar literal only handles ordering ops"),
     }
 }
 

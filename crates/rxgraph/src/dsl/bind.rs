@@ -6,6 +6,7 @@ use crate::{
         arrow_value::ColumnReader,
         eval::EvalCtx,
         expr::{ColumnRef, Expr},
+        ops::scalar::ScalarOp,
     },
     graph::{Graph, GraphId, GraphRepo},
 };
@@ -123,6 +124,27 @@ impl BoundColumn {
             Self::Edge(reader) => reader.value(ctx.edge as usize),
             Self::State(index) => Ok(ctx.state[*index].clone()),
             Self::MissingState => Ok(Value::Null),
+        }
+    }
+
+    pub(crate) fn eval_scalar_literal(
+        &self,
+        ctx: &EvalCtx<'_>,
+        op: ScalarOp,
+        literal: &Value,
+        reverse: bool,
+    ) -> Result<Option<Value>> {
+        match self {
+            Self::Src(reader) => reader.eval_scalar_literal(ctx.src as usize, op, literal, reverse),
+            Self::Dest(reader) => {
+                reader.eval_scalar_literal(ctx.dest as usize, op, literal, reverse)
+            }
+            Self::Edge(reader) => {
+                reader.eval_scalar_literal(ctx.edge as usize, op, literal, reverse)
+            }
+            Self::SrcId | Self::DestId | Self::EdgeId | Self::State(_) | Self::MissingState => {
+                Ok(None)
+            }
         }
     }
 }

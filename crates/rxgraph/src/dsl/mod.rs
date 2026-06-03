@@ -230,6 +230,33 @@ mod tests {
     }
 
     #[test]
+    fn primitive_column_literal_comparisons_work() {
+        let kernel = DslKernel::new(
+            DslExpr::edge("active")
+                .eq(DslExpr::bool_lit(true))
+                .and(DslExpr::edge("cost").lt(DslExpr::uint_lit(6)))
+                .and(DslExpr::dest("kind").eq(DslExpr::string_lit("target"))),
+            std::iter::empty::<(String, DslExpr)>(),
+            DslExpr::bool_lit(true),
+            std::iter::empty::<(String, Value)>(),
+        );
+
+        let graph = string_graph();
+        let result = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a"])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].edges, vec![GraphId::Str("ab")]);
+    }
+
+    #[test]
     fn polars_json_compat_path_uses_same_expression_engine() {
         let visit = r#"{"Column":"edge.active"}"#;
         let stop = r#"{"BinaryExpr":{"left":{"Column":"dest.kind"},"op":"Eq","right":{"Literal":{"Dyn":{"String":"target"}}}}}"#;
@@ -279,6 +306,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.paths.len(), 2);
+    }
+
+    #[test]
+    fn typed_api_boolean_ops_are_lazy() {
+        let bad_rhs = DslExpr::edge("active")
+            .plus(DslExpr::uint_lit(1))
+            .eq(DslExpr::uint_lit(2));
+        let graph = string_graph();
+
+        let and_result = graph
+            .search(
+                TraversalConfigBuilder::new(DslKernel::new(
+                    DslExpr::bool_lit(false).and(bad_rhs.clone()),
+                    std::iter::empty::<(String, DslExpr)>(),
+                    DslExpr::bool_lit(true),
+                    std::iter::empty::<(String, Value)>(),
+                ))
+                .with_start_nodes(["a"])
+                .with_parallelism(false)
+                .build(),
+            )
+            .unwrap();
+        assert_eq!(and_result.paths.len(), 0);
+
+        let or_result = graph
+            .search(
+                TraversalConfigBuilder::new(DslKernel::new(
+                    DslExpr::bool_lit(true).or(bad_rhs),
+                    std::iter::empty::<(String, DslExpr)>(),
+                    DslExpr::dest("kind").eq(DslExpr::string_lit("target")),
+                    std::iter::empty::<(String, Value)>(),
+                ))
+                .with_start_nodes(["a"])
+                .with_parallelism(false)
+                .build(),
+            )
+            .unwrap();
+        assert_eq!(or_result.paths.len(), 2);
     }
 
     #[test]
