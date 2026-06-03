@@ -80,13 +80,24 @@ struct PathEntry {
     state: StateValues,
 }
 
+/// One node in a local DFS path arena.
 #[derive(Debug, Clone)]
 struct PathTask {
     node: NodeId,
     incoming_edge: Option<EdgeId>,
+    /// Index into the arena of the parent task, if there is such.
     parent: Option<usize>,
     depth: usize,
     state: StateValues,
+}
+
+/// Independent DFS subtree work item.
+/// Carries its own arena so parent links stay valid.
+/// Important specifically for parallel DFS to avoid synchronization on
+/// a shared arena and frontier.
+struct DfsSeed {
+    arena: Vec<PathTask>,
+    task: usize,
 }
 
 struct EdgeEval {
@@ -288,7 +299,7 @@ fn initial_tasks(
     graph: &Graph,
     cfg: &RunConfig,
     kernel: &BoundKernel,
-) -> Result<(VecDeque<PathTask>, SearchStats)> {
+) -> Result<(VecDeque<DfsSeed>, SearchStats)> {
     let mut queue = VecDeque::with_capacity(cfg.start_nodes.len());
     let mut stats = SearchStats::default();
 
@@ -297,12 +308,15 @@ fn initial_tasks(
             .repo
             .internal_node(external.as_ref())
             .with_context(|| format!("unknown start node {external}"))?;
-        queue.push_back(PathTask {
-            node,
-            incoming_edge: None,
-            parent: None,
-            depth: 0,
-            state: kernel.initial_state().clone(),
+        queue.push_back(DfsSeed {
+            arena: vec![PathTask {
+                node,
+                incoming_edge: None,
+                parent: None,
+                depth: 0,
+                state: kernel.initial_state().clone(),
+            }],
+            task: 0,
         });
         stats.start_nodes += 1;
         stats.path_entries += 1;
@@ -384,27 +398,28 @@ fn build_dfs_seeds<'a>(
     graph: &'a Graph,
     cfg: &RunConfig,
     kernel: &BoundKernel,
-    mut queue: VecDeque<PathTask>,
+    mut queue: VecDeque<DfsSeed>,
     paths: &mut Vec<GraphPath<'a>>,
     stats: &mut SearchStats,
-) -> Result<Vec<PathTask>> {
+) -> Result<Vec<DfsSeed>> {
     let target = rayon::current_num_threads() * DFS_SEEDS_PER_THREAD;
 
     while queue.len() < target {
         if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
             break;
         }
-        let Some(task) = queue.pop_front() else {
+        let Some(seed) = queue.pop_front() else {
             break;
         };
-        if task.depth >= cfg.max_depth {
+        let mut arena = seed.arena;
+        let task = seed.task;
+        if arena[task].depth >= cfg.max_depth {
             continue;
         }
 
-        let mut arena = vec![task];
-        let children = expand_task(graph, cfg, kernel, &arena, 0, stats)?;
+        let children = expand_task(graph, cfg, kernel, &arena, task, stats)?;
         for (child, stop) in children {
-            let child = push_task(&mut arena, 0, child);
+            let child = push_task(&mut arena, task, child);
             if stop {
                 paths.push(materialize_task(graph, &arena, child, cfg, kernel)?);
                 stats.stopped_paths += 1;
@@ -412,7 +427,7 @@ fn build_dfs_seeds<'a>(
                     break;
                 }
             } else {
-                queue.push_back(arena[child].clone());
+                queue.push_back(standalone_seed(&arena, child));
             }
         }
     }
@@ -424,11 +439,11 @@ fn dfs_seed<'a>(
     graph: &'a Graph,
     cfg: &RunConfig,
     kernel: &BoundKernel,
-    seed: PathTask,
+    seed: DfsSeed,
     found: &AtomicUsize,
 ) -> Result<TaskResult<'a>> {
-    let mut arena = vec![seed];
-    let mut stack = vec![0usize];
+    let mut arena = seed.arena;
+    let mut stack = vec![seed.task];
     let mut paths = Vec::new();
     let mut stats = SearchStats::default();
 
@@ -510,6 +525,41 @@ fn push_task(arena: &mut Vec<PathTask>, parent: usize, edge: EdgeEval) -> usize 
         state: edge.state,
     });
     child
+}
+
+/// Copies one path chain into a new arena so the resulting seed has valid parent indexes.
+fn standalone_seed(arena: &[PathTask], mut path: usize) -> DfsSeed {
+    let mut chain = Vec::with_capacity(arena[path].depth + 1);
+    loop {
+        chain.push(path);
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+
+    let mut seed_arena = Vec::with_capacity(chain.len());
+    for index in chain {
+        let parent = if seed_arena.is_empty() {
+            None
+        } else {
+            Some(seed_arena.len() - 1)
+        };
+        let task = &arena[index];
+        seed_arena.push(PathTask {
+            node: task.node,
+            incoming_edge: task.incoming_edge,
+            parent,
+            depth: task.depth,
+            state: task.state.clone(),
+        });
+    }
+
+    DfsSeed {
+        task: seed_arena.len() - 1,
+        arena: seed_arena,
+    }
 }
 
 fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
@@ -1055,6 +1105,50 @@ mod tests {
             assert_eq!(path.nodes.last(), Some(&GraphId::Str("z")));
         }
         assert_eq!(path_set(&result).len(), 4);
+    }
+
+    /// This test case is needed because parallel DFS was highly unoptimized for 1 thread previously,
+    /// and remediation required adding [`DfsSeed`] so parent links remain valid after splitting work out of a temporary arena.
+    #[test]
+    fn parallel_dfs_single_thread_branch_returns_valid_paths() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let graph = branching_graph();
+            let parallel = graph
+                .search(
+                    TraversalConfigBuilder::new(DslKernel::new(
+                        e::bool_lit(true),
+                        [],
+                        e::dest("kind").eq(e::string_lit("end")),
+                        [],
+                    ))
+                    .with_start_nodes(["s".to_string()])
+                    .with_strategy(TraversalStrategy::DepthFirst)
+                    .with_parallelism(true)
+                    .build(),
+                )
+                .unwrap();
+            let serial = graph
+                .search(
+                    TraversalConfigBuilder::new(DslKernel::new(
+                        e::bool_lit(true),
+                        [],
+                        e::dest("kind").eq(e::string_lit("end")),
+                        [],
+                    ))
+                    .with_start_nodes(["s".to_string()])
+                    .with_strategy(TraversalStrategy::DepthFirst)
+                    .with_parallelism(false)
+                    .build(),
+                )
+                .unwrap();
+
+            assert_eq!(parallel.paths.len(), 4);
+            assert_eq!(path_set(&parallel), path_set(&serial));
+        });
     }
 
     #[test]
