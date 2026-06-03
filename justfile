@@ -58,7 +58,7 @@ install-hooks: setup
     {{prek}} install
 
 bench *args: build-maturin
-    {{python}} -m benches.main {{args}}
+    {{python}} -m benches.main --cache {{args}}
 
 bench-memory-rust *args: build-maturin
     cargo bench -p rxgraph --bench memory
