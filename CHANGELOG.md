@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/guywaldman/rxgraph/compare/v0.3.0...v0.3.1) (2026-06-04)
+
+
+### Performance Improvements
+
+* split topology storage, reduce allocations, short-circuit boolean ops, optimize u64 queries ([#22](https://github.com/guywaldman/rxgraph/issues/22)) ([f50dcfa](https://github.com/guywaldman/rxgraph/commit/f50dcfa6eaa5bc83fbef634a2c9c3d985a300d36))
+
 ## [0.3.0](https://github.com/guywaldman/rxgraph/compare/v0.2.0...v0.3.0) (2026-06-02)
 
 
