@@ -253,8 +253,8 @@ class Graph:
         if node_cols == self._loaded_node_cols and edge_cols == self._loaded_edge_cols:
             return
 
-        nodes = self._lazy_nodes.select([ID_COL, *sorted(node_cols)]).collect()
-        edges = self._lazy_edges.select([ID_COL, *sorted(edge_cols)]).collect()
+        nodes = self._lazy_nodes.select(_payload_projection(node_cols)).collect()
+        edges = self._lazy_edges.select(_payload_projection(edge_cols)).collect()
         self._inner.set_payloads(nodes, edges)
         self._loaded_node_cols = node_cols
         self._loaded_edge_cols = edge_cols
@@ -509,10 +509,14 @@ def _referenced_payload_columns(
                 continue
             if scope in ("src", "dest"):
                 node_cols.add(field)
-            elif scope == "edge":
+            elif scope == "edge" and field not in {SRC_COL, DEST_COL}:
                 edge_cols.add(field)
 
     return frozenset(node_cols), frozenset(edge_cols)
+
+
+def _payload_projection(cols: frozenset[str]) -> list[str]:
+    return sorted(cols) or [ID_COL]
 
 
 __all__ = [

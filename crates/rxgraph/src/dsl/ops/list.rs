@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 
@@ -216,18 +216,7 @@ fn slice(args: &[Value]) -> Result<Value> {
 }
 
 fn sort_values(values: &mut [Value], descending: bool, nulls_last: bool) -> Result<()> {
-    for (index, left) in values.iter().enumerate() {
-        if left.is_null() {
-            continue;
-        }
-        for right in values
-            .iter()
-            .skip(index + 1)
-            .filter(|value| !value.is_null())
-        {
-            left.compare(right)?;
-        }
-    }
+    validate_sortable(values)?;
     values.sort_by(|left, right| match (left.is_null(), right.is_null()) {
         (true, true) => Ordering::Equal,
         (true, false) => {
@@ -256,7 +245,65 @@ fn sort_values(values: &mut [Value], descending: bool, nulls_last: bool) -> Resu
     Ok(())
 }
 
+fn validate_sortable(values: &[Value]) -> Result<()> {
+    let mut first: Option<&Value> = None;
+    for value in values.iter().filter(|value| !value.is_null()) {
+        if let Some(first) = first {
+            first.compare(value)?;
+        } else {
+            first = Some(value);
+        }
+    }
+    Ok(())
+}
+
+fn compare_values(left: &Value, right: &Value) -> Ordering {
+    left.compare(right).unwrap_or(Ordering::Equal)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ScalarKey {
+    Null,
+    Bool(bool),
+    Number(u64),
+    Str(Arc<str>),
+}
+
+fn scalar_key(value: &Value) -> Option<ScalarKey> {
+    match value {
+        Value::Null => Some(ScalarKey::Null),
+        Value::Bool(value) => Some(ScalarKey::Bool(*value)),
+        Value::Str(value) => Some(ScalarKey::Str(value.clone())),
+        _ => {
+            let number = value.as_f64()?;
+            if number.is_nan() {
+                return None;
+            }
+            let number = if number == 0.0 { 0.0 } else { number };
+            Some(ScalarKey::Number(number.to_bits()))
+        }
+    }
+}
+
 fn unique(values: Vec<Value>) -> Vec<Value> {
+    if let Some(keys) = values.iter().map(scalar_key).collect::<Option<Vec<_>>>() {
+        return unique_by_scalar_key(values, keys);
+    }
+    unique_slow(values)
+}
+
+fn unique_by_scalar_key(values: Vec<Value>, keys: Vec<ScalarKey>) -> Vec<Value> {
+    let mut seen = HashSet::with_capacity(keys.len());
+    let mut out = Vec::new();
+    for (value, key) in values.into_iter().zip(keys) {
+        if seen.insert(key) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+fn unique_slow(values: Vec<Value>) -> Vec<Value> {
     let mut out = Vec::new();
     for value in values {
         if !out.iter().any(|existing: &Value| existing.eq_value(&value)) {
@@ -332,21 +379,26 @@ fn aggregate_median(args: &[Value]) -> Result<Value> {
     if values.is_empty() {
         return Ok(Value::Null);
     }
-    sort_values(&mut values, false, true)?;
+    validate_sortable(&values)?;
     let mid = values.len() / 2;
     if values.len() % 2 == 1 {
-        Ok(values[mid].clone())
-    } else {
-        Ok(Value::F64(
-            (values[mid - 1]
-                .as_f64()
-                .context("list median expected numbers")?
-                + values[mid]
-                    .as_f64()
-                    .context("list median expected numbers")?)
-                / 2.0,
-        ))
+        let (_, median, _) = values.select_nth_unstable_by(mid, compare_values);
+        return Ok(median.clone());
     }
+
+    let upper = {
+        let (_, upper, _) = values.select_nth_unstable_by(mid, compare_values);
+        upper.clone()
+    };
+    let lower = values[..mid]
+        .iter()
+        .max_by(|left, right| compare_values(left, right))
+        .expect("even-length median has a lower midpoint");
+    Ok(Value::F64(
+        (lower.as_f64().context("list median expected numbers")?
+            + upper.as_f64().context("list median expected numbers")?)
+            / 2.0,
+    ))
 }
 
 fn aggregate_bool(args: &[Value], ignore_nulls: bool, any: bool) -> Result<Value> {
@@ -478,12 +530,15 @@ fn set_operation(args: &[Value], op: SetOp) -> Result<Value> {
     let Some(right) = list_arg(args, 1)? else {
         return Ok(Value::Null);
     };
-    let left = unique(left.to_vec());
-    let right = unique(right.to_vec());
+    if let Some(out) = set_operation_scalar(left, right, op) {
+        return Ok(Value::List(out));
+    }
+    let left = unique_slow(left.to_vec());
+    let right = unique_slow(right.to_vec());
     let contains =
         |values: &[Value], needle: &Value| values.iter().any(|value| value.eq_value(needle));
     let out = match op {
-        SetOp::Union => unique(left.into_iter().chain(right).collect()),
+        SetOp::Union => unique_slow(left.into_iter().chain(right).collect()),
         SetOp::Intersection => left
             .into_iter()
             .filter(|value| contains(&right, value))
@@ -503,6 +558,62 @@ fn set_operation(args: &[Value], op: SetOp) -> Result<Value> {
         }
     };
     Ok(Value::List(out))
+}
+
+fn set_operation_scalar(left: &[Value], right: &[Value], op: SetOp) -> Option<Vec<Value>> {
+    let left = keyed_unique(left)?;
+    let right = keyed_unique(right)?;
+    let left_keys = left
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
+    let right_keys = right
+        .iter()
+        .map(|(key, _)| key.clone())
+        .collect::<HashSet<_>>();
+
+    let out = match op {
+        SetOp::Union => {
+            let mut seen = HashSet::with_capacity(left.len() + right.len());
+            left.into_iter()
+                .chain(right)
+                .filter_map(|(key, value)| seen.insert(key).then_some(value))
+                .collect()
+        }
+        SetOp::Intersection => left
+            .into_iter()
+            .filter_map(|(key, value)| right_keys.contains(&key).then_some(value))
+            .collect(),
+        SetOp::Difference => left
+            .into_iter()
+            .filter_map(|(key, value)| (!right_keys.contains(&key)).then_some(value))
+            .collect(),
+        SetOp::SymmetricDifference => {
+            let mut out = left
+                .into_iter()
+                .filter_map(|(key, value)| (!right_keys.contains(&key)).then_some(value))
+                .collect::<Vec<_>>();
+            out.extend(
+                right
+                    .into_iter()
+                    .filter_map(|(key, value)| (!left_keys.contains(&key)).then_some(value)),
+            );
+            out
+        }
+    };
+    Some(out)
+}
+
+fn keyed_unique(values: &[Value]) -> Option<Vec<(ScalarKey, Value)>> {
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut out = Vec::new();
+    for value in values {
+        let key = scalar_key(value)?;
+        if seen.insert(key.clone()) {
+            out.push((key, value.clone()));
+        }
+    }
+    Some(out)
 }
 
 fn to_struct(args: &[Value], names: &[String]) -> Result<Value> {

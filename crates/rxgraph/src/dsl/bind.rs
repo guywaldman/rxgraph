@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 
 use crate::{
     dsl::{
-        DslKernel, StateRow, StateValues, Value,
+        DslKernel, StateRow, StateValue, StateValues, Value,
         arrow_value::ColumnReader,
         eval::EvalCtx,
         expr::{ColumnRef, Expr},
+        ops::scalar::ScalarOp,
     },
-    graph::{Graph, GraphId, GraphRepo},
+    graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL},
 };
 
 #[derive(Debug)]
@@ -50,10 +51,14 @@ impl BoundKernel {
         self.visit.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn next_state(&self, current: &[Value], ctx: &EvalCtx<'_>) -> Result<StateValues> {
+    pub(crate) fn next_state(
+        &self,
+        current: &[StateValue],
+        ctx: &EvalCtx<'_>,
+    ) -> Result<StateValues> {
         let mut next = current.iter().cloned().collect::<StateValues>();
         for (index, expr) in &self.next_state {
-            next[*index] = expr.eval(ctx)?;
+            next[*index] = StateValue::new(expr.eval(ctx)?);
         }
         Ok(next)
     }
@@ -62,11 +67,11 @@ impl BoundKernel {
         self.stop.eval(ctx)?.truthy()
     }
 
-    pub(crate) fn state_row(&self, state: &[Value]) -> StateRow {
+    pub(crate) fn state_row(&self, state: &[StateValue]) -> StateRow {
         self.names
             .iter()
             .cloned()
-            .zip(state.iter().cloned())
+            .zip(state.iter().map(StateValue::to_value))
             .collect()
     }
 }
@@ -89,8 +94,13 @@ impl BoundColumn {
             ColumnRef::SrcId => Self::SrcId,
             ColumnRef::DestId => Self::DestId,
             ColumnRef::EdgeId => Self::EdgeId,
+            ColumnRef::SrcField(name) if name == ID_COL => Self::SrcId,
             ColumnRef::SrcField(name) => Self::Src(ColumnReader::bind(&graph.repo.nodes, &name)?),
+            ColumnRef::DestField(name) if name == ID_COL => Self::DestId,
             ColumnRef::DestField(name) => Self::Dest(ColumnReader::bind(&graph.repo.nodes, &name)?),
+            ColumnRef::EdgeField(name) if name == ID_COL => Self::EdgeId,
+            ColumnRef::EdgeField(name) if name == EDGE_SRC_COL => Self::SrcId,
+            ColumnRef::EdgeField(name) if name == EDGE_DEST_COL => Self::DestId,
             ColumnRef::EdgeField(name) => Self::Edge(ColumnReader::bind(&graph.repo.edges, &name)?),
             ColumnRef::State(name) => state_index(names, &name)
                 .map(Self::State)
@@ -121,8 +131,29 @@ impl BoundColumn {
             Self::Src(reader) => reader.value(ctx.src as usize),
             Self::Dest(reader) => reader.value(ctx.dest as usize),
             Self::Edge(reader) => reader.value(ctx.edge as usize),
-            Self::State(index) => Ok(ctx.state[*index].clone()),
+            Self::State(index) => Ok(ctx.state[*index].to_value()),
             Self::MissingState => Ok(Value::Null),
+        }
+    }
+
+    pub(crate) fn eval_scalar_literal(
+        &self,
+        ctx: &EvalCtx<'_>,
+        op: ScalarOp,
+        literal: &Value,
+        reverse: bool,
+    ) -> Result<Option<Value>> {
+        match self {
+            Self::Src(reader) => reader.eval_scalar_literal(ctx.src as usize, op, literal, reverse),
+            Self::Dest(reader) => {
+                reader.eval_scalar_literal(ctx.dest as usize, op, literal, reverse)
+            }
+            Self::Edge(reader) => {
+                reader.eval_scalar_literal(ctx.edge as usize, op, literal, reverse)
+            }
+            Self::SrcId | Self::DestId | Self::EdgeId | Self::State(_) | Self::MissingState => {
+                Ok(None)
+            }
         }
     }
 }
@@ -152,8 +183,8 @@ fn normalize_state(state: StateRow, names: &[String]) -> StateValues {
             state
                 .binary_search_by(|(key, _)| key.as_str().cmp(name))
                 .ok()
-                .map(|i| state[i].1.clone())
-                .unwrap_or(Value::Null)
+                .map(|i| StateValue::new(state[i].1.clone()))
+                .unwrap_or_else(|| StateValue::new(Value::Null))
         })
         .collect::<StateValues>()
 }

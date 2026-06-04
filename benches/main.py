@@ -13,9 +13,11 @@ import argparse
 import gc
 import math
 import statistics
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -27,12 +29,83 @@ from rich.table import Table
 from rich.text import Text
 
 SAME = 1.05
-INIT = {"spent": 0, "hops": 0, "ready_at": 0, "risk": 0, "detours": 0}
+CACHE_VERSION = 1
+CACHE_ROOT = Path(tempfile.gettempdir()) / "rxgraph-bench-cache"
+
+
+class Lib(StrEnum):
+    RX_DF = "rxgraph-df"
+    RX_DF_STRING_IDS = "rxgraph-df-string-ids"
+    RX_PYTHON = "rxgraph-python"
+    NETWORKX = "networkx"
+    IGRAPH = "igraph"
+
+
+LIB_ORDER = (
+    Lib.RX_DF,
+    Lib.RX_PYTHON,
+    Lib.RX_DF_STRING_IDS,
+    Lib.IGRAPH,
+    Lib.NETWORKX,
+)
+
+
+class Alg(StrEnum):
+    BFS = "bfs"
+    SHORTEST_PATH = "shortest_path"
+    DEGREES = "degrees"
+    WEAK_COMPONENTS = "weak_components"
+    TRAVERSAL = "traversal"
+
+
+class ScaleName(StrEnum):
+    LOW = "low"
+    MID = "mid"
+    HIGH = "high"
+
+
+class Field(StrEnum):
+    ID = "id"
+    SRC = "src"
+    DEST = "dest"
+    PRICE = "price"
+    DEPARTURE = "departure"
+    ARRIVAL = "arrival"
+    RELIABILITY = "reliability"
+    ROUTE_KIND = "route_kind"
+    DETOUR_COST = "detour_cost"
+    RISK = "risk"
+    MIN_CONNECTION = "min_connection"
+    CLOSED = "closed"
+    SPENT = "spent"
+    HOPS = "hops"
+    READY_AT = "ready_at"
+    DETOURS = "detours"
+
+
+class RouteKind(StrEnum):
+    ROUTE = "route"
+    SKIP = "skip"
+
+
+class Scope(StrEnum):
+    STATE = "state"
+    DEST = "dest"
+    EDGE = "edge"
+
+
+INIT = {
+    Field.SPENT: 0,
+    Field.HOPS: 0,
+    Field.READY_AT: 0,
+    Field.RISK: 0,
+    Field.DETOURS: 0,
+}
 
 
 @dataclass(frozen=True, slots=True)
 class Scale:
-    name: str
+    name: ScaleName
     nodes: int
     fanout: int
 
@@ -51,15 +124,36 @@ class Data:
 
     @property
     def pairs(self) -> list[tuple[int, int]]:
-        return list(zip(self.edges["src"].to_list(), self.edges["dest"].to_list()))
+        return list(
+            zip(self.edges[Field.SRC].to_list(), self.edges[Field.DEST].to_list())
+        )
 
 
 @dataclass(frozen=True, slots=True)
 class Case:
-    alg: str
-    lib: str
+    alg: Alg
+    lib: Lib
     run: Callable[[], Any]
     norm: Callable[[Any], Any] = lambda value: value
+    build_times: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class BuiltGraph:
+    graph: Any
+    build_times: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class LibraryFilter:
+    include: tuple[str, ...] = ()
+    exclude: tuple[str, ...] = ()
+
+    def matches(self, library: Lib | str) -> bool:
+        name = library.lower()
+        included = not self.include or any(term in name for term in self.include)
+        excluded = any(term in name for term in self.exclude)
+        return included and not excluded
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,13 +180,20 @@ class Result:
     def p90(self) -> float:
         return sorted(self.times)[max(math.ceil(len(self.times) * 0.9) - 1, 0)]
 
+    @property
+    def graph_build_median(self) -> float:
+        return statistics.median(self.case.build_times or (0.0,))
+
 
 def main() -> None:
     args = args_parser().parse_args()
     console = Console(width=max(Console().width, 160))
     results: list[Result] = []
     for scale in make_scales(args):
-        scale_results = run_scale(scale, args)
+        with console.status(
+            f"Running {scale.name} benchmark suite...", spinner="boxBounce2"
+        ):
+            scale_results = run_scale(scale, args)
         results += scale_results
         print_table(console, scale, scale_results)
     write_json(args.json, results)
@@ -104,7 +205,7 @@ def args_parser() -> argparse.ArgumentParser:
     for name, default in [
         ("low_nodes", 10_000),
         ("mid_nodes", 100_000),
-        ("high_nodes", 1_000_000),
+        ("high_nodes", 10_000_000),
         ("extra_edges", 4),
         ("runs", 10),
         ("warmups", 3),
@@ -112,6 +213,21 @@ def args_parser() -> argparse.ArgumentParser:
         ("traversal_fanout", 256),
     ]:
         p.add_argument(f"--{name.replace('_', '-')}", type=int, default=default)
+    p.add_argument(
+        "--include",
+        default="",
+        help="Comma-separated library name substrings to include, e.g. rxgraph,igraph.",
+    )
+    p.add_argument(
+        "--exclude",
+        default="",
+        help="Comma-separated library name substrings to exclude, e.g. networkx,igraph.",
+    )
+    p.add_argument(
+        "--cache",
+        action="store_true",
+        help=f"Cache generated benchmark data as Parquet under {CACHE_ROOT}.",
+    )
     p.add_argument("--json", type=Path, default=Path("dist/algorithm-benchmarks.json"))
     return p
 
@@ -120,23 +236,43 @@ def make_scales(args: argparse.Namespace) -> list[Scale]:
     low, mid = max(args.low_nodes, 2), max(args.mid_nodes, args.low_nodes + 1)
     high = max(args.high_nodes, mid + 1)
     return [
-        Scale("low", low, max(1, args.extra_edges // 2)),
-        Scale("mid", mid, max(1, args.extra_edges * 3 // 4)),
-        Scale("high", high, max(1, args.extra_edges)),
+        Scale(ScaleName.LOW, low, max(1, args.extra_edges // 2)),
+        Scale(ScaleName.MID, mid, max(1, args.extra_edges * 3 // 4)),
+        Scale(ScaleName.HIGH, high, max(1, args.extra_edges)),
     ]
 
 
 def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
+    libraries = library_filter(args)
+    cache_root = benchmark_cache_root(args)
     simple, travel = (
-        simple_data(scale.nodes, scale.fanout),
-        travel_data(scale.nodes, args.traversal_fanout),
+        cached_data(
+            cache_root,
+            "simple",
+            scale.nodes,
+            "fanout",
+            scale.fanout,
+            simple_target_node(scale.nodes),
+            lambda: simple_data(scale.nodes, scale.fanout),
+        ),
+        cached_data(
+            cache_root,
+            "travel",
+            scale.nodes,
+            "noise",
+            args.traversal_fanout,
+            None,
+            lambda: travel_data(scale.nodes, args.traversal_fanout),
+        ),
     )
-    cases = simple_cases(simple) + travel_cases(travel, args.max_paths)
+    cases = simple_cases(simple, libraries) + travel_cases(
+        travel, args.max_paths, libraries
+    )
     return [
         measure(
             case,
             scale,
-            travel if case.alg == "traversal" else simple,
+            travel if case.alg == Alg.TRAVERSAL else simple,
             args.warmups,
             args.runs,
         )
@@ -144,8 +280,68 @@ def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
     ]
 
 
+def library_terms(value: str) -> tuple[str, ...]:
+    return tuple(term.strip().lower() for term in value.split(",") if term.strip())
+
+
+def library_filter(args: argparse.Namespace) -> LibraryFilter:
+    return LibraryFilter(library_terms(args.include), library_terms(args.exclude))
+
+
+def benchmark_cache_root(args: argparse.Namespace) -> Path | None:
+    return CACHE_ROOT if args.cache else None
+
+
+def cached_data(
+    cache_root: Path | None,
+    kind: str,
+    nodes: int,
+    factor_name: str,
+    factor: int,
+    target_node: int | None,
+    build: Callable[[], Data],
+) -> Data:
+    if cache_root is None:
+        return build()
+
+    path = data_cache_path(cache_root, kind, nodes, factor_name, factor)
+    node_path, edge_path = path / "nodes.parquet", path / "edges.parquet"
+    if node_path.exists() and edge_path.exists():
+        return Data(pl.read_parquet(node_path), pl.read_parquet(edge_path), target_node)
+
+    data = build()
+    path.mkdir(parents=True, exist_ok=True)
+    write_parquet(data.nodes, node_path)
+    write_parquet(data.edges, edge_path)
+    return data
+
+
+def data_cache_path(
+    cache_root: Path, kind: str, nodes: int, factor_name: str, factor: int
+) -> Path:
+    return (
+        cache_root
+        / f"v{CACHE_VERSION}"
+        / f"{kind}-nodes={nodes}-{factor_name}={factor}"
+    )
+
+
+def write_parquet(frame: pl.DataFrame, path: Path) -> None:
+    tmp = path.with_suffix(f"{path.suffix}.tmp")
+    frame.write_parquet(tmp)
+    tmp.replace(path)
+
+
+def simple_main(n: int) -> int:
+    return max(2, n - max(1, n // 20))
+
+
+def simple_target_node(n: int) -> int:
+    return simple_main(n) - 1
+
+
 def simple_data(n: int, fanout: int) -> Data:
-    main = max(2, n - max(1, n // 20))
+    main = simple_main(n)
     edges = [
         (src, dst)
         for src in range(main - 1)
@@ -153,14 +349,14 @@ def simple_data(n: int, fanout: int) -> Data:
         if (dst := src + step) < main and (step == 1 or dst % step == 0)
     ]
     return Data(
-        df({"id": range(n)}, {"id": pl.UInt64}),
+        df({Field.ID: range(n)}, {Field.ID: pl.UInt64}),
         df(
             {
-                "id": range(len(edges)),
-                "src": [s for s, _ in edges],
-                "dest": [d for _, d in edges],
+                Field.ID: range(len(edges)),
+                Field.SRC: [s for s, _ in edges],
+                Field.DEST: [d for _, d in edges],
             },
-            {"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+            {Field.ID: pl.UInt64, Field.SRC: pl.UInt64, Field.DEST: pl.UInt64},
         ),
         main - 1,
     )
@@ -192,7 +388,7 @@ def travel_data(n: int, noise: int) -> Data:
                 min(src + st, n - 1),
                 25 + ((st * 3 + src) % 110),
                 92 if st in strides[-4:] else 45,
-                "route",
+                RouteKind.ROUTE,
                 0,
             )
             for st in strides
@@ -205,45 +401,45 @@ def travel_data(n: int, noise: int) -> Data:
                     dst,
                     20 + i % 50,
                     95 if i % 5 == 0 else 35 + i % 30,
-                    "route" if i % 5 == 0 else "skip",
+                    RouteKind.ROUTE if i % 5 == 0 else RouteKind.SKIP,
                     int(i % 5 == 0),
                 )
                 for i in range(max(noise, 0))
                 if (dst := 1 + ((src + i * 37 + 17) % (n - 1))) != src
             ]
     for i, row in enumerate(rows):
-        row["id"] = i
+        row[Field.ID] = i
 
     return Data(
         df(
             {
-                "id": range(n),
-                "risk": [(i * 7) % 9 for i in range(n)],
-                "min_connection": [35 + ((i * 11) % 50) for i in range(n)],
-                "closed": [
+                Field.ID: range(n),
+                Field.RISK: [(i * 7) % 9 for i in range(n)],
+                Field.MIN_CONNECTION: [35 + ((i * 11) % 50) for i in range(n)],
+                Field.CLOSED: [
                     i not in {0, n - 1} and i % 23 == 0 and i % step != 0
                     for i in range(n)
                 ],
             },
             {
-                "id": pl.UInt64,
-                "risk": pl.Int32,
-                "min_connection": pl.UInt64,
-                "closed": pl.Boolean,
+                Field.ID: pl.UInt64,
+                Field.RISK: pl.Int32,
+                Field.MIN_CONNECTION: pl.UInt64,
+                Field.CLOSED: pl.Boolean,
             },
         ),
         df(
             rows,
             {
-                "id": pl.UInt64,
-                "src": pl.UInt64,
-                "dest": pl.UInt64,
-                "price": pl.UInt64,
-                "departure": pl.UInt64,
-                "arrival": pl.UInt64,
-                "reliability": pl.Int32,
-                "route_kind": pl.String,
-                "detour_cost": pl.UInt64,
+                Field.ID: pl.UInt64,
+                Field.SRC: pl.UInt64,
+                Field.DEST: pl.UInt64,
+                Field.PRICE: pl.UInt64,
+                Field.DEPARTURE: pl.UInt64,
+                Field.ARRIVAL: pl.UInt64,
+                Field.RELIABILITY: pl.Int32,
+                Field.ROUTE_KIND: pl.String,
+                Field.DETOUR_COST: pl.UInt64,
             },
         ),
     )
@@ -254,146 +450,224 @@ def df(data: Any, schema: dict[str, Any]) -> pl.DataFrame:
 
 
 def flight(
-    src: int, dst: int, price: int, reliability: int, kind: str, detour: int
-) -> dict[str, int | str]:
+    src: int, dst: int, price: int, reliability: int, kind: RouteKind, detour: int
+) -> dict[Field, int | str]:
     depart = src * 120 + (dst % 9) * 7
     return {
-        "src": src,
-        "dest": dst,
-        "price": price,
-        "departure": depart,
-        "arrival": depart + 45 + ((dst * 13 + src) % 240),
-        "reliability": reliability,
-        "route_kind": kind,
-        "detour_cost": detour,
+        Field.SRC: src,
+        Field.DEST: dst,
+        Field.PRICE: price,
+        Field.DEPARTURE: depart,
+        Field.ARRIVAL: depart + 45 + ((dst * 13 + src) % 240),
+        Field.RELIABILITY: reliability,
+        Field.ROUTE_KIND: kind,
+        Field.DETOUR_COST: detour,
     }
 
 
-def simple_cases(data: Data) -> list[Case]:
+def build_graph(build: Callable[[], Any]) -> BuiltGraph:
+    start = time.perf_counter()
+    graph = build()
+    return BuiltGraph(graph, (time.perf_counter() - start,))
+
+
+def simple_cases(data: Data, libraries: LibraryFilter = LibraryFilter()) -> list[Case]:
     return [
         case
-        for lib, graph in simple_graphs(data).items()
-        for case in alg_cases(lib, graph, data)
+        for lib, built in simple_graphs(data, libraries).items()
+        for case in alg_cases(lib, built.graph, data, built.build_times)
     ]
 
 
-def simple_graphs(data: Data) -> dict[str, Any]:
-    string_data = string_ids(data)
-    graphs = {
-        "rxgraph-df": rxg.Graph(data.nodes, data.edges),
-        "rxgraph-df-string-ids": rxg.Graph(string_data.nodes, string_data.edges),
-        "rxgraph-python": rxg.Graph.from_edges(
-            data.pairs, nodes=range(data.nodes.height)
-        ),
-    }
-    if nx := opt("networkx"):
-        graphs["networkx"] = nx.MultiDiGraph()
-        graphs["networkx"].add_nodes_from(range(data.nodes.height))
-        graphs["networkx"].add_edges_from(data.pairs)
-    if ig := opt("igraph"):
-        graphs["igraph"] = ig.Graph(
-            n=data.nodes.height, edges=data.pairs, directed=True
+def simple_graphs(
+    data: Data, libraries: LibraryFilter = LibraryFilter()
+) -> dict[Lib, BuiltGraph]:
+    graphs = {}
+    pairs = None
+
+    def edge_pairs() -> list[tuple[int, int]]:
+        nonlocal pairs
+        if pairs is None:
+            pairs = data.pairs
+        return pairs
+
+    if libraries.matches(Lib.RX_DF):
+        graphs[Lib.RX_DF] = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
+    if libraries.matches(Lib.RX_DF_STRING_IDS):
+        graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
+    if libraries.matches(Lib.RX_PYTHON):
+        graphs[Lib.RX_PYTHON] = build_graph(
+            lambda: rxg.Graph.from_edges(edge_pairs(), nodes=range(data.nodes.height))
+        )
+    if libraries.matches(Lib.NETWORKX) and (nx := opt(Lib.NETWORKX)):
+        graphs[Lib.NETWORKX] = build_graph(
+            lambda: simple_networkx_graph(nx, data.nodes.height, edge_pairs())
+        )
+    if libraries.matches(Lib.IGRAPH) and (ig := opt(Lib.IGRAPH)):
+        graphs[Lib.IGRAPH] = build_graph(
+            lambda: ig.Graph(n=data.nodes.height, edges=edge_pairs(), directed=True)
         )
     return graphs
 
 
-def alg_cases(lib: str, graph: Any, data: Data) -> list[Case]:
+def simple_networkx_graph(
+    nx: Any, node_count: int, pairs: list[tuple[int, int]]
+) -> Any:
+    graph = nx.MultiDiGraph()
+    graph.add_nodes_from(range(node_count))
+    graph.add_edges_from(pairs)
+    return graph
+
+
+def string_id_graph(data: Data) -> Any:
+    string_data = string_ids(data)
+    return rxg.Graph(string_data.nodes, string_data.edges)
+
+
+def alg_cases(
+    lib: Lib, graph: Any, data: Data, build_times: tuple[float, ...]
+) -> list[Case]:
     if is_rx(lib):
-        start = "0" if lib == "rxgraph-df-string-ids" else 0
-        target = str(data.target) if lib == "rxgraph-df-string-ids" else data.target
-        bfs_norm = numeric_set if lib == "rxgraph-df-string-ids" else set
-        path_norm = numeric_path_sig if lib == "rxgraph-df-string-ids" else path_sig
-        comp_norm = numeric_comp_sig if lib == "rxgraph-df-string-ids" else comp_sig
+        start = "0" if lib == Lib.RX_DF_STRING_IDS else 0
+        target = str(data.target) if lib == Lib.RX_DF_STRING_IDS else data.target
+        bfs_norm = numeric_set if lib == Lib.RX_DF_STRING_IDS else set
+        path_norm = numeric_path_sig if lib == Lib.RX_DF_STRING_IDS else path_sig
+        comp_norm = numeric_comp_sig if lib == Lib.RX_DF_STRING_IDS else comp_sig
         return [
-            Case("bfs", lib, lambda: graph.bfs(start), bfs_norm),
+            Case(Alg.BFS, lib, lambda: graph.bfs(start), bfs_norm, build_times),
             Case(
-                "shortest_path",
+                Alg.SHORTEST_PATH,
                 lib,
                 lambda: graph.shortest_path(start, target),
                 path_norm,
+                build_times,
             ),
-            Case("degrees", lib, graph.degrees),
-            Case("weak_components", lib, graph.weakly_connected_components, comp_norm),
+            Case(Alg.DEGREES, lib, graph.degrees, build_times=build_times),
+            Case(
+                Alg.WEAK_COMPONENTS,
+                lib,
+                graph.weakly_connected_components,
+                comp_norm,
+                build_times,
+            ),
         ]
-    if lib == "networkx":
+    if lib == Lib.NETWORKX:
         import networkx as nx
 
         return [
-            Case("bfs", lib, lambda: list(nx.bfs_tree(graph, 0).nodes()), set),
             Case(
-                "shortest_path",
+                Alg.BFS,
+                lib,
+                lambda: list(nx.bfs_tree(graph, 0).nodes()),
+                set,
+                build_times,
+            ),
+            Case(
+                Alg.SHORTEST_PATH,
                 lib,
                 lambda: nx.shortest_path(graph, 0, data.target),
                 path_sig,
+                build_times,
             ),
-            Case("degrees", lib, lambda: [d for _, d in graph.degree()]),
             Case(
-                "weak_components",
+                Alg.DEGREES,
+                lib,
+                lambda: [d for _, d in graph.degree()],
+                build_times=build_times,
+            ),
+            Case(
+                Alg.WEAK_COMPONENTS,
                 lib,
                 lambda: [list(c) for c in nx.weakly_connected_components(graph)],
                 comp_sig,
+                build_times,
             ),
         ]
     return [
-        Case("bfs", lib, lambda: graph.bfs(0, mode="out")[0], set),
+        Case(Alg.BFS, lib, lambda: graph.bfs(0, mode="out")[0], set, build_times),
         Case(
-            "shortest_path",
+            Alg.SHORTEST_PATH,
             lib,
             lambda: graph.get_shortest_paths(
                 0, to=data.target, mode="out", output="vpath"
             )[0],
             path_sig,
+            build_times,
         ),
-        Case("degrees", lib, lambda: graph.degree(mode="all")),
         Case(
-            "weak_components",
+            Alg.DEGREES,
+            lib,
+            lambda: graph.degree(mode="all"),
+            build_times=build_times,
+        ),
+        Case(
+            Alg.WEAK_COMPONENTS,
             lib,
             lambda: [list(c) for c in graph.connected_components(mode="weak")],
             comp_sig,
+            build_times,
         ),
     ]
 
 
-def travel_cases(data: Data, max_paths: int) -> list[Case]:
-    nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
-    graphs = travel_graphs(data, nodes, edges)
+def travel_cases(
+    data: Data, max_paths: int, libraries: LibraryFilter = LibraryFilter()
+) -> list[Case]:
+    graphs = travel_graphs(data, libraries)
     traversal = travel_search_kwargs(data.target, [0], max_paths)
     string_traversal = travel_search_kwargs(str(data.target), ["0"], max_paths)
-    cases = [
-        Case(
-            "traversal",
-            "rxgraph-df",
-            lambda: graphs["rxgraph-df"].search(**traversal).paths,
-        ),
-        Case(
-            "traversal",
-            "rxgraph-df-string-ids",
-            lambda: graphs["rxgraph-df-string-ids"].search(**string_traversal).paths,
-        ),
-        Case(
-            "traversal",
-            "rxgraph-python",
-            lambda: graphs["rxgraph-python"].search(**traversal).paths,
-        ),
-    ]
-    if nxg := graphs.get("networkx"):
+    cases = []
+    if Lib.RX_DF in graphs:
+        built = graphs[Lib.RX_DF]
         cases.append(
             Case(
-                "traversal",
-                "networkx",
+                Alg.TRAVERSAL,
+                Lib.RX_DF,
+                lambda graph=built.graph: graph.search(**traversal).paths,
+                build_times=built.build_times,
+            )
+        )
+    if Lib.RX_DF_STRING_IDS in graphs:
+        built = graphs[Lib.RX_DF_STRING_IDS]
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.RX_DF_STRING_IDS,
+                lambda graph=built.graph: graph.search(**string_traversal).paths,
+                build_times=built.build_times,
+            )
+        )
+    if Lib.RX_PYTHON in graphs:
+        built = graphs[Lib.RX_PYTHON]
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.RX_PYTHON,
+                lambda graph=built.graph: graph.search(**traversal).paths,
+                build_times=built.build_times,
+            )
+        )
+    if built := graphs.get(Lib.NETWORKX):
+        nxg = built.graph
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.NETWORKX,
                 lambda: py_travel(
                     lambda n: ((d, e) for _, d, e in nxg.out_edges(n, data=True)),
                     lambda n: nxg.nodes[n],
                     data.target,
                     max_paths,
                 ),
+                build_times=built.build_times,
             )
         )
-    if igg := graphs.get("igraph"):
+    if built := graphs.get(Lib.IGRAPH):
+        igg = built.graph
         cases.append(
             Case(
-                "traversal",
-                "igraph",
+                Alg.TRAVERSAL,
+                Lib.IGRAPH,
                 lambda: py_travel(
                     lambda n: (
                         (e.target, e.attributes()) for e in igg.es.select(_source=n)
@@ -402,67 +676,110 @@ def travel_cases(data: Data, max_paths: int) -> list[Case]:
                     data.target,
                     max_paths,
                 ),
+                build_times=built.build_times,
             )
         )
     return cases
 
 
 def travel_graphs(
-    data: Data, nodes: list[dict[str, Any]], edges: list[dict[str, Any]]
-) -> dict[str, Any]:
-    string_data = string_ids(data)
-    graphs = {
-        "rxgraph-df": rxg.Graph(data.nodes, data.edges),
-        "rxgraph-df-string-ids": rxg.Graph(string_data.nodes, string_data.edges),
-        "rxgraph-python": rxg.Graph.from_edges(
-            [(e["src"], e["dest"], omit(e, "id", "src", "dest")) for e in edges],
-            nodes=[(n["id"], omit(n, "id")) for n in nodes],
-        ),
-    }
-    if nx := opt("networkx"):
-        graphs["networkx"] = nx.MultiDiGraph()
-        graphs["networkx"].add_nodes_from((n["id"], n) for n in nodes)
-        for i, e in enumerate(edges):
-            graphs["networkx"].add_edge(e["src"], e["dest"], edge_id=i, **e)
-    if ig := opt("igraph"):
-        graphs["igraph"] = ig.Graph(
-            n=data.nodes.height,
-            edges=[(e["src"], e["dest"]) for e in edges],
-            directed=True,
+    data: Data, libraries: LibraryFilter = LibraryFilter()
+) -> dict[Lib, BuiltGraph]:
+    graphs = {}
+    nodes = None
+    edges = None
+
+    def rows() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        nonlocal nodes, edges
+        if nodes is None or edges is None:
+            nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
+        return nodes, edges
+
+    if libraries.matches(Lib.RX_DF):
+        graphs[Lib.RX_DF] = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
+    if libraries.matches(Lib.RX_DF_STRING_IDS):
+        graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
+    if libraries.matches(Lib.RX_PYTHON):
+        graphs[Lib.RX_PYTHON] = build_graph(lambda: travel_rxgraph_python_graph(rows()))
+    if libraries.matches(Lib.NETWORKX) and (nx := opt(Lib.NETWORKX)):
+        graphs[Lib.NETWORKX] = build_graph(lambda: travel_networkx_graph(nx, rows()))
+    if libraries.matches(Lib.IGRAPH) and (ig := opt(Lib.IGRAPH)):
+        graphs[Lib.IGRAPH] = build_graph(
+            lambda: travel_igraph_graph(ig, data.nodes.height, rows())
         )
-        for key in nodes[0]:
-            graphs["igraph"].vs[key] = [n[key] for n in nodes]
-        for key in edges[0]:
-            graphs["igraph"].es[key] = [e[key] for e in edges]
     return graphs
+
+
+def travel_networkx_graph(
+    nx: Any, rows: tuple[list[dict[str, Any]], list[dict[str, Any]]]
+) -> Any:
+    node_rows, edge_rows = rows
+    graph = nx.MultiDiGraph()
+    graph.add_nodes_from((n[Field.ID], n) for n in node_rows)
+    for i, e in enumerate(edge_rows):
+        graph.add_edge(e[Field.SRC], e[Field.DEST], edge_id=i, **e)
+    return graph
+
+
+def travel_rxgraph_python_graph(
+    rows: tuple[list[dict[str, Any]], list[dict[str, Any]]],
+) -> Any:
+    node_rows, edge_rows = rows
+    return rxg.Graph.from_edges(
+        (
+            (
+                e[Field.SRC],
+                e[Field.DEST],
+                omit(e, Field.ID, Field.SRC, Field.DEST),
+            )
+            for e in edge_rows
+        ),
+        nodes=((n[Field.ID], omit(n, Field.ID)) for n in node_rows),
+    )
+
+
+def travel_igraph_graph(
+    ig: Any, node_count: int, rows: tuple[list[dict[str, Any]], list[dict[str, Any]]]
+) -> Any:
+    node_rows, edge_rows = rows
+    graph = ig.Graph(
+        n=node_count,
+        edges=[(e[Field.SRC], e[Field.DEST]) for e in edge_rows],
+        directed=True,
+    )
+    for key in node_rows[0]:
+        graph.vs[key] = [n[key] for n in node_rows]
+    for key in edge_rows[0]:
+        graph.es[key] = [e[key] for e in edge_rows]
+    return graph
 
 
 def travel_search_kwargs(
     target: int | str, start_nodes: list[int | str], max_paths: int
 ) -> dict[str, Any]:
     s, d, e = (
-        (lambda n: rxg.col(f"state.{n}")),
-        (lambda n: rxg.col(f"dest.{n}")),
-        (lambda n: rxg.col(f"edge.{n}")),
+        (lambda n: rxg.col(f"{Scope.STATE}.{n}")),
+        (lambda n: rxg.col(f"{Scope.DEST}.{n}")),
+        (lambda n: rxg.col(f"{Scope.EDGE}.{n}")),
     )
     return {
         "start_nodes": start_nodes,
-        "visit": (s("detours") == 0)
-        & ~d("closed")
-        & (e("reliability") >= 70)
-        & (e("route_kind") != "skip")
-        & (s("hops") < 18)
-        & ((s("spent") + e("price")) <= 950)
-        & (e("departure") >= s("ready_at"))
-        & ((s("risk") + d("risk")) <= 90),
+        "visit": (s(Field.DETOURS) == 0)
+        & ~d(Field.CLOSED)
+        & (e(Field.RELIABILITY) >= 70)
+        & (e(Field.ROUTE_KIND) != RouteKind.SKIP)
+        & (s(Field.HOPS) < 18)
+        & ((s(Field.SPENT) + e(Field.PRICE)) <= 950)
+        & (e(Field.DEPARTURE) >= s(Field.READY_AT))
+        & ((s(Field.RISK) + d(Field.RISK)) <= 90),
         "next_state": {
-            "spent": s("spent") + e("price"),
-            "hops": s("hops") + 1,
-            "ready_at": e("arrival") + d("min_connection"),
-            "risk": s("risk") + d("risk"),
-            "detours": s("detours") + e("detour_cost"),
+            Field.SPENT: s(Field.SPENT) + e(Field.PRICE),
+            Field.HOPS: s(Field.HOPS) + 1,
+            Field.READY_AT: e(Field.ARRIVAL) + d(Field.MIN_CONNECTION),
+            Field.RISK: s(Field.RISK) + d(Field.RISK),
+            Field.DETOURS: s(Field.DETOURS) + e(Field.DETOUR_COST),
         },
-        "stop": rxg.col("dest.id") == target,
+        "stop": rxg.col(f"{Scope.DEST}.{Field.ID}") == target,
         "initial_state": INIT,
         "max_depth": 18,
         "max_paths": max_paths,
@@ -472,11 +789,11 @@ def travel_search_kwargs(
 
 def string_ids(data: Data) -> Data:
     return Data(
-        data.nodes.with_columns(pl.col("id").cast(pl.String)),
+        data.nodes.with_columns(pl.col(Field.ID).cast(pl.String)),
         data.edges.with_columns(
-            pl.col("id").cast(pl.String),
-            pl.col("src").cast(pl.String),
-            pl.col("dest").cast(pl.String),
+            pl.col(Field.ID).cast(pl.String),
+            pl.col(Field.SRC).cast(pl.String),
+            pl.col(Field.DEST).cast(pl.String),
         ),
         data.target,
     )
@@ -496,11 +813,11 @@ def py_travel(
             if dst in path or not visit(dest, edge, state):
                 continue
             next_state = {
-                "spent": state["spent"] + edge["price"],
-                "hops": state["hops"] + 1,
-                "ready_at": edge["arrival"] + dest["min_connection"],
-                "risk": state["risk"] + dest["risk"],
-                "detours": state["detours"] + edge["detour_cost"],
+                Field.SPENT: state[Field.SPENT] + edge[Field.PRICE],
+                Field.HOPS: state[Field.HOPS] + 1,
+                Field.READY_AT: edge[Field.ARRIVAL] + dest[Field.MIN_CONNECTION],
+                Field.RISK: state[Field.RISK] + dest[Field.RISK],
+                Field.DETOURS: state[Field.DETOURS] + edge[Field.DETOUR_COST],
             }
             next_path = (*path, dst)
             paths.append(next_path) if dst == target else frontier.append(
@@ -513,14 +830,14 @@ def py_travel(
 
 def visit(dest: dict[str, Any], edge: dict[str, Any], state: dict[str, int]) -> bool:
     return (
-        state["detours"] == 0
-        and not dest["closed"]
-        and edge["reliability"] >= 70
-        and edge["route_kind"] != "skip"
-        and state["hops"] < 18
-        and state["spent"] + edge["price"] <= 950
-        and edge["departure"] >= state["ready_at"]
-        and state["risk"] + dest["risk"] <= 90
+        state[Field.DETOURS] == 0
+        and not dest[Field.CLOSED]
+        and edge[Field.RELIABILITY] >= 70
+        and edge[Field.ROUTE_KIND] != RouteKind.SKIP
+        and state[Field.HOPS] < 18
+        and state[Field.SPENT] + edge[Field.PRICE] <= 950
+        and edge[Field.DEPARTURE] >= state[Field.READY_AT]
+        and state[Field.RISK] + dest[Field.RISK] <= 90
     )
 
 
@@ -552,6 +869,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
     for name, justify in [
         ("Bench", "left"),
         ("Library", "left"),
+        ("Test setup", "right"),
         ("Median", "right"),
         ("P90", "right"),
         ("Best", "right"),
@@ -560,7 +878,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
         ("Result size", "right"),
     ]:
         table.add_column(name, justify=justify, no_wrap=True)
-    best, baselines = best_by_bench(results), rx_baselines(results)
+    best, baselines = best_by_bench(results), speedup_baselines(results)
     ordered = sorted(results, key=sort_key)
     for i, r in enumerate(ordered):
         is_best = r.case.lib == best[r.bench]
@@ -573,6 +891,7 @@ def print_table(console: Console, scale: Scale, results: list[Result]) -> None:
         table.add_row(
             r.bench,
             lib,
+            Text(fmt_time(r.graph_build_median), style="dim"),
             fmt_time(r.median),
             fmt_time(r.p90),
             fmt_time(r.best),
@@ -607,6 +926,7 @@ def write_json(path: Path, results: list[Result]) -> None:
                             "node_count": r.data.nodes.height,
                             "edge_count": r.data.edges.height,
                             "result_size": r.size,
+                            "graph_build_median": r.graph_build_median,
                         },
                         collect_metadata=False,
                     )
@@ -631,34 +951,34 @@ def best_by_bench(results: list[Result]) -> dict[str, str]:
     }
 
 
-def lib_order(library: str) -> int:
-    return [
-        "rxgraph-df",
-        "rxgraph-python",
-        "rxgraph-df-string-ids",
-        "igraph",
-        "networkx",
-    ].index(library)
+def lib_order(library: Lib | str) -> int:
+    return LIB_ORDER.index(library)
 
 
-def rx_baselines(results: list[Result]) -> dict[str, float]:
+def speedup_baselines(results: list[Result]) -> dict[str, Result]:
+    by_bench = {r.bench: [] for r in results}
+    for r in results:
+        by_bench[r.bench].append(r)
     return {
-        b: next(
-            r.median for r in results if r.bench == b and r.case.lib == "rxgraph-df"
+        bench: min(
+            [r for r in rows if is_rx(r.case.lib)] or rows,
+            key=lambda r: (r.median, lib_order(r.case.lib)),
         )
-        for b in {r.bench for r in results}
+        for bench, rows in by_bench.items()
     }
 
 
-def plain_speedup(r: Result, baseline: float) -> str:
-    ratio = r.median / baseline
+def plain_speedup(r: Result, baseline: Result | float) -> str:
+    baseline_median = baseline.median if isinstance(baseline, Result) else baseline
+    baseline_lib = baseline.case.lib if isinstance(baseline, Result) else Lib.RX_DF
+    ratio = r.median / baseline_median
     if 1 / SAME < ratio < SAME:
-        return "baseline" if r.case.lib == "rxgraph-df" else "same"
+        return "baseline" if r.case.lib == baseline_lib else "same"
     return f"{(1 / ratio if ratio < 1 else ratio):.1f}x {'faster' if ratio < 1 else 'slower'}"
 
 
-def speed(r: Result, baseline: float) -> Text:
-    label, ratio = plain_speedup(r, baseline), r.median / baseline
+def speed(r: Result, baseline: Result) -> Text:
+    label, ratio = plain_speedup(r, baseline), r.median / baseline.median
     fast, ratio = ratio < 1, (1 / ratio if ratio < 1 else ratio)
     style = (
         "bold"
@@ -733,15 +1053,15 @@ def omit(row: dict[str, Any], *keys: str) -> dict[str, Any]:
     return {k: v for k, v in row.items() if k not in keys}
 
 
-def opt(name: str) -> Any | None:
+def opt(name: Lib | str) -> Any | None:
     try:
         return __import__(name)
     except ImportError:
         return None
 
 
-def is_rx(library: str) -> bool:
-    return library.startswith("rxgraph")
+def is_rx(library: Lib | str) -> bool:
+    return library in (Lib.RX_DF, Lib.RX_DF_STRING_IDS, Lib.RX_PYTHON)
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as Json};
@@ -137,15 +137,7 @@ impl Value {
             (Self::List(left), Self::List(right)) => {
                 left.len() == right.len() && left.iter().zip(right).all(|(l, r)| l.eq_value(r))
             }
-            (Self::Struct(left), Self::Struct(right)) => {
-                left.len() == right.len()
-                    && left.iter().all(|(name, value)| {
-                        right
-                            .iter()
-                            .find(|(right_name, _)| right_name == name)
-                            .is_some_and(|(_, right_value)| value.eq_value(right_value))
-                    })
-            }
+            (Self::Struct(left), Self::Struct(right)) => struct_fields_eq(left, right),
             _ => self
                 .as_f64()
                 .zip(rhs.as_f64())
@@ -164,4 +156,32 @@ impl Value {
                 .context("cannot compare values"),
         }
     }
+}
+
+fn struct_fields_eq(left: &[(String, Value)], right: &[(String, Value)]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    if right.len() < 8 {
+        return struct_fields_eq_linear(left, right);
+    }
+
+    let mut right_by_name = HashMap::with_capacity(right.len());
+    for (name, value) in right {
+        right_by_name.entry(name.as_str()).or_insert(value);
+    }
+    left.iter().all(|(name, value)| {
+        right_by_name
+            .get(name.as_str())
+            .is_some_and(|right_value| value.eq_value(right_value))
+    })
+}
+
+fn struct_fields_eq_linear(left: &[(String, Value)], right: &[(String, Value)]) -> bool {
+    left.iter().all(|(name, value)| {
+        right
+            .iter()
+            .find(|(right_name, _)| right_name == name)
+            .is_some_and(|(_, right_value)| value.eq_value(right_value))
+    })
 }

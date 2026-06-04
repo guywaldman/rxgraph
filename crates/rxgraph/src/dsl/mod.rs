@@ -18,6 +18,8 @@ mod ops;
 mod polars_json;
 mod value;
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use smallvec::SmallVec;
 
@@ -102,8 +104,34 @@ impl DslKernel {
 /// Named state carried by each path.
 pub type StateRow = Vec<(String, Value)>;
 
+#[derive(Debug, Clone)]
+pub(crate) enum StateValue {
+    Inline(Value),
+    Shared(Arc<Value>),
+}
+
+impl StateValue {
+    pub(crate) fn new(value: Value) -> Self {
+        match value {
+            Value::List(_) | Value::Struct(_) => Self::Shared(Arc::new(value)),
+            value => Self::Inline(value),
+        }
+    }
+
+    pub(crate) fn as_value(&self) -> &Value {
+        match self {
+            Self::Inline(value) => value,
+            Self::Shared(value) => value,
+        }
+    }
+
+    pub(crate) fn to_value(&self) -> Value {
+        self.as_value().clone()
+    }
+}
+
 // Bound state drops names so every state read/write is an index lookup.
-pub(crate) type StateValues = SmallVec<[Value; 8]>;
+pub(crate) type StateValues = SmallVec<[StateValue; 8]>;
 
 #[cfg(test)]
 mod tests {
@@ -180,6 +208,35 @@ mod tests {
     }
 
     #[test]
+    fn reserved_topology_fields_read_from_identity() {
+        let kernel = DslKernel::new(
+            DslExpr::src("id")
+                .eq(DslExpr::string_lit("a"))
+                .and(DslExpr::edge("src").eq(DslExpr::string_lit("a")))
+                .and(DslExpr::edge("dest").eq(DslExpr::string_lit("b"))),
+            std::iter::empty::<(String, DslExpr)>(),
+            DslExpr::dest("id")
+                .eq(DslExpr::string_lit("b"))
+                .and(DslExpr::edge("id").eq(DslExpr::string_lit("ab"))),
+            std::iter::empty::<(String, Value)>(),
+        );
+
+        let graph = string_graph();
+        let result = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a"])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].edges, vec![GraphId::Str("ab")]);
+    }
+
+    #[test]
     fn u64_id_columns_and_mask_if_any_work() {
         let graph = Graph::new(
             record_batch!((ID_COL, UInt64, [1, 2, 3])).unwrap(),
@@ -227,6 +284,33 @@ mod tests {
             vec![GraphId::U64(1), GraphId::U64(2)]
         );
         assert_eq!(result.paths[0].edges, vec![GraphId::U64(9)]);
+    }
+
+    #[test]
+    fn primitive_column_literal_comparisons_work() {
+        let kernel = DslKernel::new(
+            DslExpr::edge("active")
+                .eq(DslExpr::bool_lit(true))
+                .and(DslExpr::edge("cost").lt(DslExpr::uint_lit(6)))
+                .and(DslExpr::dest("kind").eq(DslExpr::string_lit("target"))),
+            std::iter::empty::<(String, DslExpr)>(),
+            DslExpr::bool_lit(true),
+            std::iter::empty::<(String, Value)>(),
+        );
+
+        let graph = string_graph();
+        let result = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a"])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].edges, vec![GraphId::Str("ab")]);
     }
 
     #[test]
@@ -279,6 +363,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.paths.len(), 2);
+    }
+
+    #[test]
+    fn typed_api_boolean_ops_are_lazy() {
+        let bad_rhs = DslExpr::edge("active")
+            .plus(DslExpr::uint_lit(1))
+            .eq(DslExpr::uint_lit(2));
+        let graph = string_graph();
+
+        let and_result = graph
+            .search(
+                TraversalConfigBuilder::new(DslKernel::new(
+                    DslExpr::bool_lit(false).and(bad_rhs.clone()),
+                    std::iter::empty::<(String, DslExpr)>(),
+                    DslExpr::bool_lit(true),
+                    std::iter::empty::<(String, Value)>(),
+                ))
+                .with_start_nodes(["a"])
+                .with_parallelism(false)
+                .build(),
+            )
+            .unwrap();
+        assert_eq!(and_result.paths.len(), 0);
+
+        let or_result = graph
+            .search(
+                TraversalConfigBuilder::new(DslKernel::new(
+                    DslExpr::bool_lit(true).or(bad_rhs),
+                    std::iter::empty::<(String, DslExpr)>(),
+                    DslExpr::dest("kind").eq(DslExpr::string_lit("target")),
+                    std::iter::empty::<(String, Value)>(),
+                ))
+                .with_start_nodes(["a"])
+                .with_parallelism(false)
+                .build(),
+            )
+            .unwrap();
+        assert_eq!(or_result.paths.len(), 2);
     }
 
     #[test]
