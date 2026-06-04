@@ -42,12 +42,12 @@ impl Graph {
 
     /// Number of node rows.
     pub fn node_count(&self) -> usize {
-        self.repo.nodes.num_rows()
+        self.repo.node_count()
     }
 
     /// Number of edge rows.
     pub fn edge_count(&self) -> usize {
-        self.repo.edges.num_rows()
+        self.repo.edge_count()
     }
 
     /// Topology-only breadth-first traversal from an external node ID.
@@ -73,6 +73,29 @@ impl Graph {
             return Ok(None);
         };
         self.materialize_nodes_u64(self.walk_breadth_first(start, max_depth))
+    }
+
+    /// Batched breadth-first traversals for integer-ID graphs.
+    ///
+    /// Reuses generation-stamped scratch across starts, avoiding an O(nodes)
+    /// visited-array clear per query.
+    /// Returns `Ok(None)` when the graph uses string IDs.
+    /// Missing start nodes produce `None` entries.
+    pub fn bfs_many_u64(
+        &self,
+        starts: impl IntoIterator<Item = u64>,
+        max_depth: Option<usize>,
+    ) -> Result<Option<Vec<Option<Vec<u64>>>>> {
+        if !self.repo.has_u64_ids() {
+            return Ok(None);
+        }
+
+        let mut scratch = TopologyScratch::new(self.node_count());
+        starts
+            .into_iter()
+            .map(|start| self.bfs_u64_with_scratch(start, max_depth, &mut scratch))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
     }
 
     /// Topology-only depth-first traversal from an external node ID.
@@ -197,6 +220,30 @@ impl Graph {
         Ok(Some(None))
     }
 
+    /// Batched shortest-path query for integer-ID graphs.
+    ///
+    /// Reuses generation-stamped visited/parent scratch across queries, which
+    /// avoids O(nodes) zeroing for many small path queries. Returns `Ok(None)`
+    /// when the graph uses string IDs. Missing endpoints or disconnected pairs
+    /// produce `None` entries.
+    pub fn shortest_paths_u64(
+        &self,
+        queries: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Option<Vec<Option<Vec<u64>>>>> {
+        if !self.repo.has_u64_ids() {
+            return Ok(None);
+        }
+
+        let mut scratch = TopologyScratch::new(self.node_count());
+        queries
+            .into_iter()
+            .map(|(source, target)| {
+                self.shortest_path_u64_with_scratch(source, target, &mut scratch)
+            })
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     /// Out-degree per internal node row order.
     pub fn out_degrees(&self) -> Vec<usize> {
         self.repo.out_degrees()
@@ -318,18 +365,125 @@ impl Graph {
     }
 
     fn materialize_nodes_u64(&self, nodes: Vec<NodeId>) -> Result<Option<Vec<u64>>> {
-        if self.repo.is_contiguous_u64() {
-            return Ok(Some(nodes.into_iter().map(|node| node as u64).collect()));
-        }
+        self.materialize_nodes_u64_slice(&nodes).map(Some)
+    }
+
+    fn materialize_nodes_u64_slice(&self, nodes: &[NodeId]) -> Result<Vec<u64>> {
         nodes
-            .into_iter()
-            .map(|node| {
-                self.repo
-                    .external_node_u64(node)
-                    .context("internal node must map to u64 id")
-            })
+            .iter()
+            .map(|&node| self.node_to_u64(node))
             .collect::<Result<Vec<_>>>()
+    }
+
+    fn node_to_u64(&self, node: NodeId) -> Result<u64> {
+        if self.repo.is_contiguous_u64() {
+            return Ok(node as u64);
+        }
+        self.repo
+            .external_node_u64(node)
+            .context("internal node must map to u64 id")
+    }
+
+    fn bfs_u64_with_scratch(
+        &self,
+        start: u64,
+        max_depth: Option<usize>,
+        scratch: &mut TopologyScratch,
+    ) -> Result<Option<Vec<u64>>> {
+        let Some(start) = self.repo.internal_node_u64(start) else {
+            return Ok(None);
+        };
+
+        let generation = scratch.next_generation();
+        if let Some(max_depth) = max_depth {
+            scratch.frontier.clear();
+            scratch.depth_frontier.clear();
+            scratch.depth_frontier.push((start, 0));
+            scratch.visited[start as usize] = generation;
+            let mut head = 0;
+
+            while let Some(&(node, depth)) = scratch.depth_frontier.get(head) {
+                head += 1;
+                scratch.frontier.push(node);
+                if depth >= max_depth {
+                    continue;
+                }
+                let (_, dests) = self.repo.outgoing_slice(node);
+                for &dest in dests {
+                    let dest_idx = dest as usize;
+                    if scratch.visited[dest_idx] == generation {
+                        continue;
+                    }
+                    scratch.visited[dest_idx] = generation;
+                    scratch.depth_frontier.push((dest, depth + 1));
+                }
+            }
+        } else {
+            scratch.frontier.clear();
+            scratch.frontier.push(start);
+            scratch.visited[start as usize] = generation;
+            let mut head = 0;
+
+            while let Some(&node) = scratch.frontier.get(head) {
+                head += 1;
+                let (_, dests) = self.repo.outgoing_slice(node);
+                for &dest in dests {
+                    let dest_idx = dest as usize;
+                    if scratch.visited[dest_idx] == generation {
+                        continue;
+                    }
+                    scratch.visited[dest_idx] = generation;
+                    scratch.frontier.push(dest);
+                }
+            }
+        }
+
+        self.materialize_nodes_u64_slice(&scratch.frontier)
             .map(Some)
+    }
+
+    fn shortest_path_u64_with_scratch(
+        &self,
+        source: u64,
+        target: u64,
+        scratch: &mut TopologyScratch,
+    ) -> Result<Option<Vec<u64>>> {
+        let Some(source) = self.repo.internal_node_u64(source) else {
+            return Ok(None);
+        };
+        let Some(target) = self.repo.internal_node_u64(target) else {
+            return Ok(None);
+        };
+
+        if source == target {
+            return Ok(Some(vec![self.node_to_u64(source)?]));
+        }
+
+        let generation = scratch.next_generation();
+        scratch.frontier.clear();
+        scratch.frontier.push(source);
+        scratch.visited[source as usize] = generation;
+        let mut head = 0;
+
+        while let Some(&node) = scratch.frontier.get(head) {
+            head += 1;
+            let (_, dests) = self.repo.outgoing_slice(node);
+            for &dest in dests {
+                let dest_idx = dest as usize;
+                if scratch.visited[dest_idx] == generation {
+                    continue;
+                }
+
+                scratch.visited[dest_idx] = generation;
+                scratch.parent[dest_idx] = node;
+                if dest == target {
+                    return self.materialize_path_u64(source, target, &scratch.parent);
+                }
+                scratch.frontier.push(dest);
+            }
+        }
+
+        Ok(None)
     }
 
     fn walk_breadth_first(&self, start: NodeId, max_depth: Option<usize>) -> Vec<NodeId> {
@@ -455,5 +609,77 @@ impl Graph {
         });
         path.reverse();
         Ok(Some(path))
+    }
+}
+
+struct TopologyScratch {
+    visited: Vec<u32>,
+    generation: u32,
+    parent: Vec<NodeId>,
+    frontier: Vec<NodeId>,
+    depth_frontier: Vec<(NodeId, usize)>,
+}
+
+impl TopologyScratch {
+    fn new(node_count: usize) -> Self {
+        Self {
+            visited: vec![0; node_count],
+            generation: 0,
+            parent: vec![NodeId::MAX; node_count],
+            frontier: Vec::new(),
+            depth_frontier: Vec::new(),
+        }
+    }
+
+    fn next_generation(&mut self) -> u32 {
+        if self.generation == u32::MAX {
+            self.visited.fill(0);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+        self.generation
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::record_batch;
+
+    use super::*;
+    use crate::graph::repo::{EDGE_DEST_COL, EDGE_SRC_COL, ID_COL};
+
+    #[test]
+    fn batched_shortest_paths_reuse_topology_scratch() {
+        let graph = small_graph();
+
+        assert_eq!(
+            graph
+                .shortest_paths_u64([(0, 3), (2, 0), (4, 4), (99, 1)])
+                .unwrap()
+                .unwrap(),
+            vec![Some(vec![0, 1, 2, 3]), None, Some(vec![4]), None]
+        );
+    }
+
+    #[test]
+    fn batched_bfs_reuses_topology_scratch() {
+        let graph = small_graph();
+
+        assert_eq!(
+            graph.bfs_many_u64([0, 2, 99], Some(1)).unwrap().unwrap(),
+            vec![Some(vec![0, 1]), Some(vec![2, 3]), None]
+        );
+    }
+
+    fn small_graph() -> Graph {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2, 3, 4])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0, 1, 2]),
+            (EDGE_SRC_COL, UInt64, [0, 1, 2]),
+            (EDGE_DEST_COL, UInt64, [1, 2, 3])
+        )
+        .unwrap();
+        Graph::new(nodes, edges).unwrap()
     }
 }

@@ -8,7 +8,7 @@ use crate::{
         expr::{ColumnRef, Expr},
         ops::scalar::ScalarOp,
     },
-    graph::{Graph, GraphId, GraphRepo},
+    graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL},
 };
 
 #[derive(Debug)]
@@ -94,8 +94,13 @@ impl BoundColumn {
             ColumnRef::SrcId => Self::SrcId,
             ColumnRef::DestId => Self::DestId,
             ColumnRef::EdgeId => Self::EdgeId,
+            ColumnRef::SrcField(name) if name == ID_COL => Self::SrcId,
             ColumnRef::SrcField(name) => Self::Src(ColumnReader::bind(&graph.repo.nodes, &name)?),
+            ColumnRef::DestField(name) if name == ID_COL => Self::DestId,
             ColumnRef::DestField(name) => Self::Dest(ColumnReader::bind(&graph.repo.nodes, &name)?),
+            ColumnRef::EdgeField(name) if name == ID_COL => Self::EdgeId,
+            ColumnRef::EdgeField(name) if name == EDGE_SRC_COL => Self::SrcId,
+            ColumnRef::EdgeField(name) if name == EDGE_DEST_COL => Self::DestId,
             ColumnRef::EdgeField(name) => Self::Edge(ColumnReader::bind(&graph.repo.edges, &name)?),
             ColumnRef::State(name) => state_index(names, &name)
                 .map(Self::State)

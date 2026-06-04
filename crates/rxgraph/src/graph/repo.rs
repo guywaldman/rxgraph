@@ -1,10 +1,14 @@
-use std::{collections::HashMap, fmt, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::{Arc, OnceLock},
+};
 
 use anyhow::{Context, Result, bail};
 use arrow::array::{
     Array, LargeStringArray, RecordBatch, StringArray, StringViewArray, UInt64Array,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, FieldRef, Schema};
 
 use crate::{
     arrow::validate_field_exists,
@@ -22,6 +26,9 @@ pub const TYPE_COL: &str = "type";
 
 pub const EDGE_SRC_COL: &str = "src";
 pub const EDGE_DEST_COL: &str = "dest";
+
+const NODE_TOPOLOGY_COLS: &[&str] = &[ID_COL];
+const EDGE_TOPOLOGY_COLS: &[&str] = &[ID_COL, EDGE_SRC_COL, EDGE_DEST_COL];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GraphId<'a> {
@@ -103,6 +110,8 @@ pub(crate) struct Repo {
     csr_offsets: Vec<Offset>,
     csr_dests: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
+    node_count: usize,
+    edge_count: usize,
 
     identity: Identity,
     pub nodes: RecordBatch,
@@ -142,9 +151,9 @@ enum Identity {
         node_lookup: HashMap<u64, NodeId>,
     },
     Str {
-        nodes: Vec<String>,
-        edges: Vec<String>,
-        node_lookup: HashMap<String, NodeId>,
+        nodes: Vec<Arc<str>>,
+        edges: Vec<Arc<str>>,
+        node_lookup: HashMap<Arc<str>, NodeId>,
     },
 }
 
@@ -197,7 +206,7 @@ impl Identity {
             Self::U64 { nodes, .. } => nodes.get(internal as usize).copied().map(GraphId::U64),
             Self::Str { nodes, .. } => nodes
                 .get(internal as usize)
-                .map(|value| GraphId::Str(value)),
+                .map(|value| GraphId::Str(value.as_ref())),
         }
     }
 
@@ -210,7 +219,7 @@ impl Identity {
             Self::U64 { edges, .. } => edges.get(internal as usize).copied().map(GraphId::U64),
             Self::Str { edges, .. } => edges
                 .get(internal as usize)
-                .map(|value| GraphId::Str(value)),
+                .map(|value| GraphId::Str(value.as_ref())),
         }
     }
 }
@@ -220,30 +229,45 @@ impl Repo {
         self.identity.is_contiguous_u64()
     }
 
+    pub(crate) fn has_u64_ids(&self) -> bool {
+        matches!(
+            self.identity,
+            Identity::U64Contiguous { .. } | Identity::U64 { .. }
+        )
+    }
+
+    pub(crate) fn node_count(&self) -> usize {
+        self.node_count
+    }
+
+    pub(crate) fn edge_count(&self) -> usize {
+        self.edge_count
+    }
+
     /// Replaces the payload (attribute) tables without rebuilding topology.
     ///
     /// Used by lazy graphs to swap in column-projected payload batches for a single search.
     /// The new batches must keep the original row order and count: DSL column reads index
     /// payload arrays by internal node/edge ID, which equals the Arrow row position.
     /// Identity (`id`/`src`/`dest`) is resolved from the precomputed mapping, not these
-    /// batches, so the projected batches only need the columns the kernel references.
+    /// batches, so topology columns are discarded if callers include them.
     pub(crate) fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
-        if nodes.num_rows() != self.nodes.num_rows() {
+        if nodes.num_rows() != self.node_count {
             bail!(
                 "projected nodes table has {} rows but topology expects {}",
                 nodes.num_rows(),
-                self.nodes.num_rows()
+                self.node_count
             );
         }
-        if edges.num_rows() != self.edges.num_rows() {
+        if edges.num_rows() != self.edge_count {
             bail!(
                 "projected edges table has {} rows but topology expects {}",
                 edges.num_rows(),
-                self.edges.num_rows()
+                self.edge_count
             );
         }
-        self.nodes = nodes;
-        self.edges = edges;
+        self.nodes = strip_topology_columns(nodes, NODE_TOPOLOGY_COLS)?;
+        self.edges = strip_topology_columns(edges, EDGE_TOPOLOGY_COLS)?;
         Ok(())
     }
 
@@ -311,7 +335,7 @@ impl Repo {
     /// Returns the reverse-adjacency CSR, building it on first use.
     fn incoming(&self) -> &IncomingCsr {
         self.incoming
-            .get_or_init(|| build_incoming_csr(self.nodes.num_rows(), &self.edge_endpoints))
+            .get_or_init(|| build_incoming_csr(self.node_count, &self.edge_endpoints))
     }
 
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
@@ -333,7 +357,7 @@ impl Repo {
     fn compute_degrees(&self) -> Vec<usize> {
         let out = &self.csr_offsets;
         let incoming = &self.incoming().offsets;
-        (0..self.nodes.num_rows())
+        (0..self.node_count)
             .map(|i| {
                 let out_deg = (out[i + 1] - out[i]) as usize;
                 let in_deg = (incoming[i + 1] - incoming[i]) as usize;
@@ -349,16 +373,19 @@ impl Repo {
             identity,
             edge_endpoints,
         } = preprocess_graph(&nodes, &edges)?;
+        let node_count = nodes.num_rows();
 
         let Csr {
             offsets: csr_offsets,
             edge_ids,
             dests: csr_dests,
-        } = build_csr(nodes.num_rows(), &edge_endpoints).context("failed to construct CSR")?;
+        } = build_csr(node_count, &edge_endpoints).context("failed to construct CSR")?;
 
         Ok(Self {
-            nodes,
-            edges,
+            nodes: strip_topology_columns(nodes, NODE_TOPOLOGY_COLS)?,
+            edges: strip_topology_columns(edges, EDGE_TOPOLOGY_COLS)?,
+            node_count,
+            edge_count: edge_endpoints.len(),
             csr_offsets,
             csr_dests,
             edge_ids,
@@ -370,6 +397,27 @@ impl Repo {
             degrees: OnceLock::new(),
         })
     }
+}
+
+fn strip_topology_columns(batch: RecordBatch, topology_cols: &[&str]) -> Result<RecordBatch> {
+    let row_count = batch.num_rows();
+    let mut fields = Vec::<FieldRef>::with_capacity(batch.num_columns());
+    let mut columns = Vec::with_capacity(batch.num_columns());
+
+    for (index, field) in batch.schema().fields().iter().enumerate() {
+        if topology_cols.contains(&field.name().as_str()) {
+            continue;
+        }
+        fields.push(field.clone());
+        columns.push(batch.column(index).clone());
+    }
+
+    RecordBatch::try_new_with_options(
+        Schema::new(fields).into(),
+        columns,
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .context("failed to build payload table")
 }
 
 fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
@@ -517,14 +565,14 @@ fn preprocess_str(nodes: &RecordBatch, edges: &RecordBatch) -> Result<Preprocess
             .value(row)
             .with_context(|| format!("nodes row {row} has null id"))?;
         let internal = checked_id(row, "node")?;
-        let id = id.to_owned();
+        let id = Arc::<str>::from(id);
         if node_lookup.insert(id.clone(), internal).is_some() {
             bail!("duplicate node id {id:?}");
         }
         nodes_out.push(id);
     }
 
-    let mut edge_lookup = HashMap::with_capacity(edges.num_rows());
+    let mut edge_lookup = HashSet::with_capacity(edges.num_rows());
     let mut edges_out = Vec::with_capacity(edges.num_rows());
     let mut edge_endpoints = Vec::with_capacity(edges.num_rows());
     for row in 0..edges.num_rows() {
@@ -537,7 +585,8 @@ fn preprocess_str(nodes: &RecordBatch, edges: &RecordBatch) -> Result<Preprocess
         let dest_external = edge_dests
             .value(row)
             .with_context(|| format!("edges row {row} has null dest"))?;
-        if edge_lookup.insert(id.to_owned(), ()).is_some() {
+        let id = Arc::<str>::from(id);
+        if !edge_lookup.insert(id.clone()) {
             bail!("duplicate edge id {id:?}");
         }
         let src = *node_lookup
@@ -547,7 +596,7 @@ fn preprocess_str(nodes: &RecordBatch, edges: &RecordBatch) -> Result<Preprocess
             .get(dest_external)
             .with_context(|| format!("edge row {row} references missing dest {dest_external:?}"))?;
         checked_id(row, "edge")?;
-        edges_out.push(id.to_owned());
+        edges_out.push(id);
         edge_endpoints.push((src, dest));
     }
 
@@ -796,6 +845,10 @@ mod tests {
 
         // Topology is unchanged after the swap.
         assert_eq!(outgoing_for(&repo, GraphId::U64(0)), vec![GraphId::U64(1)]);
+        assert!(repo.nodes.column_by_name(ID_COL).is_none());
+        assert!(repo.edges.column_by_name(ID_COL).is_none());
+        assert!(repo.edges.column_by_name(EDGE_SRC_COL).is_none());
+        assert!(repo.edges.column_by_name(EDGE_DEST_COL).is_none());
         assert!(repo.nodes.column_by_name("score").is_some());
     }
 

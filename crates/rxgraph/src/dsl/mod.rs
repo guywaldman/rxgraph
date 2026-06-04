@@ -208,6 +208,35 @@ mod tests {
     }
 
     #[test]
+    fn reserved_topology_fields_read_from_identity() {
+        let kernel = DslKernel::new(
+            DslExpr::src("id")
+                .eq(DslExpr::string_lit("a"))
+                .and(DslExpr::edge("src").eq(DslExpr::string_lit("a")))
+                .and(DslExpr::edge("dest").eq(DslExpr::string_lit("b"))),
+            std::iter::empty::<(String, DslExpr)>(),
+            DslExpr::dest("id")
+                .eq(DslExpr::string_lit("b"))
+                .and(DslExpr::edge("id").eq(DslExpr::string_lit("ab"))),
+            std::iter::empty::<(String, Value)>(),
+        );
+
+        let graph = string_graph();
+        let result = graph
+            .search(
+                TraversalConfigBuilder::new(kernel)
+                    .with_start_nodes(["a"])
+                    .with_strategy(TraversalStrategy::BreadthFirst)
+                    .with_parallelism(false)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(result.paths[0].edges, vec![GraphId::Str("ab")]);
+    }
+
+    #[test]
     fn u64_id_columns_and_mask_if_any_work() {
         let graph = Graph::new(
             record_batch!((ID_COL, UInt64, [1, 2, 3])).unwrap(),
