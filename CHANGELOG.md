@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/guywaldman/rxgraph/compare/v0.3.1...v0.4.0) (2026-06-05)
+
+
+### Features
+
+* add support for list argmin/argmax ops ([8841fae](https://github.com/guywaldman/rxgraph/commit/8841fae50e2cab41833d4d6f26d72bf0c203d835))
+
 ## [0.3.1](https://github.com/guywaldman/rxgraph/compare/v0.3.0...v0.3.1) (2026-06-04)
 
 
