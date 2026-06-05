@@ -238,6 +238,8 @@ fn parse_list_function(value: &Json, inputs: &[Json]) -> Result<Expr<ColumnRef>>
         Some("Sum") => ListOp::Sum,
         Some("Min") => ListOp::Min,
         Some("Max") => ListOp::Max,
+        Some("ArgMin") => ListOp::ArgMin,
+        Some("ArgMax") => ListOp::ArgMax,
         Some("Mean") => ListOp::Mean,
         Some("Median") => ListOp::Median,
         Some("Reverse") => ListOp::Reverse,

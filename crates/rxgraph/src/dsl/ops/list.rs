@@ -33,6 +33,8 @@ pub(crate) enum ListOp {
     Sum,
     Min,
     Max,
+    ArgMin,
+    ArgMax,
     Mean,
     Median,
     Any {
@@ -89,6 +91,8 @@ impl ListOp {
             Self::Sum => aggregate_sum(args)?,
             Self::Min => aggregate_order(args, Ordering::Less)?,
             Self::Max => aggregate_order(args, Ordering::Greater)?,
+            Self::ArgMin => aggregate_arg_order(args, Ordering::Less)?,
+            Self::ArgMax => aggregate_arg_order(args, Ordering::Greater)?,
             Self::Mean => aggregate_mean(args)?,
             Self::Median => aggregate_median(args)?,
             Self::Any { ignore_nulls } => aggregate_bool(args, *ignore_nulls, true)?,
@@ -348,6 +352,24 @@ fn aggregate_order(args: &[Value], preferred: Ordering) -> Result<Value> {
         }
     }
     Ok(out.cloned().unwrap_or(Value::Null))
+}
+
+fn aggregate_arg_order(args: &[Value], preferred: Ordering) -> Result<Value> {
+    let Some(values) = list_arg(args, 0)? else {
+        return Ok(Value::Null);
+    };
+    let mut best: Option<(usize, &Value)> = None;
+    for (index, value) in values
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| !value.is_null())
+    {
+        if best.is_none_or(|(_, current)| value.compare(current).is_ok_and(|ord| ord == preferred))
+        {
+            best = Some((index, value));
+        }
+    }
+    Ok(best.map_or(Value::Null, |(index, _)| Value::U64(index as u64)))
 }
 
 fn aggregate_mean(args: &[Value]) -> Result<Value> {

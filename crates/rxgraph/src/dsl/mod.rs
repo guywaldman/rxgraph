@@ -525,6 +525,58 @@ mod tests {
     }
 
     #[test]
+    fn list_arg_min_and_arg_max_return_first_extreme_index() {
+        use crate::dsl::ops::list::ListOp;
+
+        // Ties resolve to the first occurrence, and nulls are ignored.
+        let values = Value::List(vec![
+            Value::I64(3),
+            Value::Null,
+            Value::I64(1),
+            Value::I64(3),
+        ]);
+        assert_eq!(
+            ListOp::ArgMax.eval(std::slice::from_ref(&values)).unwrap(),
+            Value::U64(0)
+        );
+        assert_eq!(
+            ListOp::ArgMin.eval(std::slice::from_ref(&values)).unwrap(),
+            Value::U64(2)
+        );
+
+        // Leading null shifts the reported index but doesn't change it.
+        let leading_null = Value::List(vec![Value::Null, Value::I64(5), Value::I64(2)]);
+        assert_eq!(
+            ListOp::ArgMax
+                .eval(std::slice::from_ref(&leading_null))
+                .unwrap(),
+            Value::U64(1)
+        );
+        assert_eq!(
+            ListOp::ArgMin
+                .eval(std::slice::from_ref(&leading_null))
+                .unwrap(),
+            Value::U64(2)
+        );
+
+        // Empty, all-null, and null lists collapse to null.
+        for empty in [
+            Value::List(vec![]),
+            Value::List(vec![Value::Null, Value::Null]),
+            Value::Null,
+        ] {
+            assert_eq!(
+                ListOp::ArgMax.eval(std::slice::from_ref(&empty)).unwrap(),
+                Value::Null
+            );
+            assert_eq!(
+                ListOp::ArgMin.eval(std::slice::from_ref(&empty)).unwrap(),
+                Value::Null
+            );
+        }
+    }
+
+    #[test]
     fn struct_ops_handle_runtime_values() {
         use crate::dsl::ops::struct_::StructOp;
 
@@ -558,6 +610,8 @@ mod tests {
     fn polars_json_parser_accepts_list_and_struct_shapes() {
         for json in [
             r#"{"Function":{"input":[{"Column":"state.x"}],"function":{"ListExpr":"Length"}}}"#,
+            r#"{"Function":{"input":[{"Column":"state.x"}],"function":{"ListExpr":"ArgMax"}}}"#,
+            r#"{"Function":{"input":[{"Column":"state.x"}],"function":{"ListExpr":"ArgMin"}}}"#,
             r#"{"Function":{"input":[{"Column":"state.x"},{"Literal":{"Dyn":{"Int":2}}}],"function":{"ListExpr":{"Contains":{"nulls_equal":true}}}}}"#,
             r#"{"Eval":{"expr":{"Column":"state.x"},"evaluation":{"BinaryExpr":{"left":"Element","op":"Plus","right":{"Literal":{"Dyn":{"Int":1}}}}},"variant":"List"}}"#,
             r#"{"Eval":{"expr":{"Column":"state.x"},"evaluation":{"Filter":{"input":{"Column":""},"by":{"BinaryExpr":{"left":"Element","op":"Gt","right":{"Literal":{"Dyn":{"Int":1}}}}}}},"variant":"List"}}"#,
