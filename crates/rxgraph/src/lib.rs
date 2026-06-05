@@ -26,12 +26,17 @@
 
 mod arrow;
 pub mod dsl;
+pub mod examples;
 pub mod graph;
 pub mod traversal;
 
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
-    GraphPath, SearchResult, SearchStats, TraversalConfig, TraversalConfigBuilder,
-    TraversalStrategy,
+    BoxedRun, EdgeCtx, GraphPath, Kernel, KernelEntry, RunKernel, RunOptions, SearchResult,
+    SearchStats, TraversalConfig, TraversalConfigBuilder, TraversalStrategy, boxed_run,
+    build_kernel, register_kernel,
 };
+
+// Re-exported so plugin crates can register kernels without their own dependency.
+pub use traversal::inventory;

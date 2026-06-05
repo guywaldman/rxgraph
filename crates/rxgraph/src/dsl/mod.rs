@@ -10,7 +10,7 @@
 //! Prefer the method-based [`DslExpr`] API in Rust. [`DslKernel::from_polars_json`]
 //! exists for callers that already have Polars expression JSON.
 
-mod arrow_value;
+pub(crate) mod arrow_value;
 pub(crate) mod bind;
 pub(crate) mod eval;
 mod expr;
@@ -28,9 +28,6 @@ use expr::{ColumnRef, Expr};
 pub use value::{Scalar, Value};
 
 use crate::graph::Graph;
-
-pub(crate) use bind::BoundKernel;
-pub(crate) use eval::EvalCtx;
 
 /// A traversal predicate/state kernel.
 ///

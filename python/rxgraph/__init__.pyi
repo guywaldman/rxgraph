@@ -63,13 +63,32 @@ class Graph:
         next_state: Mapping[str, Expr | str] | None = None,
         stop: Expr | str | None = None,
         initial_state: Mapping[str, Any] | None = None,
+        kernel: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        columns: Iterable[str] | None = None,
         max_depth: int | None = None,
         max_paths: int | None = None,
         strategy: Literal["dfs", "bfs"] = "dfs",
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
         progress: bool = False,
-    ) -> SearchResult: ...
+    ) -> SearchResult:
+        """Run a stateful traversal.
+
+        Two mutually exclusive modes:
+
+        * DSL: ``visit``/``next_state``/``stop``/``initial_state`` Polars expressions.
+        * Named native kernel: ``kernel`` (registered Rust kernel name) and ``params``.
+          The DSL args must not be set in this mode.
+
+        ``params`` node-label values under the conventional keys
+        ``target``/``source``/``start``/``node`` are translated to engine IDs when
+        the value is a known node label; other values pass through unchanged.
+
+        ``columns`` lists payload columns to load for a lazy graph before a named
+        kernel runs (required for lazy graphs, ignored for eager graphs).
+        """
+        ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
         ...

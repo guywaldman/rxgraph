@@ -16,3 +16,4 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-arrow.workspace = true
 rayon.workspace = true
 rxgraph.workspace = true
+serde_json.workspace = true

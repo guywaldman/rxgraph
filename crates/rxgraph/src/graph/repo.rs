@@ -271,6 +271,16 @@ impl Repo {
         Ok(())
     }
 
+    /// Node payload batch (topology columns stripped). Row index equals internal node ID.
+    pub(crate) fn node_batch(&self) -> &RecordBatch {
+        &self.nodes
+    }
+
+    /// Edge payload batch (topology columns stripped). Row index equals internal edge ID.
+    pub(crate) fn edge_batch(&self) -> &RecordBatch {
+        &self.edges
+    }
+
     pub(crate) fn internal_node_u64(&self, external: u64) -> Option<NodeId> {
         self.identity.internal_node_u64(external)
     }

@@ -32,17 +32,6 @@ impl<'a> EvalCtx<'a> {
         }
     }
 
-    pub(crate) fn with_state<'b>(&'b self, state: &'b [StateValue]) -> EvalCtx<'b> {
-        EvalCtx {
-            graph: self.graph,
-            src: self.src,
-            dest: self.dest,
-            edge: self.edge,
-            state,
-            element: self.element,
-        }
-    }
-
     pub(crate) fn with_element<'b>(&'b self, element: &'b Value) -> EvalCtx<'b> {
         EvalCtx {
             graph: self.graph,

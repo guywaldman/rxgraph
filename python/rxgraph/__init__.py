@@ -184,6 +184,9 @@ class Graph:
         next_state: Mapping[str, Any] | None = None,
         stop: Any | None = None,
         initial_state: Mapping[str, Any] | None = None,
+        kernel: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        columns: Iterable[str] | None = None,
         max_depth: int | None = None,
         max_paths: int | None = None,
         strategy: str = "dfs",
@@ -193,14 +196,29 @@ class Graph:
     ) -> "SearchResult":
         """Run a stateful traversal.
 
-        API is similar to ``Graph.search``.
+        Two mutually exclusive modes are supported:
 
+        * **DSL** (default): pass ``visit``/``next_state``/``stop``/``initial_state``
+          as Polars expressions.
+        * **Named native kernel**: pass ``kernel`` (the name of a registered Rust
+          kernel, e.g. ``"weighted_budget"``) and ``params``. In this mode the DSL
+          args (``visit``/``next_state``/``stop``/``initial_state``) must not be
+          provided.
 
-
-        :param visit: Predicate per candidate edge. Defaults to true (accepting every edge).
-        :param next_state: Returns the next state, with each field in the dict being a Polars expression. Evaluated after each accepted edge.
-        :param stop: Polars expression which is evaluated per node, and if it returns true, means to stop traversing and "bail out" on that node.
-        :param initial_state: Dict with each field value (scalar/list/struct) being a Polars expression, representing the starting state values
+        :param visit: (DSL) Predicate per candidate edge. Defaults to true (accepting every edge).
+        :param next_state: (DSL) Returns the next state, with each field in the dict being a Polars expression. Evaluated after each accepted edge.
+        :param stop: (DSL) Polars expression which is evaluated per node, and if it returns true, means to stop traversing and "bail out" on that node.
+        :param initial_state: (DSL) Dict with each field value (scalar/list/struct) being a Polars expression, representing the starting state values
+        :param kernel: Name of a registered native Rust kernel to run instead of the DSL.
+        :param params: Runtime parameters for the named kernel. Node-label-valued
+            params under the conventional keys ``target``/``source``/``start``/``node``
+            are translated to engine IDs when their value is a known node label;
+            all other values pass through unchanged (so raw engine IDs also work).
+        :param columns: (named kernel, lazy graphs only) Payload columns to load
+            before the search. Required for lazy graphs since native kernels cannot
+            be introspected for column references; ignored for eager graphs. Pass a
+            sequence of edge/node payload column names the kernel reads. To load all
+            columns, project them yourself via ``from_lazy`` or build an eager graph.
         :param max_depth: Maximum accepted-edge depth per path.
         :param max_paths: Stop the search once this many paths have been returned.
         :param strategy: ``"dfs"`` or ``"bfs"``.
@@ -214,16 +232,34 @@ class Graph:
         >>> result.paths[0].nodes
         ['a', 'b']
         """
+        if kernel is not None:
+            return self._search_named(
+                name=kernel,
+                params=params,
+                columns=columns,
+                start_nodes=start_nodes,
+                visit=visit,
+                next_state=next_state,
+                stop=stop,
+                initial_state=initial_state,
+                max_depth=max_depth,
+                max_paths=max_paths,
+                strategy=strategy,
+                parallel=parallel,
+                intermediate_states=intermediate_states,
+                progress=progress,
+            )
+
         stop = _default_stop(stop, max_paths)
-        kernel = Kernel(
+        kernel_obj = Kernel(
             visit,
             next_state,
             stop,
             initial_state,
         )
-        self._ensure_payloads(kernel)
+        self._ensure_payloads(kernel_obj)
         traversal = Traversal(
-            kernel,
+            kernel_obj,
             list(start_nodes),
             max_depth,
             max_paths,
@@ -237,6 +273,106 @@ class Graph:
         return SearchResult._from_inner(
             inner, self._id_to_label, self._edge_id_to_label
         )
+
+    # Conventional param keys whose values may be node labels needing translation.
+    _NODE_PARAM_KEYS = frozenset({"target", "source", "start", "node"})
+
+    def _search_named(
+        self,
+        *,
+        name: str,
+        params: Mapping[str, Any] | None,
+        columns: Iterable[str] | None,
+        start_nodes: Iterable[Hashable],
+        visit: Any | None,
+        next_state: Mapping[str, Any] | None,
+        stop: Any | None,
+        initial_state: Mapping[str, Any] | None,
+        max_depth: int | None,
+        max_paths: int | None,
+        strategy: str,
+        parallel: bool | str,
+        intermediate_states: bool,
+        progress: bool,
+    ) -> "SearchResult":
+        if any(arg is not None for arg in (visit, next_state, stop, initial_state)):
+            raise ValueError(
+                "use either the DSL (visit/next_state/stop/initial_state) "
+                "or a named kernel, not both"
+            )
+
+        translated_params = self._translate_params(params or {})
+        self._ensure_payload_columns(columns)
+        start_node_ids = [self.node_id(node) for node in start_nodes]
+
+        inner = self._inner.search_kernel(
+            name,
+            translated_params,
+            start_node_ids,
+            max_depth,
+            max_paths,
+            strategy,
+            _parallel_bool(parallel),
+            intermediate_states,
+            progress,
+        )
+        return SearchResult._from_inner(
+            inner, self._id_to_label, self._edge_id_to_label
+        )
+
+    def _translate_params(self, params: Mapping[str, Any]) -> dict[str, Any]:
+        """Translate node-label-valued params to engine IDs.
+
+        Only the conventional keys in :attr:`_NODE_PARAM_KEYS` are considered, and
+        only when the value is a known node label; everything else passes through
+        unchanged (so raw engine IDs work too).
+        """
+        if self._label_to_id is None:
+            return dict(params)
+        translated: dict[str, Any] = {}
+        for key, value in params.items():
+            if (
+                key in self._NODE_PARAM_KEYS
+                and isinstance(value, Hashable)
+                and value in self._label_to_id
+            ):
+                translated[key] = self._label_to_id[value]
+            else:
+                translated[key] = value
+        return translated
+
+    def _ensure_payload_columns(self, columns: Iterable[str] | None) -> None:
+        """Project explicit payload columns for a lazy graph's named-kernel search.
+
+        Native kernels can't be introspected for column references like the DSL is,
+        so the caller must declare which payload columns to load via ``columns``.
+        No-op for eager graphs (all payloads are already present).
+        """
+        if self._lazy_nodes is None or self._lazy_edges is None:
+            return
+        if columns is None:
+            raise ValueError(
+                "named-kernel search on a lazy graph requires 'columns=[...]' "
+                "listing the payload columns the kernel reads (lazy graphs do not "
+                "load payloads until requested). Alternatively build an eager graph."
+            )
+
+        wanted = frozenset(columns)
+        # The lazy frames carry both node and edge payloads under their own schemas;
+        # project the requested columns from each, intersected with what each frame has.
+        node_schema = set(self._lazy_nodes.collect_schema().names())
+        edge_schema = set(self._lazy_edges.collect_schema().names())
+        node_cols = frozenset(c for c in wanted if c in node_schema)
+        edge_cols = frozenset(c for c in wanted if c in edge_schema)
+
+        if node_cols == self._loaded_node_cols and edge_cols == self._loaded_edge_cols:
+            return
+
+        nodes = self._lazy_nodes.select(_payload_projection(node_cols)).collect()
+        edges = self._lazy_edges.select(_payload_projection(edge_cols)).collect()
+        self._inner.set_payloads(nodes, edges)
+        self._loaded_node_cols = node_cols
+        self._loaded_edge_cols = edge_cols
 
     def _ensure_payloads(self, kernel: Kernel) -> None:
         """Project and "install" the payload columns a lazy graph's kernel references.

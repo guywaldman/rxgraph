@@ -7,11 +7,11 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::{
-    dsl::{BoundKernel, EvalCtx, StateValues},
     graph::{EdgeId, Graph, GraphRepo, NodeId, OwnedGraphId},
     traversal::{
-        GraphPath, SearchResult, SearchStats,
+        EdgeCtx, GraphPath, Kernel, SearchResult, SearchStats,
         config::{TraversalConfig, TraversalStrategy},
+        kernel::PayloadCache,
         progress::Progress,
     },
 };
@@ -22,6 +22,47 @@ const DFS_SEEDS_PER_THREAD: usize = 8;
 const MIN_PAR_DFS_PATHS: usize = 64;
 
 type VisitCounts = HashMap<NodeId, usize>;
+
+/// Execution knobs for a native [`Kernel`] search.
+///
+/// This carries everything needed to drive a search except the kernel itself.
+/// The DSL entry point [`Graph::search`] builds one of these from a
+/// [`TraversalConfig`] and delegates to [`Graph::search_with`].
+#[derive(Debug, Clone)]
+pub struct RunOptions {
+    /// External node IDs where traversal starts.
+    pub start_nodes: Vec<OwnedGraphId>,
+    /// Maximum accepted-edge depth. `None` means unbounded.
+    pub max_depth: Option<usize>,
+    /// Maximum returned path count. Treated as a soft early-stop limit under
+    /// parallel traversal; the returned vector is truncated exactly.
+    pub max_paths: Option<usize>,
+    /// Search order.
+    pub strategy: TraversalStrategy,
+    /// Maximum revisits allowed per node inside one path.
+    pub max_revisits_per_node: usize,
+    /// Whether Rayon-backed parallel traversal is enabled.
+    pub parallel: bool,
+    /// Whether returned paths include per-node state history.
+    pub intermediate_states: bool,
+    /// Whether to report search progress on stderr.
+    pub progress: bool,
+}
+
+impl Default for RunOptions {
+    fn default() -> Self {
+        Self {
+            start_nodes: Vec::new(),
+            max_depth: None,
+            max_paths: None,
+            strategy: TraversalStrategy::default(),
+            max_revisits_per_node: 0,
+            parallel: true,
+            intermediate_states: false,
+            progress: false,
+        }
+    }
+}
 
 impl Graph {
     /// Runs a configured DSL traversal and materializes matching paths.
@@ -42,14 +83,41 @@ impl Graph {
             progress,
         } = config;
         let kernel = kernel.bind(self)?;
-        let cfg = RunConfig {
+        let run = RunOptions {
             start_nodes,
-            max_depth: max_depth.unwrap_or(usize::MAX),
+            max_depth,
             max_paths,
             strategy,
             max_revisits_per_node,
+            parallel,
             intermediate_states,
             progress,
+        };
+        self.search_with(kernel, run)
+    }
+
+    /// Runs a native [`Kernel`] traversal and materializes matching paths.
+    ///
+    /// The engine is monomorphized over `K`, so per-edge kernel calls are
+    /// statically dispatched.
+    pub fn search_with<K: Kernel + Sync>(
+        &self,
+        kernel: K,
+        run: RunOptions,
+    ) -> Result<SearchResult<'_>>
+    where
+        K::State: Send + Sync + Clone,
+    {
+        let strategy = run.strategy;
+        let parallel = run.parallel;
+        let cfg = RunConfig {
+            start_nodes: run.start_nodes,
+            max_depth: run.max_depth.unwrap_or(usize::MAX),
+            max_paths: run.max_paths,
+            strategy,
+            max_revisits_per_node: run.max_revisits_per_node,
+            intermediate_states: run.intermediate_states,
+            progress: run.progress,
         };
 
         match (parallel, strategy) {
@@ -74,38 +142,38 @@ struct RunConfig {
 }
 
 #[derive(Debug, Clone)]
-struct PathEntry {
+struct PathEntry<S> {
     node: NodeId,
     incoming_edge: Option<EdgeId>,
     parent: Option<usize>,
     depth: usize,
-    state: StateValues,
+    state: S,
 }
 
 /// One node in a local DFS path arena.
 #[derive(Debug, Clone)]
-struct PathTask {
+struct PathTask<S> {
     node: NodeId,
     incoming_edge: Option<EdgeId>,
     /// Index into the arena of the parent task, if there is such.
     parent: Option<usize>,
     depth: usize,
-    state: StateValues,
+    state: S,
 }
 
 /// Independent DFS subtree work item.
 /// Carries its own arena so parent links stay valid.
 /// Important specifically for parallel DFS to avoid synchronization on
 /// a shared arena and frontier.
-struct DfsSeed {
-    arena: Vec<PathTask>,
+struct DfsSeed<S> {
+    arena: Vec<PathTask<S>>,
     task: usize,
 }
 
-struct EdgeEval {
+struct EdgeEval<S> {
     edge: EdgeId,
     dest: NodeId,
-    state: StateValues,
+    state: S,
     stop: bool,
 }
 
@@ -114,14 +182,22 @@ struct TaskResult<'a> {
     stats: SearchStats,
 }
 
-fn search_serial<'a>(
+/// Initialized BFS/serial arena: nodes, the work frontier, and seed stats.
+type InitArena<S> = (Vec<PathEntry<S>>, VecDeque<usize>, SearchStats);
+
+/// Accepted edges keyed by parent arena index, plus stats for the evaluated batch.
+type FrontierEdges<S> = (Vec<(usize, EdgeEval<S>)>, SearchStats);
+
+fn search_serial<'a, K: Kernel>(
     graph: &'a Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
+    kernel: &K,
 ) -> Result<SearchResult<'a>> {
     let (mut arena, mut frontier, mut stats) = initial_arena(graph, cfg, kernel)?;
     let mut paths = Vec::new();
     let mut progress = Progress::new(cfg.progress);
+    // One cache for the whole serial run: readers are bound once and reused.
+    let cache = PayloadCache::new();
 
     while let Some(parent) = pop(&mut frontier, cfg.strategy) {
         progress.tick(&stats);
@@ -142,6 +218,7 @@ fn search_serial<'a>(
                 kernel,
                 &mut stats,
                 visit_counts.as_ref(),
+                &cache,
             )?
             else {
                 continue;
@@ -170,11 +247,14 @@ fn search_serial<'a>(
     Ok(SearchResult { paths, stats })
 }
 
-fn search_bfs_parallel<'a>(
+fn search_bfs_parallel<'a, K: Kernel + Sync>(
     graph: &'a Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<SearchResult<'a>> {
+    kernel: &K,
+) -> Result<SearchResult<'a>>
+where
+    K::State: Send + Sync + Clone,
+{
     let (mut arena, frontier, mut stats) = initial_arena(graph, cfg, kernel)?;
     let mut frontier = frontier.into_iter().collect::<Vec<_>>();
     let mut paths = Vec::new();
@@ -222,11 +302,14 @@ fn search_bfs_parallel<'a>(
     Ok(SearchResult { paths, stats })
 }
 
-fn search_dfs_parallel<'a>(
+fn search_dfs_parallel<'a, K: Kernel + Sync>(
     graph: &'a Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<SearchResult<'a>> {
+    kernel: &K,
+) -> Result<SearchResult<'a>>
+where
+    K::State: Send + Sync + Clone,
+{
     let (queue, mut stats) = initial_tasks(graph, cfg, kernel)?;
     let mut seed_paths = Vec::new();
     let mut progress = Progress::new(cfg.progress);
@@ -270,11 +353,11 @@ fn search_dfs_parallel<'a>(
     Ok(SearchResult { paths, stats })
 }
 
-fn initial_arena(
+fn initial_arena<K: Kernel>(
     graph: &Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<(Vec<PathEntry>, VecDeque<usize>, SearchStats)> {
+    kernel: &K,
+) -> Result<InitArena<K::State>> {
     let mut arena = Vec::with_capacity(cfg.start_nodes.len());
     let mut frontier = VecDeque::with_capacity(cfg.start_nodes.len());
     let mut stats = SearchStats::default();
@@ -290,7 +373,7 @@ fn initial_arena(
             incoming_edge: None,
             parent: None,
             depth: 0,
-            state: kernel.initial_state().clone(),
+            state: kernel.initial_state(graph, node),
         });
         stats.start_nodes += 1;
         stats.path_entries += 1;
@@ -299,11 +382,11 @@ fn initial_arena(
     Ok((arena, frontier, stats))
 }
 
-fn initial_tasks(
+fn initial_tasks<K: Kernel>(
     graph: &Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<(VecDeque<DfsSeed>, SearchStats)> {
+    kernel: &K,
+) -> Result<(VecDeque<DfsSeed<K::State>>, SearchStats)> {
     let mut queue = VecDeque::with_capacity(cfg.start_nodes.len());
     let mut stats = SearchStats::default();
 
@@ -318,7 +401,7 @@ fn initial_tasks(
                 incoming_edge: None,
                 parent: None,
                 depth: 0,
-                state: kernel.initial_state().clone(),
+                state: kernel.initial_state(graph, node),
             }],
             task: 0,
         });
@@ -329,42 +412,53 @@ fn initial_tasks(
     Ok((queue, stats))
 }
 
-fn eval_frontier_serial(
+fn eval_frontier_serial<K: Kernel>(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[PathEntry<K::State>],
     frontier: &[usize],
     edge_count: usize,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<(Vec<(usize, EdgeEval)>, SearchStats)> {
+    kernel: &K,
+) -> Result<FrontierEdges<K::State>> {
     let mut edges = Vec::with_capacity(edge_count);
     let mut stats = SearchStats::default();
+    // One cache shared across this serial frontier batch.
+    let cache = PayloadCache::new();
 
     for &parent in frontier {
-        let local = eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges)?;
+        let local = eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges, &cache)?;
         merge_stats(&mut stats, local);
     }
 
     Ok((edges, stats))
 }
 
-fn eval_frontier_parallel(
+fn eval_frontier_parallel<K: Kernel + Sync>(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[PathEntry<K::State>],
     frontier: &[usize],
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-) -> Result<(Vec<(usize, EdgeEval)>, SearchStats)> {
+    kernel: &K,
+) -> Result<FrontierEdges<K::State>>
+where
+    K::State: Send + Sync + Clone,
+{
+    // Each fold accumulator owns its own `PayloadCache`, so the cache is never
+    // shared across rayon threads and the interior `RefCell`s stay
+    // single-threaded. The cache is dropped when the fold reduces to its
+    // `(edges, stats)` pair.
     frontier
         .par_iter()
         .try_fold(
-            || (Vec::new(), SearchStats::default()),
-            |(mut edges, mut stats), &parent| {
-                let local = eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges)?;
+            || (Vec::new(), SearchStats::default(), PayloadCache::new()),
+            |(mut edges, mut stats, cache), &parent| {
+                let local =
+                    eval_parent_into(graph, arena, parent, cfg, kernel, &mut edges, &cache)?;
                 merge_stats(&mut stats, local);
-                Ok((edges, stats))
+                Ok((edges, stats, cache))
             },
         )
+        .map(|fold| fold.map(|(edges, stats, _cache)| (edges, stats)))
         .try_reduce(
             || (Vec::new(), SearchStats::default()),
             |(mut left_edges, mut left_stats), (right_edges, right_stats)| {
@@ -375,13 +469,14 @@ fn eval_frontier_parallel(
         )
 }
 
-fn eval_parent_into(
+fn eval_parent_into<K: Kernel>(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[PathEntry<K::State>],
     parent: usize,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-    out: &mut Vec<(usize, EdgeEval)>,
+    kernel: &K,
+    out: &mut Vec<(usize, EdgeEval<K::State>)>,
+    cache: &PayloadCache,
 ) -> Result<SearchStats> {
     let mut stats = SearchStats::default();
 
@@ -400,6 +495,7 @@ fn eval_parent_into(
                 kernel,
                 &mut stats,
                 visit_counts.as_ref(),
+                cache,
             )? {
                 out.push((parent, edge));
             }
@@ -410,31 +506,39 @@ fn eval_parent_into(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_arena_edge(
+fn eval_arena_edge<K: Kernel>(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[PathEntry<K::State>],
     parent: usize,
     edge: EdgeId,
     dest: NodeId,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
+    kernel: &K,
     stats: &mut SearchStats,
     visit_counts: Option<&VisitCounts>,
-) -> Result<Option<EdgeEval>> {
+    cache: &PayloadCache,
+) -> Result<Option<EdgeEval<K::State>>> {
     if !can_visit_arena(arena, parent, dest, cfg.max_revisits_per_node, visit_counts) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
 
     stats.evaluated_edges += 1;
-    let ctx = EvalCtx::new(graph, arena[parent].node, dest, edge, &arena[parent].state);
-    if !kernel.visit(&ctx)? {
+    let cx = EdgeCtx::new(
+        graph,
+        arena[parent].node,
+        dest,
+        edge,
+        &arena[parent].state,
+        cache,
+    );
+    if !kernel.visit(&cx)? {
         stats.rejected_edges += 1;
         return Ok(None);
     }
 
-    let state = kernel.next_state(&arena[parent].state, &ctx)?;
-    let stop = kernel.stop(&ctx.with_state(&state))?;
+    let state = kernel.next_state(&cx)?;
+    let stop = kernel.stop(&cx.with_state(&state))?;
     Ok(Some(EdgeEval {
         edge,
         dest,
@@ -443,7 +547,7 @@ fn eval_arena_edge(
     }))
 }
 
-fn push_entry(arena: &mut Vec<PathEntry>, parent: usize, edge: EdgeEval) -> usize {
+fn push_entry<S>(arena: &mut Vec<PathEntry<S>>, parent: usize, edge: EdgeEval<S>) -> usize {
     let child = arena.len();
     arena.push(PathEntry {
         node: edge.dest,
@@ -455,15 +559,17 @@ fn push_entry(arena: &mut Vec<PathEntry>, parent: usize, edge: EdgeEval) -> usiz
     child
 }
 
-fn build_dfs_seeds<'a>(
+fn build_dfs_seeds<'a, K: Kernel>(
     graph: &'a Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-    mut queue: VecDeque<DfsSeed>,
+    kernel: &K,
+    mut queue: VecDeque<DfsSeed<K::State>>,
     paths: &mut Vec<GraphPath<'a>>,
     stats: &mut SearchStats,
-) -> Result<Vec<DfsSeed>> {
+) -> Result<Vec<DfsSeed<K::State>>> {
     let target = rayon::current_num_threads() * DFS_SEEDS_PER_THREAD;
+    // Seed building runs single-threaded, so one cache suffices here.
+    let cache = PayloadCache::new();
 
     while queue.len() < target {
         if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
@@ -478,7 +584,7 @@ fn build_dfs_seeds<'a>(
             continue;
         }
 
-        let children = expand_task(graph, cfg, kernel, &arena, task, stats)?;
+        let children = expand_task(graph, cfg, kernel, &arena, task, stats, &cache)?;
         for (child, stop) in children {
             let child = push_task(&mut arena, task, child);
             if stop {
@@ -496,17 +602,20 @@ fn build_dfs_seeds<'a>(
     Ok(queue.into())
 }
 
-fn dfs_seed<'a>(
+fn dfs_seed<'a, K: Kernel>(
     graph: &'a Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-    seed: DfsSeed,
+    kernel: &K,
+    seed: DfsSeed<K::State>,
     found: &AtomicUsize,
 ) -> Result<TaskResult<'a>> {
     let mut arena = seed.arena;
     let mut stack = vec![seed.task];
     let mut paths = Vec::new();
     let mut stats = SearchStats::default();
+    // One cache per seed: each seed runs on a single thread, so the cache is
+    // never shared and `RefCell` stays valid.
+    let cache = PayloadCache::new();
 
     while let Some(task) = stack.pop() {
         if cfg
@@ -517,7 +626,7 @@ fn dfs_seed<'a>(
             continue;
         }
 
-        let children = expand_task(graph, cfg, kernel, &arena, task, &mut stats)?;
+        let children = expand_task(graph, cfg, kernel, &arena, task, &mut stats, &cache)?;
         for (child, stop) in children {
             let child = push_task(&mut arena, task, child);
             if stop {
@@ -535,14 +644,15 @@ fn dfs_seed<'a>(
     Ok(TaskResult { paths, stats })
 }
 
-fn expand_task(
+fn expand_task<K: Kernel>(
     graph: &Graph,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
-    arena: &[PathTask],
+    kernel: &K,
+    arena: &[PathTask<K::State>],
     task: usize,
     stats: &mut SearchStats,
-) -> Result<Vec<(EdgeEval, bool)>> {
+    cache: &PayloadCache,
+) -> Result<Vec<(EdgeEval<K::State>, bool)>> {
     let (edge_ids, dests) = graph.repo.outgoing_slice(arena[task].node);
     let mut children = Vec::with_capacity(edge_ids.len());
     let visit_counts = visit_counts_task(arena, task, edge_ids.len());
@@ -559,14 +669,21 @@ fn expand_task(
         }
 
         stats.evaluated_edges += 1;
-        let ctx = EvalCtx::new(graph, arena[task].node, dest, edge, &arena[task].state);
-        if !kernel.visit(&ctx)? {
+        let cx = EdgeCtx::new(
+            graph,
+            arena[task].node,
+            dest,
+            edge,
+            &arena[task].state,
+            cache,
+        );
+        if !kernel.visit(&cx)? {
             stats.rejected_edges += 1;
             continue;
         }
 
-        let state = kernel.next_state(&arena[task].state, &ctx)?;
-        let stop = kernel.stop(&ctx.with_state(&state))?;
+        let state = kernel.next_state(&cx)?;
+        let stop = kernel.stop(&cx.with_state(&state))?;
         stats.accepted_edges += 1;
         stats.path_entries += 1;
         stats.max_depth = stats.max_depth.max(arena[task].depth + 1);
@@ -583,7 +700,7 @@ fn expand_task(
     Ok(children)
 }
 
-fn push_task(arena: &mut Vec<PathTask>, parent: usize, edge: EdgeEval) -> usize {
+fn push_task<S>(arena: &mut Vec<PathTask<S>>, parent: usize, edge: EdgeEval<S>) -> usize {
     let child = arena.len();
     arena.push(PathTask {
         node: edge.dest,
@@ -596,7 +713,7 @@ fn push_task(arena: &mut Vec<PathTask>, parent: usize, edge: EdgeEval) -> usize 
 }
 
 /// Copies one path chain into a new arena so the resulting seed has valid parent indexes.
-fn standalone_seed(arena: &[PathTask], mut path: usize) -> DfsSeed {
+fn standalone_seed<S: Clone>(arena: &[PathTask<S>], mut path: usize) -> DfsSeed<S> {
     let mut chain = Vec::with_capacity(arena[path].depth + 1);
     loop {
         chain.push(path);
@@ -635,8 +752,8 @@ fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
         && cfg.start_nodes.len() >= rayon::current_num_threads()
 }
 
-fn visit_counts_arena(
-    arena: &[PathEntry],
+fn visit_counts_arena<S>(
+    arena: &[PathEntry<S>],
     mut path: usize,
     edge_count: usize,
 ) -> Option<VisitCounts> {
@@ -654,8 +771,8 @@ fn visit_counts_arena(
     }
 }
 
-fn visit_counts_task(
-    arena: &[PathTask],
+fn visit_counts_task<S>(
+    arena: &[PathTask<S>],
     mut path: usize,
     edge_count: usize,
 ) -> Option<VisitCounts> {
@@ -673,8 +790,8 @@ fn visit_counts_task(
     }
 }
 
-fn can_visit_arena(
-    arena: &[PathEntry],
+fn can_visit_arena<S>(
+    arena: &[PathEntry<S>],
     mut path: usize,
     node: NodeId,
     max_revisits: usize,
@@ -699,8 +816,8 @@ fn can_visit_arena(
     }
 }
 
-fn can_visit_task(
-    arena: &[PathTask],
+fn can_visit_task<S>(
+    arena: &[PathTask<S>],
     mut path: usize,
     node: NodeId,
     max_revisits: usize,
@@ -732,12 +849,12 @@ fn pop(frontier: &mut VecDeque<usize>, strategy: TraversalStrategy) -> Option<us
     }
 }
 
-fn materialize<'a>(
+fn materialize<'a, K: Kernel>(
     graph: &'a Graph,
-    arena: &[PathEntry],
+    arena: &[PathEntry<K::State>],
     mut path: usize,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
+    kernel: &K,
 ) -> Result<GraphPath<'a>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
@@ -783,12 +900,12 @@ fn materialize<'a>(
     })
 }
 
-fn materialize_task<'a>(
+fn materialize_task<'a, K: Kernel>(
     graph: &'a Graph,
-    arena: &[PathTask],
+    arena: &[PathTask<K::State>],
     mut path: usize,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
+    kernel: &K,
 ) -> Result<GraphPath<'a>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
