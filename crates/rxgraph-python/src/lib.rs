@@ -15,6 +15,7 @@ use std::thread;
 
 #[pymodule]
 fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    link_kernel_plugins();
     initialize_rayon_pool();
 
     m.add_class::<PyGraph>()?;
@@ -26,6 +27,14 @@ fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rayon_thread_count, m)?)?;
     Ok(())
 }
+
+#[cfg(feature = "kernel-plugin-example")]
+fn link_kernel_plugins() {
+    rxgraph_kernel_example::link();
+}
+
+#[cfg(not(feature = "kernel-plugin-example"))]
+fn link_kernel_plugins() {}
 
 fn initialize_rayon_pool() {
     let threads = thread::available_parallelism().map_or(1, usize::from);

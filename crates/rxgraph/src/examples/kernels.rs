@@ -73,7 +73,7 @@ impl Kernel for WeightedBudget {
 
 impl WeightedBudget {
     /// Builds a [`WeightedBudget`] from JSON params.
-    /// 
+    ///
     /// Accepts something like:
     /// ```json
     /// { "weight_col": "cost", "budget": 10, "target": 3 }

@@ -1,25 +1,13 @@
 //! Example native traversal kernel for `rxgraph`.
 //!
-//! This crate shows the **static plugin path** (Model A): you write a Rust crate
-//! that depends on `rxgraph`, implement the [`rxgraph::Kernel`] trait, and
-//! register it under a name with `inventory::submit!`. Because your kernel is
-//! compiled together with the engine, every per-edge call is statically
-//! dispatched - there is no per-edge virtual dispatch.
-//!
-//! Once registered, the kernel is reachable by name through
-//! [`rxgraph::build_kernel`] (and, via the parallel Python work, through
-//! `graph.search(kernel="hop_budget", params={...})`).
+//! This crate implements [`rxgraph::Kernel`] and registers it under a name with
+//! `inventory::submit!`. When this crate is linked into the Python extension,
+//! the kernel is selectable with `graph.search(kernel="hop_budget", params={...})`.
 //!
 //! The kernel implemented here is [`HopBudget`]: starting from a node, walk the
 //! graph and emit a path as soon as it reaches a node whose boolean payload
 //! column (named by `target_col`) is `true`, or once it has taken `max_hops`
-//! edges. It demonstrates:
-//!
-//! - carrying typed per-path state (`hops: u64`),
-//! - reading a node payload column with a typed [`EdgeCtx`] getter
-//!   ([`EdgeCtx::dest_bool`]),
-//! - parsing a JSON params blob into kernel configuration,
-//! - registering the kernel by name with `inventory::submit!`.
+//! edges.
 
 use anyhow::{Context, Result};
 use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, StateRow, Value};
@@ -114,22 +102,10 @@ rxgraph::inventory::submit! {
     }
 }
 
-/// Optional Python wiring (enabled with `--features python`).
-///
-/// Builds a `cdylib` Python extension module named `rxgraph_kernel_example`.
-/// Importing it from Python is enough to pull this object file in and run the
-/// `inventory::submit!` registration above, so the kernel becomes selectable by
-/// name. See the crate README for the maturin build.
-#[cfg(feature = "python")]
-mod python {
-    use pyo3::prelude::*;
-
-    #[pymodule]
-    fn rxgraph_kernel_example(_py: Python<'_>, _m: &Bound<'_, PyModule>) -> PyResult<()> {
-        // No symbols to export: importing the module is what registers the
-        // kernel (via the `inventory::submit!` above).
-        Ok(())
-    }
+/// References this crate from an embedding crate so the linker keeps the
+/// inventory registration above.
+pub fn link() {
+    // Intentionally empty.
 }
 
 #[cfg(test)]
@@ -201,7 +177,10 @@ mod tests {
             vec![GraphId::Str("a"), GraphId::Str("b"), GraphId::Str("c")]
         );
         assert_eq!(path.edges, vec![GraphId::Str("ab"), GraphId::Str("bc")]);
-        assert_eq!(path.state, vec![("hops".to_string(), rxgraph::Value::U64(2))]);
+        assert_eq!(
+            path.state,
+            vec![("hops".to_string(), rxgraph::Value::U64(2))]
+        );
     }
 
     #[test]
@@ -217,6 +196,9 @@ mod tests {
         let path = &result.paths[0];
         assert_eq!(path.nodes, vec![GraphId::Str("a"), GraphId::Str("b")]);
         assert_eq!(path.edges, vec![GraphId::Str("ab")]);
-        assert_eq!(path.state, vec![("hops".to_string(), rxgraph::Value::U64(1))]);
+        assert_eq!(
+            path.state,
+            vec![("hops".to_string(), rxgraph::Value::U64(1))]
+        );
     }
 }

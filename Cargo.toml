@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/rxgraph", "crates/rxgraph-python"]
+exclude = ["examples/rust-kernel-plugin"]
 resolver = "3"
 
 [workspace.package]

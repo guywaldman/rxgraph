@@ -210,8 +210,7 @@ graph.search(start_nodes=["a"], kernel="hop_budget",
 ```
 
 See [`examples/rust-kernel-plugin/`](examples/rust-kernel-plugin/README.md) for
-the full guide, including the `EdgeCtx` accessor reference, the maturin build,
-and the planned runtime `dlopen` path.
+the full guide, including the `EdgeCtx` accessor reference and the maturin build.
 
 ## Architecture
 
