@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/guywaldman/rxgraph/compare/v0.5.0...v0.6.0) (2026-06-06)
+
+
+### Features
+
+* improve ergonomics and setup of custom Rust kernels ([#27](https://github.com/guywaldman/rxgraph/issues/27)) ([dcfb52c](https://github.com/guywaldman/rxgraph/commit/dcfb52c16276958825ba9047c239cb465bce703f))
+
 ## [0.5.0](https://github.com/guywaldman/rxgraph/compare/v0.4.0...v0.5.0) (2026-06-06)
 
 
