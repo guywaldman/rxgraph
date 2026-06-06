@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/guywaldman/rxgraph/compare/v0.4.0...v0.5.0) (2026-06-06)
+
+
+### Features
+
+* add support for writing Rust search kernel plugin ([#25](https://github.com/guywaldman/rxgraph/issues/25)) ([dba4e19](https://github.com/guywaldman/rxgraph/commit/dba4e1997bb817e50a74bb895f1f8367fb82f880))
+
 ## [0.4.0](https://github.com/guywaldman/rxgraph/compare/v0.3.1...v0.4.0) (2026-06-05)
 
 
