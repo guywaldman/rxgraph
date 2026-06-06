@@ -12,6 +12,7 @@
 
 mod arrow_value;
 pub(crate) mod bind;
+pub(crate) mod compiled;
 pub(crate) mod eval;
 mod expr;
 mod ops;

@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::dsl::Value;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CastType {
     Bool,
     Int64,
@@ -13,7 +13,7 @@ pub(crate) enum CastType {
     String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScalarOp {
     And,
     Or,

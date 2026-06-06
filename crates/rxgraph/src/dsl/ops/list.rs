@@ -2,7 +2,7 @@ use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
 use anyhow::{Context, Result, bail};
 
-use crate::dsl::{Value, bind::BoundColumn, eval::EvalCtx, expr::Expr};
+use crate::dsl::Value;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum SetOp {
@@ -108,24 +108,6 @@ impl ListOp {
             Self::ToStruct(names) => to_struct(args, names)?,
             Self::Eval | Self::Filter => bail!("list op requires expression context"),
         })
-    }
-
-    pub(crate) fn eval_with_exprs(
-        &self,
-        args: &[Expr<BoundColumn>],
-        ctx: &EvalCtx<'_>,
-    ) -> Result<Value> {
-        match self {
-            Self::Eval => eval_list(args, ctx),
-            Self::Filter => filter_list(args, ctx),
-            _ => {
-                let values = args
-                    .iter()
-                    .map(|expr| expr.eval(ctx))
-                    .collect::<Result<Vec<_>>>()?;
-                self.eval(&values)
-            }
-        }
     }
 }
 
@@ -632,42 +614,6 @@ fn to_struct(args: &[Value], names: &[String]) -> Result<Value> {
             })
             .collect(),
     ))
-}
-
-fn eval_list(args: &[Expr<BoundColumn>], ctx: &EvalCtx<'_>) -> Result<Value> {
-    ensure_expr_args(args, 2)?;
-    let list = args[0].eval(ctx)?;
-    let Some(values) = list.as_list()? else {
-        return Ok(Value::Null);
-    };
-    values
-        .iter()
-        .map(|value| args[1].eval(&ctx.with_element(value)))
-        .collect::<Result<Vec<_>>>()
-        .map(Value::List)
-}
-
-fn filter_list(args: &[Expr<BoundColumn>], ctx: &EvalCtx<'_>) -> Result<Value> {
-    ensure_expr_args(args, 2)?;
-    let list = args[0].eval(ctx)?;
-    let Some(values) = list.as_list()? else {
-        return Ok(Value::Null);
-    };
-    let mut out = Vec::new();
-    for value in values {
-        if args[1].eval(&ctx.with_element(value))?.truthy()? {
-            out.push(value.clone());
-        }
-    }
-    Ok(Value::List(out))
-}
-
-fn ensure_expr_args(args: &[Expr<BoundColumn>], len: usize) -> Result<()> {
-    if args.len() == len {
-        Ok(())
-    } else {
-        bail!("expected {len} list expression inputs, got {}", args.len())
-    }
 }
 
 fn arg(args: &[Value], index: usize) -> Result<&Value> {

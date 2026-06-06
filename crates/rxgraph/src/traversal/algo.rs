@@ -7,10 +7,11 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 
 use crate::{
-    dsl::{BoundKernel, EvalCtx, StateValues},
+    dsl::{BoundKernel, EvalCtx, StateRow, StateValues, compiled::FastStateValues},
     graph::{EdgeId, Graph, GraphRepo, NodeId, OwnedGraphId},
     traversal::{
-        GraphPath, SearchResult, SearchStats,
+        GraphPath, RustEdgeContext, RustGraphPath, RustSearchKernel, RustSearchResult,
+        RustTraversalConfig, SearchResult, SearchStats,
         config::{TraversalConfig, TraversalStrategy},
         progress::Progress,
     },
@@ -21,7 +22,19 @@ const MIN_PAR_EDGES: usize = 8_192;
 const DFS_SEEDS_PER_THREAD: usize = 8;
 const MIN_PAR_DFS_PATHS: usize = 64;
 
-type VisitCounts = HashMap<NodeId, usize>;
+enum VisitCounts {
+    Linear(smallvec::SmallVec<[NodeId; 16]>),
+    Map(HashMap<NodeId, usize>),
+}
+
+impl VisitCounts {
+    fn count(&self, node: NodeId) -> usize {
+        match self {
+            Self::Linear(nodes) => nodes.iter().filter(|&&seen| seen == node).count(),
+            Self::Map(counts) => counts.get(&node).copied().unwrap_or(0),
+        }
+    }
+}
 
 impl Graph {
     /// Runs a configured DSL traversal and materializes matching paths.
@@ -53,6 +66,7 @@ impl Graph {
         };
 
         match (parallel, strategy) {
+            (false, _) if kernel.fast_scalar().is_some() => search_serial_fast(self, &cfg, &kernel),
             (false, _) => search_serial(self, &cfg, &kernel),
             (true, TraversalStrategy::BreadthFirst) => search_bfs_parallel(self, &cfg, &kernel),
             (true, TraversalStrategy::DepthFirst) if should_parallelize_dfs(&cfg) => {
@@ -60,6 +74,20 @@ impl Graph {
             }
             (true, TraversalStrategy::DepthFirst) => search_serial(self, &cfg, &kernel),
         }
+    }
+
+    /// Runs a Rust-native traversal kernel.
+    ///
+    /// This is the recommended Rust path when the kernel logic is already
+    /// ordinary Rust code and does not need the portable DSL/Polars frontend.
+    pub fn search_rust<K>(
+        &self,
+        config: RustTraversalConfig<K>,
+    ) -> Result<RustSearchResult<'_, K::State>>
+    where
+        K: RustSearchKernel,
+    {
+        search_rust_serial(self, config)
     }
 }
 
@@ -73,25 +101,20 @@ struct RunConfig {
     progress: bool,
 }
 
+/// Path arena node. The state is generic so the fast scalar path can store
+/// compact typed slots while the generic path keeps full DSL `StateValue`s.
 #[derive(Debug, Clone)]
-struct PathEntry {
+struct PathEntry<S> {
     node: NodeId,
     incoming_edge: Option<EdgeId>,
     parent: Option<usize>,
     depth: usize,
-    state: StateValues,
+    state: S,
 }
 
-/// One node in a local DFS path arena.
-#[derive(Debug, Clone)]
-struct PathTask {
-    node: NodeId,
-    incoming_edge: Option<EdgeId>,
-    /// Index into the arena of the parent task, if there is such.
-    parent: Option<usize>,
-    depth: usize,
-    state: StateValues,
-}
+type StatePathEntry = PathEntry<StateValues>;
+type FastPathEntry = PathEntry<FastStateValues>;
+type PathTask = StatePathEntry;
 
 /// Independent DFS subtree work item.
 /// Carries its own arena so parent links stay valid.
@@ -106,6 +129,13 @@ struct EdgeEval {
     edge: EdgeId,
     dest: NodeId,
     state: StateValues,
+    stop: bool,
+}
+
+struct RustEdgeEval<S> {
+    edge: EdgeId,
+    dest: NodeId,
+    state: S,
     stop: bool,
 }
 
@@ -130,7 +160,7 @@ fn search_serial<'a>(
         }
 
         let (edges, dests) = graph.repo.outgoing_slice(arena[parent].node);
-        let visit_counts = visit_counts_arena(&arena, parent, edges.len());
+        let visit_counts = visit_counts(&arena, parent, edges.len());
         for (&edge, &dest) in edges.iter().zip(dests) {
             let Some(edge) = eval_arena_edge(
                 graph,
@@ -168,6 +198,213 @@ fn search_serial<'a>(
 
     progress.finish(&stats);
     Ok(SearchResult { paths, stats })
+}
+
+fn search_serial_fast<'a>(
+    graph: &'a Graph,
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
+) -> Result<SearchResult<'a>> {
+    let fast = kernel
+        .fast_scalar()
+        .expect("fast serial search requires a fast scalar kernel");
+    let mut arena = Vec::with_capacity(cfg.start_nodes.len());
+    let mut frontier = VecDeque::with_capacity(cfg.start_nodes.len());
+    let mut stats = SearchStats::default();
+
+    for external in &cfg.start_nodes {
+        let node = graph
+            .repo
+            .internal_node(external.as_ref())
+            .with_context(|| format!("unknown start node {external}"))?;
+        frontier.push_back(arena.len());
+        arena.push(FastPathEntry {
+            node,
+            incoming_edge: None,
+            parent: None,
+            depth: 0,
+            state: fast.initial_state().clone(),
+        });
+        stats.start_nodes += 1;
+        stats.path_entries += 1;
+    }
+
+    let mut paths = Vec::new();
+    let mut progress = Progress::new(cfg.progress);
+
+    while let Some(parent) = pop(&mut frontier, cfg.strategy) {
+        progress.tick(&stats);
+        if arena[parent].depth >= cfg.max_depth {
+            continue;
+        }
+
+        let (edges, dests) = graph.repo.outgoing_slice(arena[parent].node);
+        let visit_counts = visit_counts(&arena, parent, edges.len());
+        for (&edge, &dest) in edges.iter().zip(dests) {
+            if !can_visit(
+                &arena,
+                parent,
+                dest,
+                cfg.max_revisits_per_node,
+                visit_counts.as_ref(),
+            ) {
+                stats.skipped_revisits += 1;
+                continue;
+            }
+
+            stats.evaluated_edges += 1;
+            let src = arena[parent].node;
+            let Some(edge_eval) =
+                fast.evaluate_edge(graph, src, dest, edge, &arena[parent].state)?
+            else {
+                stats.rejected_edges += 1;
+                continue;
+            };
+            let stop = edge_eval.stop;
+            let child = arena.len();
+            arena.push(FastPathEntry {
+                node: dest,
+                incoming_edge: Some(edge),
+                parent: Some(parent),
+                depth: arena[parent].depth + 1,
+                state: edge_eval.state,
+            });
+
+            stats.accepted_edges += 1;
+            stats.path_entries += 1;
+            stats.max_depth = stats.max_depth.max(arena[child].depth);
+
+            if stop {
+                paths.push(materialize_fast(graph, &arena, child, cfg, kernel)?);
+                stats.stopped_paths += 1;
+                if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
+                    progress.finish(&stats);
+                    return Ok(SearchResult { paths, stats });
+                }
+            } else {
+                frontier.push_back(child);
+            }
+        }
+    }
+
+    progress.finish(&stats);
+    Ok(SearchResult { paths, stats })
+}
+
+fn search_rust_serial<'a, K>(
+    graph: &'a Graph,
+    config: RustTraversalConfig<K>,
+) -> Result<RustSearchResult<'a, K::State>>
+where
+    K: RustSearchKernel,
+{
+    let RustTraversalConfig {
+        kernel,
+        start_nodes,
+        max_depth,
+        max_paths,
+        strategy,
+        max_revisits_per_node,
+        intermediate_states,
+        progress,
+    } = config;
+    let max_depth = max_depth.unwrap_or(usize::MAX);
+    let mut arena = Vec::with_capacity(start_nodes.len());
+    let mut frontier = VecDeque::with_capacity(start_nodes.len());
+    let mut stats = SearchStats::default();
+
+    for external in &start_nodes {
+        let node = graph
+            .repo
+            .internal_node(external.as_ref())
+            .with_context(|| format!("unknown start node {external}"))?;
+        frontier.push_back(arena.len());
+        arena.push(PathEntry {
+            node,
+            incoming_edge: None,
+            parent: None,
+            depth: 0,
+            state: kernel.initial_state(),
+        });
+        stats.start_nodes += 1;
+        stats.path_entries += 1;
+    }
+
+    let mut paths = Vec::new();
+    let mut progress = Progress::new(progress);
+
+    while let Some(parent) = pop(&mut frontier, strategy) {
+        progress.tick(&stats);
+        if arena[parent].depth >= max_depth {
+            continue;
+        }
+
+        let (edges, dests) = graph.repo.outgoing_slice(arena[parent].node);
+        let visit_counts = visit_counts(&arena, parent, edges.len());
+        for (&edge, &dest) in edges.iter().zip(dests) {
+            if !can_visit(
+                &arena,
+                parent,
+                dest,
+                max_revisits_per_node,
+                visit_counts.as_ref(),
+            ) {
+                stats.skipped_revisits += 1;
+                continue;
+            }
+
+            stats.evaluated_edges += 1;
+            let src = arena[parent].node;
+            let ctx = RustEdgeContext {
+                graph,
+                src,
+                dest,
+                edge,
+                state: &arena[parent].state,
+            };
+            if !kernel.visit(ctx) {
+                stats.rejected_edges += 1;
+                continue;
+            }
+
+            let state = kernel.next_state(ctx);
+            let stop = kernel.stop(RustEdgeContext {
+                graph,
+                src,
+                dest,
+                edge,
+                state: &state,
+            });
+            let child = push_rust_entry(
+                &mut arena,
+                parent,
+                RustEdgeEval {
+                    edge,
+                    dest,
+                    state,
+                    stop,
+                },
+            );
+
+            stats.accepted_edges += 1;
+            stats.path_entries += 1;
+            stats.max_depth = stats.max_depth.max(arena[child].depth);
+
+            if stop {
+                paths.push(materialize_rust(graph, &arena, child, intermediate_states)?);
+                stats.stopped_paths += 1;
+                if max_paths.is_some_and(|max| paths.len() >= max) {
+                    progress.finish(&stats);
+                    return Ok(RustSearchResult { paths, stats });
+                }
+            } else {
+                frontier.push_back(child);
+            }
+        }
+    }
+
+    progress.finish(&stats);
+    Ok(RustSearchResult { paths, stats })
 }
 
 fn search_bfs_parallel<'a>(
@@ -274,7 +511,7 @@ fn initial_arena(
     graph: &Graph,
     cfg: &RunConfig,
     kernel: &BoundKernel,
-) -> Result<(Vec<PathEntry>, VecDeque<usize>, SearchStats)> {
+) -> Result<(Vec<StatePathEntry>, VecDeque<usize>, SearchStats)> {
     let mut arena = Vec::with_capacity(cfg.start_nodes.len());
     let mut frontier = VecDeque::with_capacity(cfg.start_nodes.len());
     let mut stats = SearchStats::default();
@@ -331,7 +568,7 @@ fn initial_tasks(
 
 fn eval_frontier_serial(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[StatePathEntry],
     frontier: &[usize],
     edge_count: usize,
     cfg: &RunConfig,
@@ -350,7 +587,7 @@ fn eval_frontier_serial(
 
 fn eval_frontier_parallel(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[StatePathEntry],
     frontier: &[usize],
     cfg: &RunConfig,
     kernel: &BoundKernel,
@@ -377,7 +614,7 @@ fn eval_frontier_parallel(
 
 fn eval_parent_into(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[StatePathEntry],
     parent: usize,
     cfg: &RunConfig,
     kernel: &BoundKernel,
@@ -388,7 +625,7 @@ fn eval_parent_into(
     if arena[parent].depth < cfg.max_depth {
         let (edge_ids, dests) = graph.repo.outgoing_slice(arena[parent].node);
         out.reserve(edge_ids.len());
-        let visit_counts = visit_counts_arena(arena, parent, edge_ids.len());
+        let visit_counts = visit_counts(arena, parent, edge_ids.len());
         for (&edge, &dest) in edge_ids.iter().zip(dests) {
             if let Some(edge) = eval_arena_edge(
                 graph,
@@ -412,7 +649,7 @@ fn eval_parent_into(
 #[allow(clippy::too_many_arguments)]
 fn eval_arena_edge(
     graph: &Graph,
-    arena: &[PathEntry],
+    arena: &[StatePathEntry],
     parent: usize,
     edge: EdgeId,
     dest: NodeId,
@@ -421,7 +658,7 @@ fn eval_arena_edge(
     stats: &mut SearchStats,
     visit_counts: Option<&VisitCounts>,
 ) -> Result<Option<EdgeEval>> {
-    if !can_visit_arena(arena, parent, dest, cfg.max_revisits_per_node, visit_counts) {
+    if !can_visit(arena, parent, dest, cfg.max_revisits_per_node, visit_counts) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
@@ -443,7 +680,23 @@ fn eval_arena_edge(
     }))
 }
 
-fn push_entry(arena: &mut Vec<PathEntry>, parent: usize, edge: EdgeEval) -> usize {
+fn push_entry(arena: &mut Vec<StatePathEntry>, parent: usize, edge: EdgeEval) -> usize {
+    let child = arena.len();
+    arena.push(PathEntry {
+        node: edge.dest,
+        incoming_edge: Some(edge.edge),
+        parent: Some(parent),
+        depth: arena[parent].depth + 1,
+        state: edge.state,
+    });
+    child
+}
+
+fn push_rust_entry<S>(
+    arena: &mut Vec<PathEntry<S>>,
+    parent: usize,
+    edge: RustEdgeEval<S>,
+) -> usize {
     let child = arena.len();
     arena.push(PathEntry {
         node: edge.dest,
@@ -482,7 +735,7 @@ fn build_dfs_seeds<'a>(
         for (child, stop) in children {
             let child = push_task(&mut arena, task, child);
             if stop {
-                paths.push(materialize_task(graph, &arena, child, cfg, kernel)?);
+                paths.push(materialize(graph, &arena, child, cfg, kernel)?);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
                     break;
@@ -524,7 +777,7 @@ fn dfs_seed<'a>(
                 let previous = found.fetch_add(1, Ordering::Relaxed);
                 stats.stopped_paths += 1;
                 if cfg.max_paths.is_none_or(|max| previous < max) {
-                    paths.push(materialize_task(graph, &arena, child, cfg, kernel)?);
+                    paths.push(materialize(graph, &arena, child, cfg, kernel)?);
                 }
             } else {
                 stack.push(child);
@@ -545,9 +798,9 @@ fn expand_task(
 ) -> Result<Vec<(EdgeEval, bool)>> {
     let (edge_ids, dests) = graph.repo.outgoing_slice(arena[task].node);
     let mut children = Vec::with_capacity(edge_ids.len());
-    let visit_counts = visit_counts_task(arena, task, edge_ids.len());
+    let visit_counts = visit_counts(arena, task, edge_ids.len());
     for (&edge, &dest) in edge_ids.iter().zip(dests) {
-        if !can_visit_task(
+        if !can_visit(
             arena,
             task,
             dest,
@@ -635,8 +888,8 @@ fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
         && cfg.start_nodes.len() >= rayon::current_num_threads()
 }
 
-fn visit_counts_arena(
-    arena: &[PathEntry],
+fn visit_counts<S>(
+    arena: &[PathEntry<S>],
     mut path: usize,
     edge_count: usize,
 ) -> Option<VisitCounts> {
@@ -644,70 +897,36 @@ fn visit_counts_arena(
         return None;
     }
 
-    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
-    loop {
-        *counts.entry(arena[path].node).or_insert(0) += 1;
-        match arena[path].parent {
-            Some(parent) => path = parent,
-            None => return Some(counts),
-        }
-    }
-}
-
-fn visit_counts_task(
-    arena: &[PathTask],
-    mut path: usize,
-    edge_count: usize,
-) -> Option<VisitCounts> {
-    if edge_count <= 1 {
-        return None;
-    }
-
-    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
-    loop {
-        *counts.entry(arena[path].node).or_insert(0) += 1;
-        match arena[path].parent {
-            Some(parent) => path = parent,
-            None => return Some(counts),
-        }
-    }
-}
-
-fn can_visit_arena(
-    arena: &[PathEntry],
-    mut path: usize,
-    node: NodeId,
-    max_revisits: usize,
-    visit_counts: Option<&VisitCounts>,
-) -> bool {
-    if let Some(visit_counts) = visit_counts {
-        return visit_counts.get(&node).copied().unwrap_or(0) <= max_revisits;
-    }
-
-    let mut visits = 0usize;
-    loop {
-        if arena[path].node == node {
-            visits += 1;
-            if visits > max_revisits {
-                return false;
+    if arena[path].depth <= 16 {
+        let mut nodes = smallvec::SmallVec::with_capacity(arena[path].depth + 1);
+        loop {
+            nodes.push(arena[path].node);
+            match arena[path].parent {
+                Some(parent) => path = parent,
+                None => return Some(VisitCounts::Linear(nodes)),
             }
         }
+    }
+
+    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
+    loop {
+        *counts.entry(arena[path].node).or_insert(0) += 1;
         match arena[path].parent {
             Some(parent) => path = parent,
-            None => return true,
+            None => return Some(VisitCounts::Map(counts)),
         }
     }
 }
 
-fn can_visit_task(
-    arena: &[PathTask],
+fn can_visit<S>(
+    arena: &[PathEntry<S>],
     mut path: usize,
     node: NodeId,
     max_revisits: usize,
     visit_counts: Option<&VisitCounts>,
 ) -> bool {
     if let Some(visit_counts) = visit_counts {
-        return visit_counts.get(&node).copied().unwrap_or(0) <= max_revisits;
+        return visit_counts.count(node) <= max_revisits;
     }
 
     let mut visits = 0usize;
@@ -734,17 +953,36 @@ fn pop(frontier: &mut VecDeque<usize>, strategy: TraversalStrategy) -> Option<us
 
 fn materialize<'a>(
     graph: &'a Graph,
-    arena: &[PathEntry],
-    mut path: usize,
+    arena: &[StatePathEntry],
+    path: usize,
     cfg: &RunConfig,
     kernel: &BoundKernel,
 ) -> Result<GraphPath<'a>> {
+    materialize_with(graph, arena, path, cfg, |state| kernel.state_row(state))
+}
+
+fn materialize_fast<'a>(
+    graph: &'a Graph,
+    arena: &[FastPathEntry],
+    path: usize,
+    cfg: &RunConfig,
+    kernel: &BoundKernel,
+) -> Result<GraphPath<'a>> {
+    materialize_with(graph, arena, path, cfg, |state| {
+        kernel.fast_state_row(state)
+    })
+}
+
+fn materialize_rust<'a, S: Clone>(
+    graph: &'a Graph,
+    arena: &[PathEntry<S>],
+    mut path: usize,
+    intermediate_states: bool,
+) -> Result<RustGraphPath<'a, S>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
-    let state = kernel.state_row(&arena[path].state);
-    let mut states = cfg
-        .intermediate_states
-        .then(|| Vec::with_capacity(nodes.capacity()));
+    let state = arena[path].state.clone();
+    let mut states = intermediate_states.then(|| Vec::with_capacity(nodes.capacity()));
 
     loop {
         nodes.push(
@@ -762,7 +1000,7 @@ fn materialize<'a>(
             );
         }
         if let Some(states) = &mut states {
-            states.push(kernel.state_row(&arena[path].state));
+            states.push(arena[path].state.clone());
         }
         match arena[path].parent {
             Some(parent) => path = parent,
@@ -775,7 +1013,7 @@ fn materialize<'a>(
     if let Some(states) = &mut states {
         states.reverse();
     }
-    Ok(GraphPath {
+    Ok(RustGraphPath {
         nodes,
         edges,
         state,
@@ -783,16 +1021,16 @@ fn materialize<'a>(
     })
 }
 
-fn materialize_task<'a>(
+fn materialize_with<'a, S>(
     graph: &'a Graph,
-    arena: &[PathTask],
+    arena: &[PathEntry<S>],
     mut path: usize,
     cfg: &RunConfig,
-    kernel: &BoundKernel,
+    state_row: impl Fn(&S) -> StateRow,
 ) -> Result<GraphPath<'a>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
-    let state = kernel.state_row(&arena[path].state);
+    let state = state_row(&arena[path].state);
     let mut states = cfg
         .intermediate_states
         .then(|| Vec::with_capacity(nodes.capacity()));
@@ -813,7 +1051,7 @@ fn materialize_task<'a>(
             );
         }
         if let Some(states) = &mut states {
-            states.push(kernel.state_row(&arena[path].state));
+            states.push(state_row(&arena[path].state));
         }
         match arena[path].parent {
             Some(parent) => path = parent,
@@ -853,7 +1091,10 @@ mod tests {
     use crate::{
         dsl::{DslExpr as e, DslKernel, Value},
         graph::{EDGE_DEST_COL, EDGE_SRC_COL, GraphId, ID_COL, Repo},
-        traversal::config::{TraversalConfigBuilder, TraversalStrategy},
+        traversal::{
+            RustEdgeContext, RustKernel, RustTraversalConfigBuilder,
+            config::{TraversalConfigBuilder, TraversalStrategy},
+        },
     };
 
     fn graph() -> Graph {
@@ -1069,6 +1310,40 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(states.last().unwrap(), &with_history.paths[0].state);
+    }
+
+    #[test]
+    fn rust_kernel_returns_typed_state_and_history() {
+        let kernel = RustKernel::new(
+            0_u64,
+            |ctx: RustEdgeContext<'_, u64>| ctx.edge <= 20,
+            |ctx: RustEdgeContext<'_, u64>| *ctx.state + 1,
+            |ctx: RustEdgeContext<'_, u64>| ctx.dest == 2,
+        );
+        let graph = integer_graph();
+        let result = graph
+            .search_rust(
+                RustTraversalConfigBuilder::new(kernel)
+                    .with_start_nodes([1_u64])
+                    .with_max_depth(2)
+                    .with_strategy(TraversalStrategy::DepthFirst)
+                    .with_intermediate_states(true)
+                    .build(),
+            )
+            .unwrap();
+
+        assert_eq!(result.paths.len(), 1);
+        assert_eq!(
+            result.paths[0].nodes,
+            vec![GraphId::U64(1), GraphId::U64(2), GraphId::U64(3)]
+        );
+        assert_eq!(result.paths[0].state, 2);
+        assert_eq!(
+            result.paths[0].intermediate_states.as_ref().unwrap(),
+            &vec![0, 1, 2]
+        );
+        assert_eq!(result.stats.evaluated_edges, 2);
+        assert_eq!(result.stats.accepted_edges, 2);
     }
 
     #[test]

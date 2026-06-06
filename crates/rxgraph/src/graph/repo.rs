@@ -368,6 +368,47 @@ impl Repo {
 }
 
 impl Repo {
+    pub(crate) fn from_u64_edges(
+        node_count: usize,
+        edges: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Self> {
+        validate_node_count(node_count)?;
+
+        let mut edge_endpoints = Vec::new();
+        for (row, (src_external, dest_external)) in edges.into_iter().enumerate() {
+            checked_id(row, "edge")?;
+            let src = endpoint_node(row, "src", src_external, node_count)?;
+            let dest = endpoint_node(row, "dest", dest_external, node_count)?;
+            edge_endpoints.push((src, dest));
+        }
+
+        let Csr {
+            offsets: csr_offsets,
+            edge_ids,
+            dests: csr_dests,
+        } = build_csr(node_count, &edge_endpoints).context("failed to construct CSR")?;
+        let edge_count = edge_endpoints.len();
+
+        Ok(Self {
+            nodes: empty_payload_table(node_count)?,
+            edges: empty_payload_table(edge_count)?,
+            node_count,
+            edge_count,
+            csr_offsets,
+            csr_dests,
+            edge_ids,
+            incoming: OnceLock::new(),
+            edge_endpoints,
+            identity: Identity::U64Contiguous {
+                node_count,
+                edge_count,
+            },
+            out_degrees: OnceLock::new(),
+            in_degrees: OnceLock::new(),
+            degrees: OnceLock::new(),
+        })
+    }
+
     pub(crate) fn from_tables(nodes: RecordBatch, edges: RecordBatch) -> Result<Self> {
         let Preprocessed {
             identity,
@@ -397,6 +438,15 @@ impl Repo {
             degrees: OnceLock::new(),
         })
     }
+}
+
+fn empty_payload_table(row_count: usize) -> Result<RecordBatch> {
+    RecordBatch::try_new_with_options(
+        Schema::new(Vec::<FieldRef>::new()).into(),
+        Vec::new(),
+        &arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(row_count)),
+    )
+    .context("failed to build empty payload table")
 }
 
 fn strip_topology_columns(batch: RecordBatch, topology_cols: &[&str]) -> Result<RecordBatch> {
@@ -692,6 +742,23 @@ fn str_col<'a>(batch: &'a RecordBatch, col: &str) -> Result<StrCol<'a>> {
         )),
         other => bail!("'{col}' must be a string column (actual type: {other})"),
     }
+}
+
+fn validate_node_count(node_count: usize) -> Result<()> {
+    if node_count > NodeId::MAX as usize + 1 {
+        bail!("too many nodes for u32 internal IDs");
+    }
+    Ok(())
+}
+
+fn endpoint_node(row: usize, col: &str, external: u64, node_count: usize) -> Result<NodeId> {
+    let Some(index) = usize::try_from(external)
+        .ok()
+        .filter(|&index| index < node_count)
+    else {
+        bail!("edge row {row} references missing {col} {external}");
+    };
+    Ok(index as NodeId)
 }
 
 fn checked_id(index: usize, kind: &str) -> Result<u32> {

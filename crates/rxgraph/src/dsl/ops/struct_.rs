@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
-use crate::dsl::{Value, bind::BoundColumn, eval::EvalCtx, expr::Expr};
+use crate::dsl::Value;
 
 #[derive(Debug, Clone)]
 pub(crate) enum StructOp {
@@ -54,41 +54,6 @@ impl StructOp {
             }
             Self::WithFields(_) => bail!("struct with_fields requires expression context"),
         })
-    }
-
-    pub(crate) fn eval_with_exprs(
-        &self,
-        args: &[Expr<BoundColumn>],
-        ctx: &EvalCtx<'_>,
-    ) -> Result<Value> {
-        match self {
-            Self::WithFields(names) => {
-                let base = args.first().context("missing base struct")?.eval(ctx)?;
-                let Some(mut fields) = base.into_struct()? else {
-                    return Ok(Value::Null);
-                };
-                for (index, name) in names.iter().enumerate() {
-                    let value = args
-                        .get(index + 1)
-                        .with_context(|| format!("missing struct field expression {name:?}"))?
-                        .eval(ctx)?;
-                    if let Some((_, existing)) = fields.iter_mut().find(|(field, _)| field == name)
-                    {
-                        *existing = value;
-                    } else {
-                        fields.push((name.clone(), value));
-                    }
-                }
-                Ok(Value::Struct(fields))
-            }
-            _ => {
-                let values = args
-                    .iter()
-                    .map(|expr| expr.eval(ctx))
-                    .collect::<Result<Vec<_>>>()?;
-                self.eval(&values)
-            }
-        }
     }
 }
 

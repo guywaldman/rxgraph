@@ -32,6 +32,7 @@ pub mod traversal;
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
-    GraphPath, SearchResult, SearchStats, TraversalConfig, TraversalConfigBuilder,
-    TraversalStrategy,
+    GraphPath, RustEdgeContext, RustGraphPath, RustKernel, RustSearchKernel, RustSearchResult,
+    RustTraversalConfig, RustTraversalConfigBuilder, SearchResult, SearchStats, TraversalConfig,
+    TraversalConfigBuilder, TraversalStrategy,
 };

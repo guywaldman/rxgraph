@@ -35,6 +35,19 @@ impl Graph {
         })
     }
 
+    /// Builds a topology-only graph from contiguous integer node IDs and edge pairs.
+    ///
+    /// Nodes are `0..node_count`, edge IDs are assigned by input order, and no
+    /// node or edge payload columns are installed.
+    pub fn from_u64_edges(
+        node_count: usize,
+        edges: impl IntoIterator<Item = (u64, u64)>,
+    ) -> Result<Self> {
+        Ok(Self {
+            repo: Repo::from_u64_edges(node_count, edges)?,
+        })
+    }
+
     /// Replaces the payload (attribute) tables, reusing the existing topology.
     pub fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
         self.repo.set_payloads(nodes, edges)
@@ -681,5 +694,35 @@ mod tests {
         )
         .unwrap();
         Graph::new(nodes, edges).unwrap()
+    }
+
+    #[test]
+    fn builds_topology_from_u64_edges() {
+        let graph = Graph::from_u64_edges(5, [(0, 1), (0, 2), (1, 3), (2, 3)]).unwrap();
+
+        assert_eq!(graph.node_count(), 5);
+        assert_eq!(graph.edge_count(), 4);
+        assert_eq!(graph.bfs_u64(0, Some(1)).unwrap(), Some(vec![0, 1, 2]));
+        assert_eq!(
+            graph.shortest_path_u64(0, 3).unwrap(),
+            Some(Some(vec![0, 1, 3]))
+        );
+        assert_eq!(graph.out_degrees(), vec![2, 1, 1, 0, 0]);
+        assert_eq!(graph.in_degrees(), vec![0, 1, 1, 2, 0]);
+        assert_eq!(graph.degrees(), vec![2, 2, 2, 2, 0]);
+        assert_eq!(
+            graph.weakly_connected_components_u64(),
+            Some(vec![vec![0, 1, 2, 3], vec![4]])
+        );
+    }
+
+    #[test]
+    fn rejects_u64_edge_endpoint_outside_node_range() {
+        let Err(err) = Graph::from_u64_edges(2, [(0, 2)]) else {
+            panic!("expected endpoint validation to fail");
+        };
+        let err = err.to_string();
+
+        assert!(err.contains("edge row 0 references missing dest 2"));
     }
 }

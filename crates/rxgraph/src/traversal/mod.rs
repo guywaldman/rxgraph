@@ -21,10 +21,15 @@
 mod algo;
 mod config;
 mod progress;
+mod rust_api;
 
 use crate::{dsl::StateRow, graph::GraphId};
 
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
+pub use rust_api::{
+    RustEdgeContext, RustGraphPath, RustKernel, RustSearchKernel, RustSearchResult,
+    RustTraversalConfig, RustTraversalConfigBuilder,
+};
 
 /// One materialized path returned by a traversal.
 ///

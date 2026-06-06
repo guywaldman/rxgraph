@@ -4,18 +4,19 @@ use crate::{
     dsl::{
         DslKernel, StateRow, StateValue, StateValues, Value,
         arrow_value::ColumnReader,
+        compiled::{CompiledBool, CompiledExpr, FastScalar, FastScalarKernel},
         eval::EvalCtx,
         expr::{ColumnRef, Expr},
-        ops::scalar::ScalarOp,
     },
     graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL},
 };
 
 #[derive(Debug)]
 pub(crate) struct BoundKernel {
-    visit: Expr<BoundColumn>,
-    next_state: Vec<(usize, Expr<BoundColumn>)>,
-    stop: Expr<BoundColumn>,
+    visit: CompiledBool,
+    next_state: Vec<(usize, CompiledExpr)>,
+    stop: CompiledBool,
+    fast_scalar: Option<FastScalarKernel>,
     names: Vec<String>,
     initial_state: StateValues,
 }
@@ -24,22 +25,32 @@ impl BoundKernel {
     pub(crate) fn bind(graph: &Graph, kernel: DslKernel) -> Result<Self> {
         let names = state_names(&kernel.initial_state, &kernel.next_state);
         let mut bind = |column| BoundColumn::bind(graph, column, &names);
+        let initial_state = normalize_state(kernel.initial_state, &names);
+        let visit = kernel.visit.try_map_column(&mut bind)?;
+        let next_state = kernel
+            .next_state
+            .into_iter()
+            .map(|(name, expr)| {
+                Ok((
+                    state_index(&names, &name).unwrap(),
+                    expr.try_map_column(&mut bind)?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let stop = kernel.stop.try_map_column(&mut bind)?;
+        let fast_scalar =
+            FastScalarKernel::compile(&visit, &next_state, &stop, initial_state.as_slice());
 
         Ok(Self {
-            visit: kernel.visit.try_map_column(&mut bind)?,
-            next_state: kernel
-                .next_state
+            visit: CompiledBool::compile(visit)?,
+            next_state: next_state
                 .into_iter()
-                .map(|(name, expr)| {
-                    Ok((
-                        state_index(&names, &name).unwrap(),
-                        expr.try_map_column(&mut bind)?,
-                    ))
-                })
+                .map(|(index, expr)| Ok((index, CompiledExpr::compile(expr)?)))
                 .collect::<Result<_>>()?,
-            stop: kernel.stop.try_map_column(&mut bind)?,
+            stop: CompiledBool::compile(stop)?,
+            fast_scalar,
             names: names.clone(),
-            initial_state: normalize_state(kernel.initial_state, &names),
+            initial_state,
         })
     }
 
@@ -47,8 +58,12 @@ impl BoundKernel {
         &self.initial_state
     }
 
+    pub(crate) fn fast_scalar(&self) -> Option<&FastScalarKernel> {
+        self.fast_scalar.as_ref()
+    }
+
     pub(crate) fn visit(&self, ctx: &EvalCtx<'_>) -> Result<bool> {
-        self.visit.eval(ctx)?.truthy()
+        self.visit.eval(ctx)
     }
 
     pub(crate) fn next_state(
@@ -64,7 +79,7 @@ impl BoundKernel {
     }
 
     pub(crate) fn stop(&self, ctx: &EvalCtx<'_>) -> Result<bool> {
-        self.stop.eval(ctx)?.truthy()
+        self.stop.eval(ctx)
     }
 
     pub(crate) fn state_row(&self, state: &[StateValue]) -> StateRow {
@@ -72,6 +87,22 @@ impl BoundKernel {
             .iter()
             .cloned()
             .zip(state.iter().map(StateValue::to_value))
+            .collect()
+    }
+
+    pub(crate) fn fast_state_row(&self, state: &[FastScalar]) -> StateRow {
+        let fast = self
+            .fast_scalar
+            .as_ref()
+            .expect("fast state row requires a fast scalar kernel");
+        self.names
+            .iter()
+            .cloned()
+            .zip(
+                fast.state_values(state)
+                    .into_iter()
+                    .map(|value| value.to_value()),
+            )
             .collect()
     }
 }
@@ -133,27 +164,6 @@ impl BoundColumn {
             Self::Edge(reader) => reader.value(ctx.edge as usize),
             Self::State(index) => Ok(ctx.state[*index].to_value()),
             Self::MissingState => Ok(Value::Null),
-        }
-    }
-
-    pub(crate) fn eval_scalar_literal(
-        &self,
-        ctx: &EvalCtx<'_>,
-        op: ScalarOp,
-        literal: &Value,
-        reverse: bool,
-    ) -> Result<Option<Value>> {
-        match self {
-            Self::Src(reader) => reader.eval_scalar_literal(ctx.src as usize, op, literal, reverse),
-            Self::Dest(reader) => {
-                reader.eval_scalar_literal(ctx.dest as usize, op, literal, reverse)
-            }
-            Self::Edge(reader) => {
-                reader.eval_scalar_literal(ctx.edge as usize, op, literal, reverse)
-            }
-            Self::SrcId | Self::DestId | Self::EdgeId | Self::State(_) | Self::MissingState => {
-                Ok(None)
-            }
         }
     }
 }

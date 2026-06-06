@@ -63,6 +63,10 @@ bench *args: build-maturin
 bench-memory-rust *args: build-maturin
     cargo bench -p rxgraph --bench memory
 
+bench-rust-petgraph *args:
+    cargo bench -p rxgraph --bench petgraph_topology -- {{args}}
+    cargo bench -p rxgraph --bench petgraph_search -- {{args}}
+
 memcheck *args: build-maturin
     {{python}} -m benches.memory_rss {{args}}
 
