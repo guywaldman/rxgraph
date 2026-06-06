@@ -44,7 +44,7 @@ test-python *args: build-maturin
     {{python}} -m pytest {{args}}
 
 test-kernel-plugin-example: build-maturin
-    cargo test --manifest-path {{kernel_plugin_manifest}} --locked
+    cargo test --manifest-path {{kernel_plugin_manifest}} --offline
     {{maturin}} build --manifest-path {{kernel_plugin_manifest}} --out {{kernel_plugin_dist}} --interpreter {{python}}
     uv pip install --python {{python}} --no-deps --reinstall "$({{python}} -c 'import glob, sys; tag = sys.implementation.cache_tag.replace("cpython-", "cp"); matches = glob.glob("{{kernel_plugin_dist}}/rxgraph_hop_budget-*-" + tag + "-" + tag + "-*.whl"); assert len(matches) == 1, matches; print(matches[0])')"
     {{python}} examples/rust-kernel-plugin/example.py
