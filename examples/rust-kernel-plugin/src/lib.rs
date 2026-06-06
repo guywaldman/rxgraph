@@ -1,8 +1,8 @@
 //! Example native traversal kernel for `rxgraph`.
 //!
-//! This crate implements [`rxgraph::Kernel`] and registers it under a name with
-//! `inventory::submit!`. When this crate is linked into the Python extension,
-//! the kernel is selectable with `graph.search(kernel="hop_budget", params={...})`.
+//! This crate implements [`rxgraph::Kernel`] and exposes it through a generated
+//! Python extension module. The kernel is selectable with
+//! `graph.search(kernel="hop_budget", params={...})`.
 //!
 //! The kernel implemented here is [`HopBudget`]: starting from a node, walk the
 //! graph and emit a path as soon as it reaches a node whose boolean payload
@@ -91,21 +91,9 @@ impl Kernel for HopBudget {
     }
 }
 
-// Register the kernel under the name "hop_budget" so `rxgraph::build_kernel`
-// (and the Python `kernel="hop_budget"` selector) can find it at link time.
-// `inventory` is re-exported by `rxgraph`, so this crate needs no direct
-// `inventory` dependency.
-rxgraph::inventory::submit! {
-    rxgraph::KernelEntry {
-        name: "hop_budget",
-        make: |params| Ok(rxgraph::boxed_run(HopBudget::from_params(params)?)),
-    }
-}
-
-/// References this crate from an embedding crate so the linker keeps the
-/// inventory registration above.
-pub fn link() {
-    // Intentionally empty.
+rxgraph_py::plugin! {
+    module = _native;
+    "hop_budget" => HopBudget::from_params,
 }
 
 #[cfg(test)]
@@ -150,7 +138,7 @@ mod tests {
 
     #[test]
     fn registered_under_its_name() {
-        // build_kernel succeeds => inventory::submit! registration was linked in.
+        // build_kernel succeeds => the macro registered the kernel by name.
         assert!(rxgraph::build_kernel("hop_budget", &serde_json::json!({})).is_err());
         assert!(
             rxgraph::build_kernel(

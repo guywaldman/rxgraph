@@ -122,4 +122,7 @@ parallelism and optional per-node intermediate state materialization.
 ## Python Bindings
 
 Python bindings are published separately as the `rxgraph` package on PyPI from
-the same repository.
+the same repository. The reusable PyO3 binding layer is also available as the
+`rxgraph-py` crate. Downstream native-kernel plugins use
+`rxgraph_py::plugin!` to register kernels and build a custom extension; see
+[`examples/rust-kernel-plugin/`](../../examples/rust-kernel-plugin/README.md).

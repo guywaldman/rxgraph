@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.13,<1.14"]
+build-backend = "maturin"
+
+[project]
+name = "rxgraph-hop-budget"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Example downstream rxgraph extension exposing the native hop_budget kernel"
+dependencies = ["rxgraph"]
+
+[tool.maturin]
+manifest-path = "Cargo.toml"
+module-name = "rxgraph_hop_budget._native"
+python-source = "python"
