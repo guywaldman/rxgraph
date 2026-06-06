@@ -1320,16 +1320,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rxgraph-kernel-example"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "rxgraph",
- "serde_json",
-]
-
-[[package]]
-name = "rxgraph-python"
+name = "rxgraph-py"
 version = "0.5.0"
 dependencies = [
  "anyhow",
@@ -1338,8 +1329,15 @@ dependencies = [
  "pyo3-arrow",
  "rayon",
  "rxgraph",
- "rxgraph-kernel-example",
  "serde_json",
+]
+
+[[package]]
+name = "rxgraph-python"
+version = "0.5.0"
+dependencies = [
+ "pyo3",
+ "rxgraph-py",
 ]
 
 [[package]]

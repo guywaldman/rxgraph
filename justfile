@@ -7,6 +7,8 @@ ruff := venv / "bin/ruff"
 prek := venv / "bin/prek"
 py_sources := "python tests benches examples"
 python_manifest := "crates/rxgraph-python/Cargo.toml"
+kernel_plugin_manifest := "examples/rust-kernel-plugin/Cargo.toml"
+kernel_plugin_dist := "examples/rust-kernel-plugin/dist/current"
 
 default: test
 
@@ -41,9 +43,11 @@ test-rust:
 test-python *args: build-maturin
     {{python}} -m pytest {{args}}
 
-test-kernel-plugin-example: setup
-    cargo test --manifest-path examples/rust-kernel-plugin/Cargo.toml --locked
-    {{maturin}} develop --manifest-path {{python_manifest}} --release --features kernel-plugin-example
+test-kernel-plugin-example: build-maturin
+    cargo test --manifest-path {{kernel_plugin_manifest}} --locked
+    {{maturin}} build --manifest-path {{kernel_plugin_manifest}} --out {{kernel_plugin_dist}} --interpreter {{python}}
+    uv pip install --python {{python}} --no-deps --reinstall "$({{python}} -c 'import glob, sys; tag = sys.implementation.cache_tag.replace("cpython-", "cp"); matches = glob.glob("{{kernel_plugin_dist}}/rxgraph_hop_budget-*-" + tag + "-" + tag + "-*.whl"); assert len(matches) == 1, matches; print(matches[0])')"
+    {{python}} examples/rust-kernel-plugin/example.py
     RXGRAPH_REQUIRE_KERNEL_PLUGIN_EXAMPLE=1 {{python}} -m pytest tests/test_rust_kernel_plugin_example.py
 
 test: test-rust test-python
