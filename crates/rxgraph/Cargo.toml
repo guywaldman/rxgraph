@@ -21,6 +21,7 @@ include = [
 anyhow.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
+inventory.workspace = true
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true

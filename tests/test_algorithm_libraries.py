@@ -12,7 +12,9 @@ from benches.main import (
     simple_data,
     travel_cases,
     travel_data,
+    travel_graphs,
     visit,
+    weighted_budget_search_kwargs,
 )
 
 
@@ -56,6 +58,22 @@ def test_traversal_matches_reference_libraries() -> None:
     assert normalize_rx_paths(by_lib["rxgraph-python"]) == reference
     assert normalize_reference_paths(by_lib["networkx"]) == reference
     assert normalize_reference_paths(by_lib["igraph"]) == reference
+
+
+def test_traversal_includes_rust_kernel_case_matching_budget_dsl() -> None:
+    data = travel_data(96, 8)
+    graphs = travel_graphs(data)
+    cases = travel_cases(data, max_paths=8, graphs=graphs)
+    rust_case = next(case for case in cases if case.lib == "rxgraph-rust-kernel")
+    dsl_paths = (
+        graphs["rxgraph-df"]
+        .graph.search(**weighted_budget_search_kwargs(data.target, [0], 8))
+        .paths
+    )
+
+    assert rust_case.alg == "traversal"
+    assert normalize_rx_paths(rust_case.run()) == normalize_rx_paths(dsl_paths)
+    assert normalize_rx_paths(dsl_paths)
 
 
 def test_benchmark_report_helpers_are_human_readable() -> None:

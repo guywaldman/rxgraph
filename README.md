@@ -152,6 +152,66 @@ See [`examples/nyc_taxi_zone_search.py`](examples/nyc_taxi_zone_search.py)
 for a public NYC TLC trip-record example that uses list and struct state over
 millions of raw trip edges.
 
+## Native Rust kernels
+
+The Polars expression DSL covers most stateful searches with no compilation
+step. When you need arbitrary state types, logic the DSL cannot express, or the
+last bit of performance, you can supply a **native Rust kernel** instead.
+
+A kernel implements the `rxgraph::Kernel` trait - the same three per-edge
+decisions the DSL makes (`visit`, `next_state`, `stop`) plus its own per-path
+`State` type. The engine is monomorphized over your kernel, so per-edge calls
+are statically dispatched; there is no per-edge virtual dispatch. You register a
+kernel under a name with `inventory::submit!` and then select it by that name.
+
+```rust
+use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, StateRow, Value};
+
+#[derive(Clone)]
+struct HopBudget { max_hops: u64, target_col: String }
+
+impl Kernel for HopBudget {
+    type State = u64; // hops taken so far
+    fn initial_state(&self, _g: &Graph, _start: NodeId) -> u64 { 0 }
+    fn visit(&self, cx: &EdgeCtx<'_, u64>) -> anyhow::Result<bool> {
+        Ok(*cx.state() < self.max_hops)
+    }
+    fn next_state(&self, cx: &EdgeCtx<'_, u64>) -> anyhow::Result<u64> {
+        Ok(cx.state() + 1)
+    }
+    fn stop(&self, cx: &EdgeCtx<'_, u64>) -> anyhow::Result<bool> {
+        Ok(*cx.state() >= self.max_hops
+            || cx.dest_bool(&self.target_col)?.unwrap_or(false))
+    }
+    fn state_row(&self, state: &u64) -> StateRow {
+        vec![("hops".into(), Value::U64(*state))]
+    }
+}
+
+// Register the kernel by name (inventory is re-exported by rxgraph).
+rxgraph::inventory::submit! {
+    rxgraph::KernelEntry {
+        name: "hop_budget",
+        make: |p| Ok(rxgraph::boxed_run(HopBudget {
+            max_hops: p["max_hops"].as_u64().unwrap(),
+            target_col: p["target_col"].as_str().unwrap().to_string(),
+        })),
+    }
+}
+```
+
+You compile your kernel into your own Python extension (statically linked with
+`rxgraph`); importing it registers the kernel, and Python can then select it by
+name:
+
+```python
+graph.search(start_nodes=["a"], kernel="hop_budget",
+             params={"max_hops": 3, "target_col": "target"}, max_paths=10)
+```
+
+See [`examples/rust-kernel-plugin/`](examples/rust-kernel-plugin/README.md) for
+the full guide, including the `EdgeCtx` accessor reference and the maturin build.
+
 ## Architecture
 
 The Python package is backed by a Rust core. Internally, `rxgraph` stores node

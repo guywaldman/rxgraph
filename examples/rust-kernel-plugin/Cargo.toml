@@ -1,0 +1,20 @@
+[package]
+name = "rxgraph-kernel-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Example: a native Rust traversal kernel registered into rxgraph by name"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+rxgraph = { path = "../../crates/rxgraph" }
+anyhow = "1"
+serde_json = "1"
+
+[dev-dependencies]
+# Only needed by the tests, to build small graphs with the `record_batch!` macro
+# (which also expands to reference `arrow_schema`).
+arrow = "58"
+arrow-schema = "58"

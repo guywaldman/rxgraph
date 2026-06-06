@@ -20,11 +20,18 @@
 
 mod algo;
 mod config;
+mod kernel;
 mod progress;
+mod registry;
 
 use crate::{dsl::StateRow, graph::GraphId};
 
+pub use algo::RunOptions;
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
+pub use kernel::{EdgeCtx, Kernel};
+pub use registry::{
+    BoxedRun, KernelEntry, RunKernel, boxed_run, build_kernel, inventory, register_kernel,
+};
 
 /// One materialized path returned by a traversal.
 ///

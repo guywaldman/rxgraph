@@ -35,6 +35,7 @@ CACHE_ROOT = Path(tempfile.gettempdir()) / "rxgraph-bench-cache"
 
 class Lib(StrEnum):
     RX_DF = "rxgraph-df"
+    RX_RUST_KERNEL = "rxgraph-rust-kernel"
     RX_DF_STRING_IDS = "rxgraph-df-string-ids"
     RX_PYTHON = "rxgraph-python"
     NETWORKX = "networkx"
@@ -43,6 +44,7 @@ class Lib(StrEnum):
 
 LIB_ORDER = (
     Lib.RX_DF,
+    Lib.RX_RUST_KERNEL,
     Lib.RX_PYTHON,
     Lib.RX_DF_STRING_IDS,
     Lib.IGRAPH,
@@ -265,8 +267,9 @@ def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
             lambda: travel_data(scale.nodes, args.traversal_fanout),
         ),
     )
+    travel_graph_cache = travel_graphs(travel, libraries)
     cases = simple_cases(simple, libraries) + travel_cases(
-        travel, args.max_paths, libraries
+        travel, args.max_paths, libraries, travel_graph_cache
     )
     return [
         measure(
@@ -611,9 +614,12 @@ def alg_cases(
 
 
 def travel_cases(
-    data: Data, max_paths: int, libraries: LibraryFilter = LibraryFilter()
+    data: Data,
+    max_paths: int,
+    libraries: LibraryFilter = LibraryFilter(),
+    graphs: dict[Lib, BuiltGraph] | None = None,
 ) -> list[Case]:
-    graphs = travel_graphs(data, libraries)
+    graphs = graphs if graphs is not None else travel_graphs(data, libraries)
     traversal = travel_search_kwargs(data.target, [0], max_paths)
     string_traversal = travel_search_kwargs(str(data.target), ["0"], max_paths)
     cases = []
@@ -624,6 +630,17 @@ def travel_cases(
                 Alg.TRAVERSAL,
                 Lib.RX_DF,
                 lambda graph=built.graph: graph.search(**traversal).paths,
+                build_times=built.build_times,
+            )
+        )
+    if Lib.RX_RUST_KERNEL in graphs:
+        built = graphs[Lib.RX_RUST_KERNEL]
+        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.RX_RUST_KERNEL,
+                lambda graph=built.graph: graph.search(**native).paths,
                 build_times=built.build_times,
             )
         )
@@ -695,8 +712,12 @@ def travel_graphs(
             nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
         return nodes, edges
 
-    if libraries.matches(Lib.RX_DF):
-        graphs[Lib.RX_DF] = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
+    if libraries.matches(Lib.RX_DF) or libraries.matches(Lib.RX_RUST_KERNEL):
+        built = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
+        if libraries.matches(Lib.RX_DF):
+            graphs[Lib.RX_DF] = built
+        if libraries.matches(Lib.RX_RUST_KERNEL):
+            graphs[Lib.RX_RUST_KERNEL] = built
     if libraries.matches(Lib.RX_DF_STRING_IDS):
         graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
     if libraries.matches(Lib.RX_PYTHON):
@@ -781,6 +802,46 @@ def travel_search_kwargs(
         },
         "stop": rxg.col(f"{Scope.DEST}.{Field.ID}") == target,
         "initial_state": INIT,
+        "max_depth": 18,
+        "max_paths": max_paths,
+        "strategy": "dfs",
+    }
+
+
+def weighted_budget_search_kwargs(
+    target: int | str, start_nodes: list[int | str], max_paths: int
+) -> dict[str, Any]:
+    s, d, e = (
+        (lambda n: rxg.col(f"{Scope.STATE}.{n}")),
+        (lambda n: rxg.col(f"{Scope.DEST}.{n}")),
+        (lambda n: rxg.col(f"{Scope.EDGE}.{n}")),
+    )
+    return {
+        "start_nodes": start_nodes,
+        "visit": (s(Field.SPENT) + e(Field.PRICE)) <= 950,
+        "next_state": {
+            Field.SPENT: s(Field.SPENT) + e(Field.PRICE),
+        },
+        "stop": d(Field.ID) == target,
+        "initial_state": {Field.SPENT: 0},
+        "max_depth": 18,
+        "max_paths": max_paths,
+        "strategy": "dfs",
+    }
+
+
+def weighted_budget_kernel_kwargs(
+    target: int | str, start_nodes: list[int | str], max_paths: int
+) -> dict[str, Any]:
+    return {
+        "start_nodes": start_nodes,
+        "kernel": "weighted_budget",
+        "params": {
+            "weight_col": Field.PRICE.value,
+            "budget": 950,
+            "target": target,
+        },
+        "columns": [Field.PRICE.value],
         "max_depth": 18,
         "max_paths": max_paths,
         "strategy": "dfs",
@@ -1061,7 +1122,12 @@ def opt(name: Lib | str) -> Any | None:
 
 
 def is_rx(library: Lib | str) -> bool:
-    return library in (Lib.RX_DF, Lib.RX_DF_STRING_IDS, Lib.RX_PYTHON)
+    return library in (
+        Lib.RX_DF,
+        Lib.RX_RUST_KERNEL,
+        Lib.RX_DF_STRING_IDS,
+        Lib.RX_PYTHON,
+    )
 
 
 if __name__ == "__main__":

@@ -9,6 +9,10 @@ publish = false
 name = "_rxgraph"
 crate-type = ["cdylib"]
 
+[features]
+default = []
+kernel-plugin-example = ["dep:rxgraph-kernel-example"]
+
 [dependencies]
 anyhow.workspace = true
 arrow.workspace = true
@@ -16,3 +20,5 @@ pyo3 = { workspace = true, features = ["extension-module"] }
 pyo3-arrow.workspace = true
 rayon.workspace = true
 rxgraph.workspace = true
+rxgraph-kernel-example = { path = "../../examples/rust-kernel-plugin", optional = true }
+serde_json.workspace = true

@@ -8,13 +8,14 @@ use pyo3::{
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
 use rxgraph::{
-    DslKernel, Graph, GraphId, OwnedGraphId, SearchResult, SearchStats, StateRow,
-    TraversalConfigBuilder, TraversalStrategy, Value,
+    DslKernel, Graph, GraphId, OwnedGraphId, RunOptions, SearchResult, SearchStats, StateRow,
+    TraversalConfigBuilder, TraversalStrategy, Value, build_kernel,
 };
 use std::thread;
 
 #[pymodule]
 fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    link_kernel_plugins();
     initialize_rayon_pool();
 
     m.add_class::<PyGraph>()?;
@@ -26,6 +27,14 @@ fn _rxgraph(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(rayon_thread_count, m)?)?;
     Ok(())
 }
+
+#[cfg(feature = "kernel-plugin-example")]
+fn link_kernel_plugins() {
+    rxgraph_kernel_example::link();
+}
+
+#[cfg(not(feature = "kernel-plugin-example"))]
+fn link_kernel_plugins() {}
 
 fn initialize_rayon_pool() {
     let threads = thread::available_parallelism().map_or(1, usize::from);
@@ -74,6 +83,47 @@ impl PyGraph {
                 .search(builder.build())
                 .map_err(to_py_runtime_err)?,
         )
+    }
+
+    /// Run a named, natively-registered Rust kernel selected by `name` with
+    /// runtime `params`.
+    ///
+    /// `params` is converted to a `serde_json::Value` and passed verbatim to
+    /// `rxgraph::build_kernel`. The Python layer is responsible for translating
+    /// any node-label-valued params (e.g. `target`) into engine IDs before
+    /// calling this; no ID remapping happens here.
+    ///
+    /// Result marshalling is identical to the DSL `search` path.
+    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false))]
+    #[allow(clippy::too_many_arguments)]
+    fn search_kernel(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        params: &Bound<'_, PyAny>,
+        start_nodes: Vec<PyGraphId>,
+        max_depth: Option<usize>,
+        max_paths: Option<usize>,
+        strategy: &str,
+        parallel: bool,
+        intermediate_states: bool,
+        progress: bool,
+    ) -> PyResult<PySearchResult> {
+        let params_json = py_dict_to_json(params)?;
+        let kernel = build_kernel(name, &params_json).map_err(to_py_value_err)?;
+
+        let run = RunOptions {
+            start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
+            max_depth,
+            max_paths,
+            strategy: parse_strategy(strategy)?,
+            max_revisits_per_node: 0,
+            parallel,
+            intermediate_states,
+            progress,
+        };
+
+        PySearchResult::from_result(py, kernel.run(&self.inner, run).map_err(to_py_runtime_err)?)
     }
 
     #[pyo3(signature = (start, max_depth = None))]
@@ -304,15 +354,7 @@ impl PyTraversal {
         intermediate_states: bool,
         progress: bool,
     ) -> PyResult<Self> {
-        let strategy = match strategy {
-            "dfs" => TraversalStrategy::DepthFirst,
-            "bfs" => TraversalStrategy::BreadthFirst,
-            other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown traversal strategy {other:?}; expected 'dfs' or 'bfs'"
-                )));
-            }
-        };
+        let strategy = parse_strategy(strategy)?;
 
         Ok(Self {
             kernel: kernel.inner.clone(),
@@ -608,6 +650,68 @@ fn py_to_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     Err(PyTypeError::new_err(format!(
         "cannot convert {} to DSL value",
         value.get_type().name()?
+    )))
+}
+
+fn parse_strategy(strategy: &str) -> PyResult<TraversalStrategy> {
+    match strategy {
+        "dfs" => Ok(TraversalStrategy::DepthFirst),
+        "bfs" => Ok(TraversalStrategy::BreadthFirst),
+        other => Err(PyValueError::new_err(format!(
+            "unknown traversal strategy {other:?}; expected 'dfs' or 'bfs'"
+        ))),
+    }
+}
+
+/// Converts a Python value (None/bool/int/float/str/list/dict) into a
+/// `serde_json::Value`.
+///
+/// Used for named-kernel `params`. `bool` is checked before the integer cases
+/// because Python `bool` is a subclass of `int`. Dict keys must be strings.
+fn py_dict_to_json(obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    if obj.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Ok(value) = obj.extract::<bool>() {
+        return Ok(serde_json::Value::Bool(value));
+    }
+    if let Ok(value) = obj.extract::<u64>() {
+        return Ok(serde_json::Value::Number(value.into()));
+    }
+    if let Ok(value) = obj.extract::<i64>() {
+        return Ok(serde_json::Value::Number(value.into()));
+    }
+    if let Ok(value) = obj.extract::<f64>() {
+        return serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .ok_or_else(|| PyValueError::new_err("cannot convert non-finite float to JSON"));
+    }
+    if let Ok(value) = obj.cast::<PyString>() {
+        return Ok(serde_json::Value::String(value.to_str()?.to_string()));
+    }
+    if let Ok(values) = obj.cast::<PyList>() {
+        return values
+            .iter()
+            .map(|value| py_dict_to_json(&value))
+            .collect::<PyResult<Vec<_>>>()
+            .map(serde_json::Value::Array);
+    }
+    if let Ok(fields) = obj.cast::<PyDict>() {
+        let mut map = serde_json::Map::with_capacity(fields.len());
+        for (key, value) in fields.iter() {
+            let key = key
+                .cast::<PyString>()
+                .map_err(|_| PyTypeError::new_err("params keys must be strings"))?
+                .to_str()?
+                .to_string();
+            map.insert(key, py_dict_to_json(&value)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+
+    Err(PyTypeError::new_err(format!(
+        "cannot convert {} to JSON params",
+        obj.get_type().name()?
     )))
 }
 

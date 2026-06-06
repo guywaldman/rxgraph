@@ -8,7 +8,8 @@ use crate::{
         expr::{ColumnRef, Expr},
         ops::scalar::ScalarOp,
     },
-    graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL},
+    graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL, NodeId},
+    traversal::{EdgeCtx, Kernel},
 };
 
 #[derive(Debug)]
@@ -73,6 +74,36 @@ impl BoundKernel {
             .cloned()
             .zip(state.iter().map(StateValue::to_value))
             .collect()
+    }
+}
+
+/// The DSL is just another kernel: every per-edge call rebuilds an [`EvalCtx`]
+/// from the [`EdgeCtx`] and delegates to the inherent methods above.
+impl Kernel for BoundKernel {
+    type State = StateValues;
+
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
+        // The DSL's initial state is independent of the start node.
+        self.initial_state().clone()
+    }
+
+    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+        let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
+        BoundKernel::visit(self, &ctx)
+    }
+
+    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
+        let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
+        BoundKernel::next_state(self, cx.state(), &ctx)
+    }
+
+    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+        let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
+        BoundKernel::stop(self, &ctx)
+    }
+
+    fn state_row(&self, state: &Self::State) -> StateRow {
+        BoundKernel::state_row(self, state)
     }
 }
 

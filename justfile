@@ -41,6 +41,11 @@ test-rust:
 test-python *args: build-maturin
     {{python}} -m pytest {{args}}
 
+test-kernel-plugin-example: setup
+    cargo test --manifest-path examples/rust-kernel-plugin/Cargo.toml --locked
+    {{maturin}} develop --manifest-path {{python_manifest}} --release --features kernel-plugin-example
+    RXGRAPH_REQUIRE_KERNEL_PLUGIN_EXAMPLE=1 {{python}} -m pytest tests/test_rust_kernel_plugin_example.py
+
 test: test-rust test-python
 
 package-rust:
@@ -49,7 +54,7 @@ package-rust:
 package-python: setup
     {{maturin}} build --manifest-path {{python_manifest}} --release --out dist
 
-ci: lock-check fmt-check lint test package-rust package-python memcheck
+ci: lock-check fmt-check lint test-kernel-plugin-example test package-rust package-python memcheck
 
 precommit: setup
     {{prek}} run --all-files
