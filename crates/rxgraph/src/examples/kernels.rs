@@ -1,4 +1,4 @@
-//! Example traversal kernels.
+//! Example traversal kernel using a Rust kernel as a plugin.
 //!
 //! [`WeightedBudget`] accumulates an edge weight along a path and accepts an
 //! edge only while the running total stays within a budget, stopping once a
@@ -73,15 +73,11 @@ impl Kernel for WeightedBudget {
 
 impl WeightedBudget {
     /// Builds a [`WeightedBudget`] from JSON params.
-    ///
-    /// Expected shape:
-    ///
+    /// 
+    /// Accepts something like:
     /// ```json
     /// { "weight_col": "cost", "budget": 10, "target": 3 }
     /// ```
-    ///
-    /// `target` accepts a JSON number (integer node ID) or a JSON string
-    /// (string node ID), matching the graph's ID mode.
     fn from_params(params: &serde_json::Value) -> Result<Self> {
         let weight_col = params
             .get("weight_col")
