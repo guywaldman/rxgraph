@@ -11,4 +11,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pyo3 = { workspace = true, features = ["extension-module"] }
-rxgraph-py = { path = "../rxgraph-py" }
+rxgraph = { workspace = true, features = ["python"] }

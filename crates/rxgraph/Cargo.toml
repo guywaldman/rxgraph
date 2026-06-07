@@ -22,6 +22,11 @@ anyhow.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 inventory.workspace = true
+# Optional: only pulled in by the `python` feature for the PyO3 binding layer.
+# `extension-module` is intentionally NOT enabled here; the final extension
+# crate (cdylib) enables it, so this stays linkable/testable as an rlib.
+pyo3 = { workspace = true, optional = true }
+pyo3-arrow = { workspace = true, optional = true }
 rand.workspace = true
 rayon.workspace = true
 serde.workspace = true
@@ -29,6 +34,12 @@ serde_json.workspace = true
 smallvec.workspace = true
 sprs.workspace = true
 stats_alloc.workspace = true
+
+[features]
+# Exposes the PyO3 binding layer (`register`, the `plugin!` macro, and pyclasses)
+# so downstream consumers can build native kernel plugins against the published
+# crate without an unpublished path-dependency.
+python = ["dep:pyo3", "dep:pyo3-arrow"]
 
 [dev-dependencies]
 criterion.workspace = true

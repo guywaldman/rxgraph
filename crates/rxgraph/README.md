@@ -21,7 +21,7 @@ evaluates stateful traversal kernels without copying user columns out of Arrow.
 
 ```toml
 [dependencies]
-rxgraph = "0.0.5"
+rxgraph = "0.6"
 ```
 
 ## Data Model
@@ -121,8 +121,8 @@ parallelism and optional per-node intermediate state materialization.
 
 ## Python Bindings
 
-Python bindings are published separately as the `rxgraph` package on PyPI from
-the same repository. The reusable PyO3 binding layer is also available as the
-`rxgraph-py` crate. Downstream native-kernel plugins use
-`rxgraph_py::plugin!` to register kernels and build a custom extension; see
+Python bindings are published as the `rxgraph` package on PyPI. The same PyO3
+binding layer is available from this crate via the `python` feature; downstream
+native-kernel plugins enable `features = ["python"]` and use the
+`rxgraph::plugin!` macro to register kernels and build a custom extension; see
 [`examples/rust-kernel-plugin/`](../../examples/rust-kernel-plugin/README.md).

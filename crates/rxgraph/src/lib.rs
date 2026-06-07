@@ -28,7 +28,12 @@ mod arrow;
 pub mod dsl;
 pub mod examples;
 pub mod graph;
+#[cfg(feature = "python")]
+mod python;
 pub mod traversal;
+
+#[cfg(feature = "python")]
+pub use python::register;
 
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};

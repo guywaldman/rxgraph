@@ -1,3 +1,7 @@
+use crate::{
+    DslKernel, Graph, GraphId, OwnedGraphId, RunOptions, SearchResult, SearchStats, StateRow,
+    TraversalConfigBuilder, TraversalStrategy, Value, build_kernel,
+};
 use pyo3::{
     Borrowed,
     conversion::IntoPyObjectExt,
@@ -7,10 +11,6 @@ use pyo3::{
 };
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
-use rxgraph::{
-    DslKernel, Graph, GraphId, OwnedGraphId, RunOptions, SearchResult, SearchStats, StateRow,
-    TraversalConfigBuilder, TraversalStrategy, Value, build_kernel,
-};
 use std::thread;
 
 /// Registers all rxgraph native classes and functions into a Python module.
@@ -37,7 +37,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
 /// `rxgraph::Kernel`.
 ///
 /// ```ignore
-/// rxgraph_py::plugin! {
+/// rxgraph::plugin! {
 ///     module = _native;
 ///     "hop_budget" => HopBudget::from_params,
 /// }
@@ -49,10 +49,10 @@ macro_rules! plugin {
         $($name:literal => $factory:expr),+ $(,)?
     ) => {
         $(
-            ::rxgraph::inventory::submit! {
-                ::rxgraph::KernelEntry {
+            $crate::inventory::submit! {
+                $crate::KernelEntry {
                     name: $name,
-                    make: |params| Ok(::rxgraph::boxed_run(($factory)(params)?)),
+                    make: |params| Ok($crate::boxed_run(($factory)(params)?)),
                 }
             }
         )+
@@ -466,7 +466,7 @@ struct PySearchPath {
 }
 
 impl PySearchPath {
-    fn from_path(_py: Python<'_>, path: rxgraph::GraphPath<'_>) -> PyResult<Self> {
+    fn from_path(_py: Python<'_>, path: crate::GraphPath<'_>) -> PyResult<Self> {
         Ok(Self {
             nodes: path.nodes.into_iter().map(GraphId::into_owned).collect(),
             edges: path.edges.into_iter().map(GraphId::into_owned).collect(),

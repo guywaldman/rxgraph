@@ -1310,6 +1310,8 @@ dependencies = [
  "criterion",
  "inventory",
  "pretty_assertions",
+ "pyo3",
+ "pyo3-arrow",
  "rand",
  "rayon",
  "serde",
@@ -1320,24 +1322,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "rxgraph-py"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "arrow",
- "pyo3",
- "pyo3-arrow",
- "rayon",
- "rxgraph",
- "serde_json",
-]
-
-[[package]]
 name = "rxgraph-python"
 version = "0.6.0"
 dependencies = [
  "pyo3",
- "rxgraph-py",
+ "rxgraph",
 ]
 
 [[package]]

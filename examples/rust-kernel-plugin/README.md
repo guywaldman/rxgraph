@@ -14,7 +14,7 @@ The example implements `hop_budget`:
 ## Rust shape
 
 Implement `rxgraph::Kernel`, parse runtime params, then call
-`rxgraph_py::plugin!` once:
+`rxgraph::plugin!` once:
 
 ```rust
 use anyhow::{Context, Result};
@@ -74,7 +74,7 @@ impl Kernel for HopBudget {
     }
 }
 
-rxgraph_py::plugin! {
+rxgraph::plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }
@@ -121,11 +121,11 @@ result = graph.search(
 ```
 
 NOTE: the plugin wheel links its own copy of the `rxgraph` engine, so the
-plugin's `rxgraph`, `rxgraph-py`, and Python wrapper versions should match.
+plugin's `rxgraph` and Python wrapper versions should match.
 
 ## Layout
 
-- `src/lib.rs` - kernel implementation, tests, and `rxgraph_py::plugin!`.
+- `src/lib.rs` - kernel implementation, tests, and `rxgraph::plugin!`.
 - `python/rxgraph_hop_budget/` - tiny Python package that calls `export_api`.
 - `pyproject.toml` - maturin package config.
 - `example.py` - runnable end-to-end demo.

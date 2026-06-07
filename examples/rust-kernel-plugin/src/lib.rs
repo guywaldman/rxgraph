@@ -91,7 +91,7 @@ impl Kernel for HopBudget {
     }
 }
 
-rxgraph_py::plugin! {
+rxgraph::plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }

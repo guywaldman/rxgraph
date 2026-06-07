@@ -171,10 +171,20 @@ result = graph.search(
 )
 ```
 
+The consumer's crate depends on `rxgraph` with the `python` feature (their own
+crate is the `cdylib` that needs pyo3's `extension-module`; rxgraph's `python`
+feature deliberately does not enable it):
+
+```toml
+[dependencies]
+rxgraph = { version = "0.6", features = ["python"] }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+```
+
 The Rust side implements `rxgraph::Kernel` and ends with a small macro call:
 
 ```rust
-rxgraph_py::plugin! {
+rxgraph::plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }

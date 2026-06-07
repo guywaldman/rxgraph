@@ -12,12 +12,12 @@ crate-type = ["cdylib"]
 [dependencies]
 anyhow = "1"
 pyo3 = { version = "0.28", features = ["extension-module"] }
-rxgraph = { path = "../../crates/rxgraph" }
-rxgraph-py = { path = "../../crates/rxgraph-py" }
+# In-repo example uses the path dep, however external consumers should depend on the published
+# crate instead. e.g., `rxgraph = { version = "0.6", features = ["python"] }`
+rxgraph = { path = "../../crates/rxgraph", features = ["python"] }
 serde_json = "1"
 
 [dev-dependencies]
-# Only needed by the tests, to build small graphs with the `record_batch!` macro
-# (which also expands to reference `arrow_schema`).
+# Only needed by the tests, to build small graphs with the `record_batch!` macro.
 arrow = "58"
 arrow-schema = "58"
