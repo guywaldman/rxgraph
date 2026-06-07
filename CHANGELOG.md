@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/guywaldman/rxgraph/compare/v0.6.0...v0.6.1) (2026-06-07)
+
+
+### Bug Fixes
+
+* publish single Rust crate with Py03 bindings behind a FF ([dc39173](https://github.com/guywaldman/rxgraph/commit/dc391732adcb85753c682304995d82a0a8265d05))
+
 ## [0.6.0](https://github.com/guywaldman/rxgraph/compare/v0.5.0...v0.6.0) (2026-06-06)
 
 
