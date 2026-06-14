@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.0](https://github.com/guywaldman/rxgraph/compare/v0.6.1...v0.7.0) (2026-06-14)
+
+
+### Features
+
+* add support for a native Rust kernel ([226cd66](https://github.com/guywaldman/rxgraph/commit/226cd66ed417364ef0abad18fd46d6b9b44cfa02))
+
 ## [0.6.1](https://github.com/guywaldman/rxgraph/compare/v0.6.0...v0.6.1) (2026-06-07)
 
 
