@@ -39,6 +39,7 @@ lint: setup
 
 test-rust:
     cargo test --workspace --locked
+    cargo test -p rxgraph --example native_row_lazy --locked
 
 test-python *args: build-maturin
     {{python}} -m pytest {{args}}

@@ -40,7 +40,7 @@ pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
     BoxedRun, EdgeCtx, GraphPath, Kernel, KernelEntry, RunKernel, RunOptions, SearchResult,
     SearchStats, TraversalConfig, TraversalConfigBuilder, TraversalStrategy, boxed_run,
-    build_kernel, register_kernel,
+    build_kernel, register_kernel, search_native,
 };
 
 // Re-exported so plugin crates can register kernels without their own dependency.

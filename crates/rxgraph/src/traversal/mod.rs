@@ -21,6 +21,7 @@
 mod algo;
 mod config;
 mod kernel;
+pub mod native;
 mod progress;
 mod registry;
 
@@ -29,6 +30,7 @@ use crate::{dsl::StateRow, graph::GraphId};
 pub use algo::RunOptions;
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
 pub use kernel::{EdgeCtx, Kernel};
+pub use native::search_native;
 pub use registry::{
     BoxedRun, KernelEntry, RunKernel, boxed_run, build_kernel, inventory, register_kernel,
 };
