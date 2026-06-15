@@ -1,5 +1,6 @@
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
+from os import PathLike
 from typing import Any, Literal, Self, TypeVar
 
 from polars import DataFrame, Expr, LazyFrame, col as col, lit as lit
@@ -48,6 +49,17 @@ class Graph:
         """
         ...
 
+    @classmethod
+    def from_parquet(
+        cls,
+        nodes: str | PathLike[str],
+        edges: str | PathLike[str],
+        *,
+        payloads: Literal["eager", "lazy"] = "eager",
+    ) -> Self:
+        """Build a file-backed graph from Parquet node and edge tables."""
+        ...
+
     @property
     def node_count(self) -> int: ...
     @property
@@ -85,8 +97,9 @@ class Graph:
         ``target``/``source``/``start``/``node`` are translated to engine IDs when
         the value is a known node label; other values pass through unchanged.
 
-        ``columns`` lists payload columns to load for a lazy graph before a named
-        kernel runs (required for lazy graphs, ignored for eager graphs).
+        ``columns`` lists payload columns to load for ``from_lazy`` before a
+        legacy named kernel runs. File-backed ``from_parquet`` graphs use typed
+        native kernels and do not need ``columns``.
         """
         ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
@@ -205,6 +218,10 @@ class SearchStats:
     def skipped_revisits(self) -> int: ...
     @property
     def max_depth(self) -> int: ...
+    @property
+    def materialized_node_payloads(self) -> int: ...
+    @property
+    def materialized_edge_payloads(self) -> int: ...
 
 @dataclass(slots=True)
 class SearchPath:

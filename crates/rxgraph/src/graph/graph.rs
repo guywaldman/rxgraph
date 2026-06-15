@@ -10,10 +10,15 @@
 //! enumeration lives in [`Graph::search`](Self::search), implemented by the
 //! traversal module.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result, anyhow};
 use arrow::record_batch::RecordBatch;
 
-use crate::graph::{GraphId, GraphRepo, NodeId, OwnedGraphId, repo::Repo};
+use crate::{
+    graph::{GraphId, GraphRepo, NodeId, OwnedGraphId, repo::Repo},
+    traversal::{ParquetPaths, read_parquet_tables, read_parquet_topology},
+};
 
 pub struct Graph {
     pub(crate) repo: Repo,
@@ -35,9 +40,32 @@ impl Graph {
         })
     }
 
+    /// Builds a graph topology from Parquet files.
+    ///
+    /// Only node `id` and edge `id`/`src_id`/`dest_id` (or legacy
+    /// `src`/`dest`) are read. Payload loading is controlled by the caller.
+    pub fn from_parquet_topology(nodes: PathBuf, edges: PathBuf) -> Result<Self> {
+        let (nodes, edges) = read_parquet_topology(&ParquetPaths { nodes, edges })?;
+        Self::new(nodes, edges)
+    }
+
+    /// Builds a graph from Parquet files, eagerly reading topology and payloads.
+    pub fn from_parquet(nodes: PathBuf, edges: PathBuf) -> Result<Self> {
+        let (nodes, edges) = read_parquet_tables(&ParquetPaths { nodes, edges })?;
+        Self::new(nodes, edges)
+    }
+
     /// Replaces the payload (attribute) tables, reusing the existing topology.
     pub fn set_payloads(&mut self, nodes: RecordBatch, edges: RecordBatch) -> Result<()> {
         self.repo.set_payloads(nodes, edges)
+    }
+
+    pub(crate) fn node_payloads(&self) -> &RecordBatch {
+        self.repo.node_batch()
+    }
+
+    pub(crate) fn edge_payloads(&self) -> &RecordBatch {
+        self.repo.edge_batch()
     }
 
     /// Number of node rows.

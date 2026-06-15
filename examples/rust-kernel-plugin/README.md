@@ -13,12 +13,13 @@ The example implements `hop_budget`:
 
 ## Rust shape
 
-Implement `rxgraph::Kernel`, parse runtime params, then call
-`rxgraph::plugin!` once:
+Implement `rxgraph::TypedKernel`, declare the payload columns it needs, decode
+those projected Arrow rows into native structs with `TryFrom<ArrowRow<'_>>`, then call
+`rxgraph::typed_plugin!` once:
 
 ```rust
 use anyhow::{Context, Result};
-use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, StateRow, Value};
+use rxgraph::{ArrowRow, PayloadField, StateRow, TypedKernel, Value, traversal::native};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HopState {
@@ -29,6 +30,21 @@ pub struct HopState {
 pub struct HopBudget {
     pub max_hops: u64,
     pub target_col: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct HopNode {
+    target: bool,
+}
+
+impl TryFrom<ArrowRow<'_>> for HopNode {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowRow<'_>) -> Result<Self> {
+        Ok(Self {
+            target: row.bool("target")?.unwrap_or(false),
+        })
+    }
 }
 
 impl HopBudget {
@@ -47,26 +63,43 @@ impl HopBudget {
     }
 }
 
-impl Kernel for HopBudget {
+impl TypedKernel for HopBudget {
+    type Node = HopNode;
+    type Edge = ();
     type State = HopState;
 
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
-        HopState::default()
+    fn node_fields(&self) -> Vec<PayloadField> {
+        vec![PayloadField::aliased(self.target_col.clone(), "target")]
     }
 
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+    fn initial_state(
+        &self,
+        _cx: &native::StartCtx<'_, Self::Node, Self::Edge>,
+    ) -> Result<Self::State> {
+        Ok(HopState::default())
+    }
+
+    fn visit(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
         Ok(cx.state().hops < self.max_hops)
     }
 
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
+    fn next_state(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Self::State> {
         Ok(HopState {
             hops: cx.state().hops + 1,
         })
     }
 
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
-        Ok(cx.state().hops >= self.max_hops
-            || cx.dest_bool(&self.target_col)?.unwrap_or(false))
+    fn stop(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
+        Ok(cx.state().hops >= self.max_hops || cx.dest()?.target)
     }
 
     fn state_row(&self, state: &Self::State) -> StateRow {
@@ -74,15 +107,15 @@ impl Kernel for HopBudget {
     }
 }
 
-rxgraph::plugin! {
+rxgraph::typed_plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }
 ```
 
 The macro registers the named kernel and emits the PyO3 `_native` module. The
-search hot path still runs through `Graph::search_with` monomorphized over the
-concrete kernel; the named lookup adds one boxed call per search, not per edge.
+search hot path runs in Rust over native payload structs; the named lookup adds
+one boxed call per search, not per edge.
 
 ## Python shape
 
@@ -99,17 +132,17 @@ export_api(globals(), _native)
 Users import the plugin package as their graph API:
 
 ```python
+from pathlib import Path
+
+import polars as pl
 import rxgraph_hop_budget as rxg
 
-graph = rxg.Graph.from_edges(
-    [("a", "b"), ("b", "c"), ("c", "d")],
-    nodes=[
-        ("a", {"target": False}),
-        ("b", {"target": False}),
-        ("c", {"target": True}),
-        ("d", {"target": False}),
-    ],
-)
+nodes = Path("nodes.parquet")
+edges = Path("edges.parquet")
+pl.DataFrame({"id": ["a", "b", "c"], "target": [False, False, True]}).write_parquet(nodes)
+pl.DataFrame({"id": ["ab", "bc"], "src": ["a", "b"], "dest": ["b", "c"]}).write_parquet(edges)
+
+graph = rxg.Graph.from_parquet(nodes, edges, payloads="lazy")
 
 result = graph.search(
     start_nodes=["a"],
@@ -125,7 +158,7 @@ plugin's `rxgraph` and Python wrapper versions should match.
 
 ## Layout
 
-- `src/lib.rs` - kernel implementation, tests, and `rxgraph::plugin!`.
+- `src/lib.rs` - typed kernel implementation, tests, and `rxgraph::typed_plugin!`.
 - `python/rxgraph_hop_budget/` - tiny Python package that calls `export_api`.
 - `pyproject.toml` - maturin package config.
 - `example.py` - runnable end-to-end demo.
@@ -143,24 +176,15 @@ The `just` recipe builds `rxgraph`, builds the plugin wheel for the repo venv's
 Python interpreter, installs that exact wheel, runs `example.py`, and runs the
 plugin pytest coverage.
 
-## `EdgeCtx` accessor reference
+## Native context
 
-A kernel's `visit`/`next_state`/`stop` receive an `EdgeCtx<'_, State>` for the
-candidate edge `(src)-[edge]->(dest)`. Source of truth:
-`crates/rxgraph/src/traversal/kernel.rs`.
+A typed kernel's `visit`/`next_state`/`stop` receive a
+`native::EdgeCtx<'_, '_, Node, Edge, State>` for the candidate edge
+`(src)-[edge]->(dest)`.
 
 | Accessor | Returns | Notes |
 | --- | --- | --- |
-| `state()` | `&State` | Per-path state. Parent state in `visit`/`next_state`; child state in `stop`. |
-| `graph()` | `&Graph` | The graph being traversed. |
-| `src()` / `dest()` / `edge()` | `NodeId` / `NodeId` / `EdgeId` | Internal row ids. |
-| `src_id()` / `dest_id()` / `edge_id()` | `Option<GraphId>` | External ids, if present. |
-| `src_value(col)` / `dest_value(col)` / `edge_value(col)` | `Result<Value>` | Raw payload value. |
-| `src_u64(col)` / `dest_u64(col)` / `edge_u64(col)` | `Result<Option<u64>>` | Lossless numeric coercion; `None` if null. |
-| `src_i64(col)` / `dest_i64(col)` / `edge_i64(col)` | `Result<Option<i64>>` | Lossless numeric coercion; `None` if null. |
-| `src_f64(col)` / `dest_f64(col)` / `edge_f64(col)` | `Result<Option<f64>>` | Widening numeric coercion; `None` if null. |
-| `src_bool(col)` / `dest_bool(col)` / `edge_bool(col)` | `Result<Option<bool>>` | `None` if null; errors on non-bool. |
-| `src_str(col)` / `dest_str(col)` / `edge_str(col)` | `Result<Option<String>>` | `None` if null; errors on non-string. |
-
-Typed getters read through a per-search payload cache, so repeated reads of the
-same column do not re-downcast the underlying Arrow array on every edge.
+| `state()` | `&State` | Parent state in `visit`/`next_state`; child state in `stop`. |
+| `src_id()` / `dest_id()` / `edge_id()` | `NodeId` / `NodeId` / `EdgeId` | Internal row ids. |
+| `src_external_id()` / `dest_external_id()` / `edge_external_id()` | `Result<Option<GraphId>>` | External ids, if present. |
+| `src()` / `dest()` / `edge()` | `Result<&Node>` / `Result<&Node>` / `Result<&Edge>` | Native structs decoded via `TryFrom<ArrowRow<'_>>`. |

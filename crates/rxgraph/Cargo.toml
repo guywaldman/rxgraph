@@ -22,6 +22,7 @@ anyhow.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true
 inventory.workspace = true
+parquet.workspace = true
 # Optional: only pulled in by the `python` feature for the PyO3 binding layer.
 # `extension-module` is intentionally NOT enabled here; the final extension
 # crate (cdylib) enables it, so this stays linkable/testable as an rlib.

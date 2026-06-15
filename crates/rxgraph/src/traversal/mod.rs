@@ -20,10 +20,12 @@
 
 mod algo;
 mod config;
+mod engine;
 mod kernel;
 pub mod native;
 mod progress;
 mod registry;
+mod typed;
 
 use crate::{dsl::StateRow, graph::GraphId};
 
@@ -32,8 +34,15 @@ pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
 pub use kernel::{EdgeCtx, Kernel};
 pub use native::search_native;
 pub use registry::{
-    BoxedRun, KernelEntry, RunKernel, boxed_run, build_kernel, inventory, register_kernel,
+    BoxedRun, BoxedTypedRun, KernelEntry, RunKernel, RunTypedKernel, TypedKernelEntry, boxed_run,
+    boxed_typed_run, build_kernel, build_typed_kernel, inventory, register_kernel,
+    try_build_kernel, try_build_typed_kernel,
 };
+pub use typed::ParquetPaths;
+pub use typed::{
+    ArrowRow, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel, TypedPayloadCache,
+};
+pub(crate) use typed::{read_parquet_tables, read_parquet_topology};
 
 /// One materialized path returned by a traversal.
 ///
@@ -93,4 +102,8 @@ pub struct SearchStats {
     pub stopped_paths: usize,
     /// Maximum accepted-edge depth reached by any completed path state.
     pub max_depth: usize,
+    /// Native node payload structs materialized by a lazy typed store.
+    pub materialized_node_payloads: usize,
+    /// Native edge payload structs materialized by a lazy typed store.
+    pub materialized_edge_payloads: usize,
 }

@@ -1,7 +1,7 @@
 //! Example native traversal kernel for `rxgraph`.
 //!
-//! This crate implements [`rxgraph::Kernel`] and exposes it through a generated
-//! Python extension module. The kernel is selectable with
+//! This crate implements [`rxgraph::TypedKernel`] and exposes it through a
+//! generated Python extension module. The kernel is selectable with
 //! `graph.search(kernel="hop_budget", params={...})`.
 //!
 //! The kernel implemented here is [`HopBudget`]: starting from a node, walk the
@@ -10,7 +10,7 @@
 //! edges.
 
 use anyhow::{Context, Result};
-use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, StateRow, Value};
+use rxgraph::{ArrowRow, PayloadField, StateRow, TypedKernel, Value, traversal::native};
 
 /// Per-path state carried by [`HopBudget`].
 ///
@@ -34,6 +34,21 @@ pub struct HopBudget {
     pub target_col: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HopNode {
+    target: bool,
+}
+
+impl TryFrom<ArrowRow<'_>> for HopNode {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowRow<'_>) -> Result<Self> {
+        Ok(Self {
+            target: row.bool("target")?.unwrap_or(false),
+        })
+    }
+}
+
 impl HopBudget {
     /// Builds a [`HopBudget`] from a JSON params object.
     ///
@@ -55,27 +70,45 @@ impl HopBudget {
     }
 }
 
-impl Kernel for HopBudget {
+impl TypedKernel for HopBudget {
+    type Node = HopNode;
+    type Edge = ();
     type State = HopState;
 
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
-        HopState::default()
+    fn node_fields(&self) -> Vec<PayloadField> {
+        vec![PayloadField::aliased(self.target_col.clone(), "target")]
     }
 
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+    fn initial_state(
+        &self,
+        _cx: &native::StartCtx<'_, Self::Node, Self::Edge>,
+    ) -> Result<Self::State> {
+        Ok(HopState::default())
+    }
+
+    fn visit(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
         // Accept an edge only while we still have hop budget left. `cx.state()`
         // is the *parent* path's state, so accepting this edge would make
         // `hops + 1` edges - reject once that would exceed `max_hops`.
         Ok(cx.state().hops < self.max_hops)
     }
 
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
+    fn next_state(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Self::State> {
         Ok(HopState {
             hops: cx.state().hops + 1,
         })
     }
 
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+    fn stop(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
         // `cx` here carries the *child* state produced by `next_state`.
         // Emit the path if we reached the hop budget...
         if cx.state().hops >= self.max_hops {
@@ -83,7 +116,7 @@ impl Kernel for HopBudget {
         }
         // ...or if the destination node is flagged as a target. A missing/null
         // value reads as `false`.
-        Ok(cx.dest_bool(&self.target_col)?.unwrap_or(false))
+        Ok(cx.dest()?.target)
     }
 
     fn state_row(&self, state: &Self::State) -> StateRow {
@@ -91,7 +124,7 @@ impl Kernel for HopBudget {
     }
 }
 
-rxgraph::plugin! {
+rxgraph::typed_plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }
@@ -99,7 +132,7 @@ rxgraph::plugin! {
 #[cfg(test)]
 mod tests {
     use arrow::array::record_batch;
-    use rxgraph::{Graph, GraphId, RunOptions};
+    use rxgraph::{Graph, RunOptions};
 
     // Required graph identity columns: nodes need `id`; edges need `id`, `src`,
     // `dest`. (These names are part of the public data model.)
@@ -121,11 +154,11 @@ mod tests {
         .unwrap()
     }
 
-    fn run(graph: &Graph, params: serde_json::Value) -> rxgraph::SearchResult<'_> {
+    fn run(graph: &Graph, params: serde_json::Value) -> rxgraph::OwnedSearchResult {
         // Resolve the kernel by name exactly like the Python selector does.
-        let kernel = rxgraph::build_kernel("hop_budget", &params).unwrap();
+        let kernel = rxgraph::build_typed_kernel("hop_budget", &params).unwrap();
         kernel
-            .run(
+            .run_eager(
                 graph,
                 RunOptions {
                     start_nodes: vec!["a".into()],
@@ -138,10 +171,10 @@ mod tests {
 
     #[test]
     fn registered_under_its_name() {
-        // build_kernel succeeds => the macro registered the kernel by name.
-        assert!(rxgraph::build_kernel("hop_budget", &serde_json::json!({})).is_err());
+        // build_typed_kernel succeeds => the macro registered the kernel by name.
+        assert!(rxgraph::build_typed_kernel("hop_budget", &serde_json::json!({})).is_err());
         assert!(
-            rxgraph::build_kernel(
+            rxgraph::build_typed_kernel(
                 "hop_budget",
                 &serde_json::json!({"max_hops": 3, "target_col": "target"})
             )
@@ -162,9 +195,9 @@ mod tests {
         let path = &result.paths[0];
         assert_eq!(
             path.nodes,
-            vec![GraphId::Str("a"), GraphId::Str("b"), GraphId::Str("c")]
+            vec!["a".into(), "b".into(), "c".into()]
         );
-        assert_eq!(path.edges, vec![GraphId::Str("ab"), GraphId::Str("bc")]);
+        assert_eq!(path.edges, vec!["ab".into(), "bc".into()]);
         assert_eq!(
             path.state,
             vec![("hops".to_string(), rxgraph::Value::U64(2))]
@@ -182,8 +215,8 @@ mod tests {
 
         assert_eq!(result.paths.len(), 1);
         let path = &result.paths[0];
-        assert_eq!(path.nodes, vec![GraphId::Str("a"), GraphId::Str("b")]);
-        assert_eq!(path.edges, vec![GraphId::Str("ab")]);
+        assert_eq!(path.nodes, vec!["a".into(), "b".into()]);
+        assert_eq!(path.edges, vec!["ab".into()]);
         assert_eq!(
             path.state,
             vec![("hops".to_string(), rxgraph::Value::U64(1))]

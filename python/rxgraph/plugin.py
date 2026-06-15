@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Hashable, Iterable, Mapping
 from dataclasses import dataclass
+from os import PathLike, fspath
 from typing import Any, Self
 
 import polars as pl
@@ -172,6 +173,36 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             return graph
 
         @classmethod
+        def from_parquet(
+            cls,
+            nodes: str | PathLike[str],
+            edges: str | PathLike[str],
+            *,
+            payloads: str = "eager",
+        ) -> Self:
+            """Build a file-backed graph from Parquet node and edge tables.
+
+            Topology is loaded eagerly from ``id`` and ``src_id``/``dest_id``
+            (or ``src``/``dest``). Native typed kernels use ``payloads="eager"``
+            to decode payload structs before search, or ``payloads="lazy"`` to
+            decode only touched payload rows during search.
+            """
+            graph = cls.__new__(cls)
+            graph._inner = _rxgraph.Graph.from_parquet(
+                fspath(nodes),
+                fspath(edges),
+                payloads,
+            )
+            graph._label_to_id = None
+            graph._id_to_label = None
+            graph._edge_id_to_label = None
+            graph._lazy_nodes = None
+            graph._lazy_edges = None
+            graph._loaded_node_cols = None
+            graph._loaded_edge_cols = None
+            return graph
+
+        @classmethod
         def _from_tables(cls, tables: GraphTables) -> Self:
             graph = cls.__new__(cls)
             Graph.__init__(
@@ -248,11 +279,9 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 params under the conventional keys ``target``/``source``/``start``/``node``
                 are translated to engine IDs when their value is a known node label;
                 all other values pass through unchanged (so raw engine IDs also work).
-            :param columns: (named kernel, lazy graphs only) Payload columns to load
-                before the search. Required for lazy graphs since native kernels cannot
-                be introspected for column references; ignored for eager graphs. Pass a
-                sequence of edge/node payload column names the kernel reads. To load all
-                columns, project them yourself via ``from_lazy`` or build an eager graph.
+            :param columns: (legacy ``from_lazy`` named kernels only) Payload
+                columns to load before the search. File-backed ``from_parquet`` graphs
+                use typed native kernels and do not need this.
             :param max_depth: Maximum accepted-edge depth per path.
             :param max_paths: Stop the search once this many paths have been returned.
             :param strategy: ``"dfs"`` or ``"bfs"``.
@@ -378,9 +407,9 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
         def _ensure_payload_columns(self, columns: Iterable[str] | None) -> None:
             """Project explicit payload columns for a lazy graph's named-kernel search.
 
-            Native kernels can't be introspected for column references like the DSL is,
-            so the caller must declare which payload columns to load via ``columns``.
-            No-op for eager graphs (all payloads are already present).
+            Legacy native kernels can't be introspected for column references like the
+            DSL is, so the caller must declare which LazyFrame payload columns to load
+            via ``columns``. No-op for eager and file-backed graphs.
             """
             if self._lazy_nodes is None or self._lazy_edges is None:
                 return

@@ -1,17 +1,18 @@
 use crate::{
-    DslKernel, Graph, GraphId, OwnedGraphId, RunOptions, SearchResult, SearchStats, StateRow,
-    TraversalConfigBuilder, TraversalStrategy, Value, build_kernel,
+    DslKernel, Graph, GraphId, OwnedGraphId, OwnedSearchResult, ParquetPaths, RunOptions,
+    SearchResult, SearchStats, StateRow, TraversalConfigBuilder, TraversalStrategy,
+    TypedPayloadCache, Value, try_build_kernel, try_build_typed_kernel,
 };
 use pyo3::{
     Borrowed,
     conversion::IntoPyObjectExt,
     exceptions::{PyRuntimeError, PyTypeError, PyValueError},
     prelude::*,
-    types::{PyAny, PyDict, PyList, PyString},
+    types::{PyAny, PyDict, PyList, PyString, PyType},
 };
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
-use std::thread;
+use std::{path::PathBuf, thread};
 
 /// Registers all rxgraph native classes and functions into a Python module.
 ///
@@ -66,6 +67,31 @@ macro_rules! plugin {
     };
 }
 
+/// Declares a Python extension module that exposes typed native kernels.
+#[macro_export]
+macro_rules! typed_plugin {
+    (
+        module = $module:ident;
+        $($name:literal => $factory:expr),+ $(,)?
+    ) => {
+        $(
+            $crate::inventory::submit! {
+                $crate::TypedKernelEntry {
+                    name: $name,
+                    make: |params| Ok($crate::boxed_typed_run(($factory)(params)?)),
+                }
+            }
+        )+
+
+        #[::pyo3::pymodule]
+        fn $module(
+            m: &::pyo3::Bound<'_, ::pyo3::types::PyModule>,
+        ) -> ::pyo3::PyResult<()> {
+            $crate::register(m)
+        }
+    };
+}
+
 fn initialize_rayon_pool() {
     let threads = thread::available_parallelism().map_or(1, usize::from);
     let _ = ThreadPoolBuilder::new().num_threads(threads).build_global();
@@ -79,6 +105,20 @@ fn rayon_thread_count() -> usize {
 #[pyclass(name = "Graph", unsendable)]
 struct PyGraph {
     inner: Graph,
+    parquet: Option<PyParquetPayloads>,
+    typed_cache: TypedPayloadCache,
+}
+
+#[derive(Clone)]
+struct PyParquetPayloads {
+    paths: ParquetPaths,
+    mode: PayloadMode,
+}
+
+#[derive(Clone, Copy)]
+enum PayloadMode {
+    Eager,
+    Lazy,
 }
 
 #[pymethods]
@@ -89,6 +129,32 @@ impl PyGraph {
         Ok(Self {
             inner: Graph::new(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
                 .map_err(to_py_value_err)?,
+            parquet: None,
+            typed_cache: TypedPayloadCache::default(),
+        })
+    }
+
+    #[classmethod]
+    #[pyo3(signature = (nodes, edges, payloads = "eager"))]
+    fn from_parquet(
+        _cls: &Bound<'_, PyType>,
+        nodes: PathBuf,
+        edges: PathBuf,
+        payloads: &str,
+    ) -> PyResult<Self> {
+        let mode = parse_payload_mode(payloads)?;
+        let paths = ParquetPaths { nodes, edges };
+        let inner = match mode {
+            PayloadMode::Eager => Graph::from_parquet(paths.nodes.clone(), paths.edges.clone()),
+            PayloadMode::Lazy => {
+                Graph::from_parquet_topology(paths.nodes.clone(), paths.edges.clone())
+            }
+        }
+        .map_err(to_py_value_err)?;
+        Ok(Self {
+            inner,
+            parquet: Some(PyParquetPayloads { paths, mode }),
+            typed_cache: TypedPayloadCache::default(),
         })
     }
 
@@ -119,7 +185,7 @@ impl PyGraph {
     /// runtime `params`.
     ///
     /// `params` is converted to a `serde_json::Value` and passed verbatim to
-    /// `rxgraph::build_kernel`. The Python layer is responsible for translating
+    /// `rxgraph::try_build_kernel`. The Python layer is responsible for translating
     /// any node-label-valued params (e.g. `target`) into engine IDs before
     /// calling this; no ID remapping happens here.
     ///
@@ -140,8 +206,6 @@ impl PyGraph {
         progress: bool,
     ) -> PyResult<PySearchResult> {
         let params_json = py_dict_to_json(params)?;
-        let kernel = build_kernel(name, &params_json).map_err(to_py_value_err)?;
-
         let run = RunOptions {
             start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
             max_depth,
@@ -153,7 +217,41 @@ impl PyGraph {
             progress,
         };
 
-        PySearchResult::from_result(py, kernel.run(&self.inner, run).map_err(to_py_runtime_err)?)
+        if let Some(parquet) = &self.parquet {
+            let Some(kernel) =
+                try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)?
+            else {
+                return Err(PyValueError::new_err(format!(
+                    "file-backed graph search requires a typed native kernel; {name:?} is not registered as typed"
+                )));
+            };
+            let result = match parquet.mode {
+                PayloadMode::Eager => kernel.run_eager_cached(&self.inner, &self.typed_cache, run),
+                PayloadMode::Lazy => {
+                    kernel.run_parquet_lazy(&self.inner, parquet.paths.clone(), run)
+                }
+            }
+            .map_err(to_py_runtime_err)?;
+            return PySearchResult::from_owned_result(py, result);
+        }
+
+        if let Some(kernel) = try_build_kernel(name, &params_json).map_err(to_py_value_err)? {
+            return PySearchResult::from_result(
+                py,
+                kernel.run(&self.inner, run).map_err(to_py_runtime_err)?,
+            );
+        }
+
+        if let Some(kernel) = try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)? {
+            let result = kernel
+                .run_eager_cached(&self.inner, &self.typed_cache, run)
+                .map_err(to_py_runtime_err)?;
+            return PySearchResult::from_owned_result(py, result);
+        }
+
+        Err(PyValueError::new_err(format!(
+            "unknown kernel {name:?}; no legacy or typed native kernel is registered with that name"
+        )))
     }
 
     #[pyo3(signature = (start, max_depth = None))]
@@ -278,7 +376,9 @@ impl PyGraph {
     fn set_payloads(&mut self, nodes: PyTable, edges: PyTable) -> PyResult<()> {
         self.inner
             .set_payloads(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
-            .map_err(to_py_value_err)
+            .map_err(to_py_value_err)?;
+        self.typed_cache = TypedPayloadCache::default();
+        Ok(())
     }
 }
 
@@ -418,6 +518,17 @@ impl PySearchResult {
             stats: result.stats.into(),
         })
     }
+
+    fn from_owned_result(_py: Python<'_>, result: OwnedSearchResult) -> PyResult<Self> {
+        Ok(Self {
+            paths: result
+                .paths
+                .into_iter()
+                .map(PySearchPath::from_owned_path)
+                .collect(),
+            stats: result.stats.into(),
+        })
+    }
 }
 
 #[pyclass(name = "SearchStats", frozen, skip_from_py_object)]
@@ -439,6 +550,10 @@ struct PySearchStats {
     stopped_paths: usize,
     #[pyo3(get)]
     max_depth: usize,
+    #[pyo3(get)]
+    materialized_node_payloads: usize,
+    #[pyo3(get)]
+    materialized_edge_payloads: usize,
 }
 
 impl From<SearchStats> for PySearchStats {
@@ -452,6 +567,8 @@ impl From<SearchStats> for PySearchStats {
             skipped_revisits: stats.skipped_revisits,
             stopped_paths: stats.stopped_paths,
             max_depth: stats.max_depth,
+            materialized_node_payloads: stats.materialized_node_payloads,
+            materialized_edge_payloads: stats.materialized_edge_payloads,
         }
     }
 }
@@ -473,6 +590,15 @@ impl PySearchPath {
             state: path.state,
             intermediate_states: path.intermediate_states,
         })
+    }
+
+    fn from_owned_path(path: crate::OwnedGraphPath) -> Self {
+        Self {
+            nodes: path.nodes,
+            edges: path.edges,
+            state: path.state,
+            intermediate_states: path.intermediate_states,
+        }
     }
 }
 
@@ -689,6 +815,16 @@ fn parse_strategy(strategy: &str) -> PyResult<TraversalStrategy> {
         "bfs" => Ok(TraversalStrategy::BreadthFirst),
         other => Err(PyValueError::new_err(format!(
             "unknown traversal strategy {other:?}; expected 'dfs' or 'bfs'"
+        ))),
+    }
+}
+
+fn parse_payload_mode(mode: &str) -> PyResult<PayloadMode> {
+    match mode {
+        "eager" => Ok(PayloadMode::Eager),
+        "lazy" => Ok(PayloadMode::Lazy),
+        other => Err(PyValueError::new_err(format!(
+            "payloads must be 'eager' or 'lazy', got {other:?}"
         ))),
     }
 }

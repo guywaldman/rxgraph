@@ -10,7 +10,7 @@ use anyhow::{Result, anyhow};
 use crate::{
     dsl::{StateRow, Value},
     graph::{Graph, NodeId, OwnedGraphId},
-    traversal::{EdgeCtx, Kernel},
+    traversal::{ArrowRow, EdgeCtx, Kernel, PayloadField, TypedKernel, native},
 };
 
 /// Per-path state for [`WeightedBudget`]: the weight accumulated so far.
@@ -116,5 +116,89 @@ crate::inventory::submit! {
     crate::KernelEntry {
         name: "weighted_budget",
         make: |params| Ok(crate::boxed_run(WeightedBudget::from_params(params)?)),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WeightedBudgetTyped {
+    pub weight_col: String,
+    pub budget: u64,
+    pub target: OwnedGraphId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetEdge {
+    pub weight: u64,
+}
+
+impl TryFrom<ArrowRow<'_>> for BudgetEdge {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowRow<'_>) -> Result<Self> {
+        Ok(Self {
+            weight: row.u64("weight")?.unwrap_or(0),
+        })
+    }
+}
+
+impl TypedKernel for WeightedBudgetTyped {
+    type Node = ();
+    type Edge = BudgetEdge;
+    type State = BudgetState;
+
+    fn edge_fields(&self) -> Vec<PayloadField> {
+        vec![PayloadField::aliased(self.weight_col.clone(), "weight")]
+    }
+
+    fn initial_state(
+        &self,
+        _cx: &native::StartCtx<'_, Self::Node, Self::Edge>,
+    ) -> Result<Self::State> {
+        Ok(BudgetState { spent: 0 })
+    }
+
+    fn visit(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
+        Ok(cx.state().spent.saturating_add(cx.edge()?.weight) <= self.budget)
+    }
+
+    fn next_state(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Self::State> {
+        Ok(BudgetState {
+            spent: cx.state().spent.saturating_add(cx.edge()?.weight),
+        })
+    }
+
+    fn stop(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
+        Ok(cx.dest_external_id()? == Some(self.target.as_ref()))
+    }
+
+    fn state_row(&self, state: &Self::State) -> StateRow {
+        vec![("spent".to_string(), Value::U64(state.spent))]
+    }
+}
+
+impl WeightedBudgetTyped {
+    fn from_params(params: &serde_json::Value) -> Result<Self> {
+        let base = WeightedBudget::from_params(params)?;
+        Ok(Self {
+            weight_col: base.weight_col,
+            budget: base.budget,
+            target: base.target,
+        })
+    }
+}
+
+crate::inventory::submit! {
+    crate::TypedKernelEntry {
+        name: "weighted_budget",
+        make: |params| Ok(crate::boxed_typed_run(WeightedBudgetTyped::from_params(params)?)),
     }
 }

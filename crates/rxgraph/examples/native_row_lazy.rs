@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use rxgraph::{
-    GraphId, NodeId, RunOptions, TraversalStrategy, search_native,
+    GraphId, NodeId, RunOptions, TraversalStrategy, Value, search_native,
     traversal::native::{self, GraphStore, OutgoingEdge},
 };
 
@@ -113,7 +113,10 @@ impl native::Kernel for RiskKernel {
         })
     }
 
-    fn visit(&self, cx: &native::EdgeCtx<'_, Self::Node, Self::Edge, Self::State>) -> Result<bool> {
+    fn visit(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
         let transfer = cx.edge()?;
         let dest = cx.dest()?;
         Ok(transfer.allowed
@@ -123,7 +126,7 @@ impl native::Kernel for RiskKernel {
 
     fn next_state(
         &self,
-        cx: &native::EdgeCtx<'_, Self::Node, Self::Edge, Self::State>,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
     ) -> Result<Self::State> {
         let transfer = cx.edge()?;
         let dest = cx.dest()?;
@@ -136,8 +139,15 @@ impl native::Kernel for RiskKernel {
         Ok(next)
     }
 
-    fn stop(&self, cx: &native::EdgeCtx<'_, Self::Node, Self::Edge, Self::State>) -> Result<bool> {
+    fn stop(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
         Ok(cx.dest()?.target && (!self.require_checkpoint || !cx.state().checkpoints.is_empty()))
+    }
+
+    fn state_row(&self, state: &Self::State) -> rxgraph::StateRow {
+        vec![("total_risk".to_string(), Value::U64(state.total_risk))]
     }
 }
 

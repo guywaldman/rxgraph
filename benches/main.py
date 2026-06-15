@@ -36,6 +36,8 @@ CACHE_ROOT = Path(tempfile.gettempdir()) / "rxgraph-bench-cache"
 class Lib(StrEnum):
     RX_DF = "rxgraph-df"
     RX_RUST_KERNEL = "rxgraph-rust-kernel"
+    RX_PARQUET_EAGER = "rxgraph-parquet-eager"
+    RX_PARQUET_LAZY = "rxgraph-parquet-lazy"
     RX_DF_STRING_IDS = "rxgraph-df-string-ids"
     RX_PYTHON = "rxgraph-python"
     NETWORKX = "networkx"
@@ -45,6 +47,8 @@ class Lib(StrEnum):
 LIB_ORDER = (
     Lib.RX_DF,
     Lib.RX_RUST_KERNEL,
+    Lib.RX_PARQUET_EAGER,
+    Lib.RX_PARQUET_LAZY,
     Lib.RX_PYTHON,
     Lib.RX_DF_STRING_IDS,
     Lib.IGRAPH,
@@ -117,6 +121,8 @@ class Data:
     nodes: pl.DataFrame
     edges: pl.DataFrame
     target_node: int | None = None
+    node_path: Path | None = None
+    edge_path: Path | None = None
 
     @property
     def target(self) -> int:
@@ -310,13 +316,19 @@ def cached_data(
     path = data_cache_path(cache_root, kind, nodes, factor_name, factor)
     node_path, edge_path = path / "nodes.parquet", path / "edges.parquet"
     if node_path.exists() and edge_path.exists():
-        return Data(pl.read_parquet(node_path), pl.read_parquet(edge_path), target_node)
+        return Data(
+            pl.read_parquet(node_path),
+            pl.read_parquet(edge_path),
+            target_node,
+            node_path,
+            edge_path,
+        )
 
     data = build()
     path.mkdir(parents=True, exist_ok=True)
     write_parquet(data.nodes, node_path)
     write_parquet(data.edges, edge_path)
-    return data
+    return Data(data.nodes, data.edges, data.target_node, node_path, edge_path)
 
 
 def data_cache_path(
@@ -644,6 +656,28 @@ def travel_cases(
                 build_times=built.build_times,
             )
         )
+    if Lib.RX_PARQUET_EAGER in graphs:
+        built = graphs[Lib.RX_PARQUET_EAGER]
+        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.RX_PARQUET_EAGER,
+                lambda graph=built.graph: graph.search(**native).paths,
+                build_times=built.build_times,
+            )
+        )
+    if Lib.RX_PARQUET_LAZY in graphs:
+        built = graphs[Lib.RX_PARQUET_LAZY]
+        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
+        cases.append(
+            Case(
+                Alg.TRAVERSAL,
+                Lib.RX_PARQUET_LAZY,
+                lambda graph=built.graph: graph.search(**native).paths,
+                build_times=built.build_times,
+            )
+        )
     if Lib.RX_DF_STRING_IDS in graphs:
         built = graphs[Lib.RX_DF_STRING_IDS]
         cases.append(
@@ -718,6 +752,18 @@ def travel_graphs(
             graphs[Lib.RX_DF] = built
         if libraries.matches(Lib.RX_RUST_KERNEL):
             graphs[Lib.RX_RUST_KERNEL] = built
+    if libraries.matches(Lib.RX_PARQUET_EAGER) or libraries.matches(
+        Lib.RX_PARQUET_LAZY
+    ):
+        node_path, edge_path = parquet_paths(data, "travel")
+        if libraries.matches(Lib.RX_PARQUET_EAGER):
+            graphs[Lib.RX_PARQUET_EAGER] = build_graph(
+                lambda: rxg.Graph.from_parquet(node_path, edge_path, payloads="eager")
+            )
+        if libraries.matches(Lib.RX_PARQUET_LAZY):
+            graphs[Lib.RX_PARQUET_LAZY] = build_graph(
+                lambda: rxg.Graph.from_parquet(node_path, edge_path, payloads="lazy")
+            )
     if libraries.matches(Lib.RX_DF_STRING_IDS):
         graphs[Lib.RX_DF_STRING_IDS] = build_graph(lambda: string_id_graph(data))
     if libraries.matches(Lib.RX_PYTHON):
@@ -858,6 +904,23 @@ def string_ids(data: Data) -> Data:
         ),
         data.target,
     )
+
+
+def parquet_paths(data: Data, kind: str) -> tuple[Path, Path]:
+    if data.node_path is not None and data.edge_path is not None:
+        return data.node_path, data.edge_path
+
+    path = (
+        CACHE_ROOT
+        / f"v{CACHE_VERSION}"
+        / f"adhoc-{kind}-nodes={data.nodes.height}-edges={data.edges.height}"
+    )
+    node_path, edge_path = path / "nodes.parquet", path / "edges.parquet"
+    if not node_path.exists() or not edge_path.exists():
+        path.mkdir(parents=True, exist_ok=True)
+        write_parquet(data.nodes, node_path)
+        write_parquet(data.edges, edge_path)
+    return node_path, edge_path
 
 
 def py_travel(
@@ -1125,6 +1188,8 @@ def is_rx(library: Lib | str) -> bool:
     return library in (
         Lib.RX_DF,
         Lib.RX_RUST_KERNEL,
+        Lib.RX_PARQUET_EAGER,
+        Lib.RX_PARQUET_LAZY,
         Lib.RX_DF_STRING_IDS,
         Lib.RX_PYTHON,
     )

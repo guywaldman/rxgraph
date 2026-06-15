@@ -171,6 +171,17 @@ result = graph.search(
 )
 ```
 
+File-backed graphs use the same plugin path and keep Python out of the search
+loop:
+
+```python
+graph = rxg.Graph.from_parquet(
+    nodes="nodes.parquet",
+    edges="edges.parquet",
+    payloads="lazy",
+)
+```
+
 The consumer's crate depends on `rxgraph` with the `python` feature (their own
 crate is the `cdylib` that needs pyo3's `extension-module`; rxgraph's `python`
 feature deliberately does not enable it):
@@ -181,17 +192,18 @@ rxgraph = { version = "0.6", features = ["python"] }
 pyo3 = { version = "0.28", features = ["extension-module"] }
 ```
 
-The Rust side implements `rxgraph::Kernel` and ends with a small macro call:
+The Rust side implements `rxgraph::TypedKernel`, decodes payload structs with
+`TryFrom<rxgraph::ArrowRow<'_>>`, and ends with a small macro call:
 
 ```rust
-rxgraph::plugin! {
+rxgraph::typed_plugin! {
     module = _native;
     "hop_budget" => HopBudget::from_params,
 }
 ```
 
 See [`examples/rust-kernel-plugin/`](examples/rust-kernel-plugin/README.md) for
-the full guide, including the `EdgeCtx` accessor reference and the maturin build.
+the full guide, including the typed payload shape and the maturin build.
 
 ## Architecture
 
