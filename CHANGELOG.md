@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/guywaldman/rxgraph/compare/v0.7.0...v0.8.0) (2026-06-15)
+
+
+### Features
+
+* (expriment) introduce a typed Rust kernel ([6714b7a](https://github.com/guywaldman/rxgraph/commit/6714b7ad55cfc0dfd3b506603932b22195df9a8b))
+
 ## [0.7.0](https://github.com/guywaldman/rxgraph/compare/v0.6.1...v0.7.0) (2026-06-14)
 
 
