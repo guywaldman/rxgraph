@@ -65,3 +65,12 @@ def test_from_parquet_lazy_matches_eager_and_decodes_touched_rows(tmp_path) -> N
     assert lazy_result.paths[0].state == {"spent": 2}
     assert lazy_result.stats.materialized_node_payloads < lazy.node_count
     assert lazy_result.stats.materialized_edge_payloads < lazy.edge_count
+    assert lazy_result.stats.lazy_payload_read_calls > 0
+    assert (
+        lazy_result.stats.lazy_payload_requested_rows
+        >= lazy_result.stats.materialized_edge_payloads
+    )
+    assert (
+        lazy_result.stats.lazy_payload_selected_rows
+        >= lazy_result.stats.lazy_payload_requested_rows
+    )

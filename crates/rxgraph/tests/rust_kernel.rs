@@ -1,12 +1,19 @@
 //! Integration tests for the example native kernel, exercised through the
 //! public `rxgraph` API exactly as an external Rust consumer would.
 
+use std::sync::Arc;
+
 use anyhow::Result;
-use arrow::array::record_batch;
+use arrow::{
+    array::{
+        Array, ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray, record_batch,
+    },
+    datatypes::{DataType, Field as ArrowField, Int64Type, Schema},
+};
 use pretty_assertions::assert_eq;
 use rxgraph::{
-    DslExpr as e, DslKernel, Graph, GraphId, RunOptions, TraversalConfigBuilder, TraversalStrategy,
-    Value,
+    ArrowRow, DslExpr as e, DslKernel, Graph, GraphId, RunOptions, TraversalConfigBuilder,
+    TraversalStrategy, Value,
     examples::kernels::{BudgetState, WeightedBudget},
 };
 
@@ -231,6 +238,54 @@ fn dsl_equivalent_kernel_matches_native_node_sequences() -> Result<()> {
     )?;
 
     assert_eq!(summarize(&dsl_result), summarize(&native_result));
+    Ok(())
+}
+
+#[test]
+fn arrow_row_reads_nested_values() -> Result<()> {
+    let items =
+        ListArray::from_iter_primitive::<Int64Type, _, _>(vec![Some(vec![Some(1), Some(2)]), None]);
+    let meta = StructArray::from(vec![
+        (
+            Arc::new(ArrowField::new("name", DataType::Utf8, true)),
+            Arc::new(StringArray::from(vec![Some("a"), Some("b")])) as ArrayRef,
+        ),
+        (
+            Arc::new(ArrowField::new("score", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(7), None])) as ArrayRef,
+        ),
+    ]);
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new("items", items.data_type().clone(), true),
+            ArrowField::new("meta", meta.data_type().clone(), true),
+        ])),
+        vec![Arc::new(items), Arc::new(meta)],
+    )?;
+
+    let row = ArrowRow::new(&batch, 0);
+    assert_eq!(
+        row.value("items")?,
+        Value::List(vec![Value::I64(1), Value::I64(2)])
+    );
+    assert_eq!(row.list("items")?, Some(vec![Value::I64(1), Value::I64(2)]));
+    assert_eq!(
+        row.struct_fields("meta")?,
+        Some(vec![
+            ("name".to_string(), Value::Str(Arc::from("a"))),
+            ("score".to_string(), Value::I64(7)),
+        ])
+    );
+
+    let row = ArrowRow::new(&batch, 1);
+    assert_eq!(row.list("items")?, None);
+    assert_eq!(
+        row.struct_fields("meta")?,
+        Some(vec![
+            ("name".to_string(), Value::Str(Arc::from("b"))),
+            ("score".to_string(), Value::Null),
+        ])
+    );
     Ok(())
 }
 

@@ -235,18 +235,18 @@ impl PyGraph {
             return PySearchResult::from_owned_result(py, result);
         }
 
-        if let Some(kernel) = try_build_kernel(name, &params_json).map_err(to_py_value_err)? {
-            return PySearchResult::from_result(
-                py,
-                kernel.run(&self.inner, run).map_err(to_py_runtime_err)?,
-            );
-        }
-
         if let Some(kernel) = try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)? {
             let result = kernel
                 .run_eager_cached(&self.inner, &self.typed_cache, run)
                 .map_err(to_py_runtime_err)?;
             return PySearchResult::from_owned_result(py, result);
+        }
+
+        if let Some(kernel) = try_build_kernel(name, &params_json).map_err(to_py_value_err)? {
+            return PySearchResult::from_result(
+                py,
+                kernel.run(&self.inner, run).map_err(to_py_runtime_err)?,
+            );
         }
 
         Err(PyValueError::new_err(format!(
@@ -554,6 +554,14 @@ struct PySearchStats {
     materialized_node_payloads: usize,
     #[pyo3(get)]
     materialized_edge_payloads: usize,
+    #[pyo3(get)]
+    lazy_payload_read_calls: usize,
+    #[pyo3(get)]
+    lazy_payload_requested_rows: usize,
+    #[pyo3(get)]
+    lazy_payload_selected_rows: usize,
+    #[pyo3(get)]
+    lazy_payload_row_groups: usize,
 }
 
 impl From<SearchStats> for PySearchStats {
@@ -569,6 +577,10 @@ impl From<SearchStats> for PySearchStats {
             max_depth: stats.max_depth,
             materialized_node_payloads: stats.materialized_node_payloads,
             materialized_edge_payloads: stats.materialized_edge_payloads,
+            lazy_payload_read_calls: stats.lazy_payload_read_calls,
+            lazy_payload_requested_rows: stats.lazy_payload_requested_rows,
+            lazy_payload_selected_rows: stats.lazy_payload_selected_rows,
+            lazy_payload_row_groups: stats.lazy_payload_row_groups,
         }
     }
 }

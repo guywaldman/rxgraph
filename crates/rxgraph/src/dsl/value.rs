@@ -113,7 +113,7 @@ impl Value {
         }
     }
 
-    pub(crate) fn as_list(&self) -> Result<Option<&[Value]>> {
+    pub fn as_list(&self) -> Result<Option<&[Value]>> {
         match self {
             Self::Null => Ok(None),
             Self::List(values) => Ok(Some(values)),
@@ -121,7 +121,23 @@ impl Value {
         }
     }
 
-    pub(crate) fn into_struct(self) -> Result<Option<Vec<(String, Value)>>> {
+    pub fn into_list(self) -> Result<Option<Vec<Value>>> {
+        match self {
+            Self::Null => Ok(None),
+            Self::List(values) => Ok(Some(values)),
+            other => bail!("expected list, got {other:?}"),
+        }
+    }
+
+    pub fn as_struct(&self) -> Result<Option<&[(String, Value)]>> {
+        match self {
+            Self::Null => Ok(None),
+            Self::Struct(fields) => Ok(Some(fields)),
+            other => bail!("expected struct, got {other:?}"),
+        }
+    }
+
+    pub fn into_struct(self) -> Result<Option<Vec<(String, Value)>>> {
         match self {
             Self::Null => Ok(None),
             Self::Struct(fields) => Ok(Some(fields)),

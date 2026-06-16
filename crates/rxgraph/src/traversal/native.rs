@@ -385,6 +385,10 @@ where
         self.kernel.initial_state(&cx)
     }
 
+    fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
+        self.store.prefetch_outgoing(nodes)
+    }
+
     fn out_degree(&self, node: NodeId) -> Result<usize> {
         self.store.prefetch_outgoing(&[node])?;
         Ok(self.store.outgoing(node)?.len())

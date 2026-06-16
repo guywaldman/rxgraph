@@ -300,7 +300,7 @@ pub(crate) fn ipc_list_literal_to_value(bytes: &[u8]) -> Result<Value> {
         .map(Value::List)
 }
 
-fn array_row_to_value(array: &dyn Array, row: usize) -> Result<Value> {
+pub(crate) fn array_row_to_value(array: &dyn Array, row: usize) -> Result<Value> {
     macro_rules! primitive {
         ($array:ty, $value:expr) => {
             if let Some(array) = array.as_any().downcast_ref::<$array>() {

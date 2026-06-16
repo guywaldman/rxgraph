@@ -15,6 +15,7 @@ import math
 import statistics
 import tempfile
 import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
@@ -29,15 +30,15 @@ from rich.table import Table
 from rich.text import Text
 
 SAME = 1.05
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 CACHE_ROOT = Path(tempfile.gettempdir()) / "rxgraph-bench-cache"
 
 
 class Lib(StrEnum):
     RX_DF = "rxgraph-df"
-    RX_RUST_KERNEL = "rxgraph-rust-kernel"
-    RX_PARQUET_EAGER = "rxgraph-parquet-eager"
-    RX_PARQUET_LAZY = "rxgraph-parquet-lazy"
+    RX_NATIVE_INMEMORY = "rxgraph-native-inmemory"
+    RX_NATIVE_PARQUET_EAGER = "rxgraph-native-parquet-eager"
+    RX_NATIVE_PARQUET_LAZY = "rxgraph-native-parquet-lazy"
     RX_DF_STRING_IDS = "rxgraph-df-string-ids"
     RX_PYTHON = "rxgraph-python"
     NETWORKX = "networkx"
@@ -46,9 +47,9 @@ class Lib(StrEnum):
 
 LIB_ORDER = (
     Lib.RX_DF,
-    Lib.RX_RUST_KERNEL,
-    Lib.RX_PARQUET_EAGER,
-    Lib.RX_PARQUET_LAZY,
+    Lib.RX_NATIVE_INMEMORY,
+    Lib.RX_NATIVE_PARQUET_EAGER,
+    Lib.RX_NATIVE_PARQUET_LAZY,
     Lib.RX_PYTHON,
     Lib.RX_DF_STRING_IDS,
     Lib.IGRAPH,
@@ -61,7 +62,14 @@ class Alg(StrEnum):
     SHORTEST_PATH = "shortest_path"
     DEGREES = "degrees"
     WEAK_COMPONENTS = "weak_components"
-    TRAVERSAL = "traversal"
+    TRAVERSAL_BFS = "traversal_bfs"
+    TRAVERSAL_DFS = "traversal_dfs"
+
+
+TRAVERSAL_STRATEGIES = (
+    (Alg.TRAVERSAL_BFS, "bfs"),
+    (Alg.TRAVERSAL_DFS, "dfs"),
+)
 
 
 class ScaleName(StrEnum):
@@ -89,24 +97,10 @@ class Field(StrEnum):
     DETOURS = "detours"
 
 
-class RouteKind(StrEnum):
-    ROUTE = "route"
-    SKIP = "skip"
-
-
 class Scope(StrEnum):
     STATE = "state"
     DEST = "dest"
     EDGE = "edge"
-
-
-INIT = {
-    Field.SPENT: 0,
-    Field.HOPS: 0,
-    Field.READY_AT: 0,
-    Field.RISK: 0,
-    Field.DETOURS: 0,
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,10 +211,20 @@ def args_parser() -> argparse.ArgumentParser:
         ("extra_edges", 4),
         ("runs", 10),
         ("warmups", 3),
-        ("max_paths", 50),
-        ("traversal_fanout", 256),
     ]:
         p.add_argument(f"--{name.replace('_', '-')}", type=int, default=default)
+    p.add_argument(
+        "--max-paths",
+        type=int,
+        default=50,
+        help="Traversal result cap at mid scale; low/high scales are proportional.",
+    )
+    p.add_argument(
+        "--traversal-fanout",
+        type=int,
+        default=1,
+        help="Unreachable filler edge stride families per node for traversal data.",
+    )
     p.add_argument(
         "--include",
         default="",
@@ -253,40 +257,65 @@ def make_scales(args: argparse.Namespace) -> list[Scale]:
 def run_scale(scale: Scale, args: argparse.Namespace) -> list[Result]:
     libraries = library_filter(args)
     cache_root = benchmark_cache_root(args)
-    simple, travel = (
-        cached_data(
-            cache_root,
-            "simple",
-            scale.nodes,
-            "fanout",
-            scale.fanout,
-            simple_target_node(scale.nodes),
-            lambda: simple_data(scale.nodes, scale.fanout),
-        ),
-        cached_data(
-            cache_root,
+    case_data: list[tuple[Case, Data]] = []
+    if wants_simple(libraries):
+        simple = simple_data(scale.nodes, scale.fanout)
+        case_data += [(case, simple) for case in simple_cases(simple, libraries)]
+
+    if wants_travel(libraries):
+        max_paths = traversal_max_paths(scale, args)
+        travel_cache_root = cache_root if wants_file_backed_travel(libraries) else None
+        travel = cached_data(
+            travel_cache_root,
             "travel",
             scale.nodes,
-            "noise",
-            args.traversal_fanout,
-            None,
-            lambda: travel_data(scale.nodes, args.traversal_fanout),
-        ),
-    )
-    travel_graph_cache = travel_graphs(travel, libraries)
-    cases = simple_cases(simple, libraries) + travel_cases(
-        travel, args.max_paths, libraries, travel_graph_cache
-    )
+            f"paths={max_paths}-filler={args.traversal_fanout}",
+            scale.nodes - 1,
+            lambda: travel_data(scale.nodes, max_paths, args.traversal_fanout),
+        )
+        travel_graph_cache = travel_graphs(travel, libraries)
+        case_data += [
+            (case, travel)
+            for case in travel_cases(travel, max_paths, libraries, travel_graph_cache)
+        ]
+
     return [
         measure(
             case,
             scale,
-            travel if case.alg == Alg.TRAVERSAL else simple,
+            data,
             args.warmups,
             args.runs,
         )
-        for case in cases
+        for case, data in case_data
     ]
+
+
+def wants_simple(libraries: LibraryFilter) -> bool:
+    return any(
+        libraries.matches(lib)
+        for lib in (
+            Lib.RX_DF,
+            Lib.RX_DF_STRING_IDS,
+            Lib.RX_PYTHON,
+            Lib.NETWORKX,
+            Lib.IGRAPH,
+        )
+    )
+
+
+def wants_travel(libraries: LibraryFilter) -> bool:
+    return any(libraries.matches(lib) for lib in LIB_ORDER)
+
+
+def wants_file_backed_travel(libraries: LibraryFilter) -> bool:
+    return libraries.matches(Lib.RX_NATIVE_PARQUET_EAGER) or libraries.matches(
+        Lib.RX_NATIVE_PARQUET_LAZY
+    )
+
+
+def traversal_max_paths(scale: Scale, args: argparse.Namespace) -> int:
+    return max(1, round(args.max_paths * scale.nodes / max(args.mid_nodes, 1)))
 
 
 def library_terms(value: str) -> tuple[str, ...]:
@@ -305,15 +334,14 @@ def cached_data(
     cache_root: Path | None,
     kind: str,
     nodes: int,
-    factor_name: str,
-    factor: int,
+    variant: str,
     target_node: int | None,
     build: Callable[[], Data],
 ) -> Data:
     if cache_root is None:
         return build()
 
-    path = data_cache_path(cache_root, kind, nodes, factor_name, factor)
+    path = data_cache_path(cache_root, kind, nodes, variant)
     node_path, edge_path = path / "nodes.parquet", path / "edges.parquet"
     if node_path.exists() and edge_path.exists():
         return Data(
@@ -331,14 +359,8 @@ def cached_data(
     return Data(data.nodes, data.edges, data.target_node, node_path, edge_path)
 
 
-def data_cache_path(
-    cache_root: Path, kind: str, nodes: int, factor_name: str, factor: int
-) -> Path:
-    return (
-        cache_root
-        / f"v{CACHE_VERSION}"
-        / f"{kind}-nodes={nodes}-{factor_name}={factor}"
-    )
+def data_cache_path(cache_root: Path, kind: str, nodes: int, variant: str) -> Path:
+    return cache_root / f"v{CACHE_VERSION}" / f"{kind}-nodes={nodes}-{variant}"
 
 
 def write_parquet(frame: pl.DataFrame, path: Path) -> None:
@@ -357,106 +379,60 @@ def simple_target_node(n: int) -> int:
 
 def simple_data(n: int, fanout: int) -> Data:
     main = simple_main(n)
-    edges = [
-        (src, dst)
-        for src in range(main - 1)
-        for step in range(1, fanout + 2)
-        if (dst := src + step) < main and (step == 1 or dst % step == 0)
-    ]
-    return Data(
-        df({Field.ID: range(n)}, {Field.ID: pl.UInt64}),
-        df(
+    edge_frames = []
+    for step in range(1, fanout + 2):
+        count = max(main - step, 0)
+        if count == 0:
+            continue
+        frame = pl.DataFrame(
             {
-                Field.ID: range(len(edges)),
-                Field.SRC: [s for s, _ in edges],
-                Field.DEST: [d for _, d in edges],
-            },
-            {Field.ID: pl.UInt64, Field.SRC: pl.UInt64, Field.DEST: pl.UInt64},
-        ),
+                Field.SRC: pl.arange(0, count, eager=True, dtype=pl.UInt64),
+                Field.DEST: pl.arange(step, main, eager=True, dtype=pl.UInt64),
+            }
+        )
+        if step != 1:
+            frame = frame.filter(pl.col(Field.DEST) % step == 0)
+        edge_frames.append(frame)
+    edges = pl.concat(edge_frames) if edge_frames else edge_frame()
+    return Data(
+        id_frame(n),
+        with_edge_ids(edges),
         main - 1,
     )
 
 
-def travel_data(n: int, noise: int) -> Data:
-    step = max(n // 18, 1)
-    strides = sorted(
-        {
-            1,
-            2,
-            3,
-            5,
-            8,
-            13,
-            21,
-            max(step - 1, 1),
-            step,
-            step + 1,
-            max(n // 7, 1),
-            max(n // 5, 1),
-        }
-    )
-    rows = []
-    for src in range(n - 1):
-        rows += [
-            flight(
-                src,
-                min(src + st, n - 1),
-                25 + ((st * 3 + src) % 110),
-                92 if st in strides[-4:] else 45,
-                RouteKind.ROUTE,
-                0,
-            )
-            for st in strides
-            if min(src + st, n - 1) != src
+def travel_data(n: int, max_paths: int, filler_fanout: int = 1) -> Data:
+    target = n - 1
+    lanes = min(max(max_paths, 0), max(n - 2, 0))
+    frames = []
+    if lanes:
+        lane_nodes = pl.arange(1, lanes + 1, eager=True, dtype=pl.UInt64)
+        frames += [
+            edge_frame(
+                pl.repeat(0, lanes, eager=True, dtype=pl.UInt64),
+                lane_nodes,
+                1,
+            ),
+            edge_frame(
+                lane_nodes,
+                pl.repeat(target, lanes, eager=True, dtype=pl.UInt64),
+                1,
+            ),
         ]
-        if src % step == 0 or src % max(n // 5, 1) == 0 or src % max(n // 7, 1) == 0:
-            rows += [
-                flight(
-                    src,
-                    dst,
-                    20 + i % 50,
-                    95 if i % 5 == 0 else 35 + i % 30,
-                    RouteKind.ROUTE if i % 5 == 0 else RouteKind.SKIP,
-                    int(i % 5 == 0),
-                )
-                for i in range(max(noise, 0))
-                if (dst := 1 + ((src + i * 37 + 17) % (n - 1))) != src
-            ]
-    for i, row in enumerate(rows):
-        row[Field.ID] = i
 
+    filler_start = lanes + 1
+    filler_count = max(target - filler_start, 0)
+    if filler_count > 1:
+        for step in range(1, max(filler_fanout, 0) + 1):
+            src = pl.arange(filler_start, target, eager=True, dtype=pl.UInt64)
+            dest = ((src - filler_start + step) % filler_count) + filler_start
+            frames.append(edge_frame(src, dest, 1_000))
+
+    edges = pl.concat(frames) if frames else edge_frame()
     return Data(
-        df(
-            {
-                Field.ID: range(n),
-                Field.RISK: [(i * 7) % 9 for i in range(n)],
-                Field.MIN_CONNECTION: [35 + ((i * 11) % 50) for i in range(n)],
-                Field.CLOSED: [
-                    i not in {0, n - 1} and i % 23 == 0 and i % step != 0
-                    for i in range(n)
-                ],
-            },
-            {
-                Field.ID: pl.UInt64,
-                Field.RISK: pl.Int32,
-                Field.MIN_CONNECTION: pl.UInt64,
-                Field.CLOSED: pl.Boolean,
-            },
-        ),
-        df(
-            rows,
-            {
-                Field.ID: pl.UInt64,
-                Field.SRC: pl.UInt64,
-                Field.DEST: pl.UInt64,
-                Field.PRICE: pl.UInt64,
-                Field.DEPARTURE: pl.UInt64,
-                Field.ARRIVAL: pl.UInt64,
-                Field.RELIABILITY: pl.Int32,
-                Field.ROUTE_KIND: pl.String,
-                Field.DETOUR_COST: pl.UInt64,
-            },
-        ),
+        id_frame(n),
+        with_edge_ids(edges),
+        target,
     )
 
 
@@ -464,20 +440,37 @@ def df(data: Any, schema: dict[str, Any]) -> pl.DataFrame:
     return pl.DataFrame(data, schema=schema)
 
 
-def flight(
-    src: int, dst: int, price: int, reliability: int, kind: RouteKind, detour: int
-) -> dict[Field, int | str]:
-    depart = src * 120 + (dst % 9) * 7
-    return {
-        Field.SRC: src,
-        Field.DEST: dst,
-        Field.PRICE: price,
-        Field.DEPARTURE: depart,
-        Field.ARRIVAL: depart + 45 + ((dst * 13 + src) % 240),
-        Field.RELIABILITY: reliability,
-        Field.ROUTE_KIND: kind,
-        Field.DETOUR_COST: detour,
-    }
+def id_frame(n: int) -> pl.DataFrame:
+    return pl.DataFrame({Field.ID: pl.arange(0, n, eager=True, dtype=pl.UInt64)})
+
+
+def edge_frame(
+    src: pl.Series | None = None, dest: pl.Series | None = None, price: int | None = None
+) -> pl.DataFrame:
+    if src is None or dest is None:
+        return pl.DataFrame(
+            {
+                Field.SRC: pl.Series([], dtype=pl.UInt64),
+                Field.DEST: pl.Series([], dtype=pl.UInt64),
+                Field.PRICE: pl.Series([], dtype=pl.UInt64),
+            }
+        )
+    frame = pl.DataFrame({Field.SRC: src, Field.DEST: dest})
+    if price is not None:
+        frame = frame.with_columns(pl.lit(price, dtype=pl.UInt64).alias(Field.PRICE))
+    return frame
+
+
+def with_edge_ids(edges: pl.DataFrame) -> pl.DataFrame:
+    return (
+        edges.with_row_index(Field.ID)
+        .with_columns(pl.col(Field.ID).cast(pl.UInt64))
+        .select(Field.ID, Field.SRC, Field.DEST, *edge_payload_fields(edges))
+    )
+
+
+def edge_payload_fields(edges: pl.DataFrame) -> list[Field]:
+    return [field for field in [Field.PRICE] if field in edges.columns]
 
 
 def build_graph(build: Callable[[], Any]) -> BuiltGraph:
@@ -632,104 +625,113 @@ def travel_cases(
     graphs: dict[Lib, BuiltGraph] | None = None,
 ) -> list[Case]:
     graphs = graphs if graphs is not None else travel_graphs(data, libraries)
-    traversal = travel_search_kwargs(data.target, [0], max_paths)
-    string_traversal = travel_search_kwargs(str(data.target), ["0"], max_paths)
     cases = []
-    if Lib.RX_DF in graphs:
-        built = graphs[Lib.RX_DF]
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_DF,
-                lambda graph=built.graph: graph.search(**traversal).paths,
-                build_times=built.build_times,
-            )
+    for alg, strategy in TRAVERSAL_STRATEGIES:
+        traversal = weighted_budget_search_kwargs(data.target, [0], max_paths, strategy)
+        string_traversal = weighted_budget_search_kwargs(
+            str(data.target), ["0"], max_paths, strategy
         )
-    if Lib.RX_RUST_KERNEL in graphs:
-        built = graphs[Lib.RX_RUST_KERNEL]
-        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_RUST_KERNEL,
-                lambda graph=built.graph: graph.search(**native).paths,
-                build_times=built.build_times,
+        if Lib.RX_DF in graphs:
+            built = graphs[Lib.RX_DF]
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_DF,
+                    lambda graph=built.graph, traversal=traversal: graph.search(
+                        **traversal
+                    ).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if Lib.RX_PARQUET_EAGER in graphs:
-        built = graphs[Lib.RX_PARQUET_EAGER]
-        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_PARQUET_EAGER,
-                lambda graph=built.graph: graph.search(**native).paths,
-                build_times=built.build_times,
+        if Lib.RX_NATIVE_INMEMORY in graphs:
+            built = graphs[Lib.RX_NATIVE_INMEMORY]
+            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_NATIVE_INMEMORY,
+                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if Lib.RX_PARQUET_LAZY in graphs:
-        built = graphs[Lib.RX_PARQUET_LAZY]
-        native = weighted_budget_kernel_kwargs(data.target, [0], max_paths)
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_PARQUET_LAZY,
-                lambda graph=built.graph: graph.search(**native).paths,
-                build_times=built.build_times,
+        if Lib.RX_NATIVE_PARQUET_EAGER in graphs:
+            built = graphs[Lib.RX_NATIVE_PARQUET_EAGER]
+            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_NATIVE_PARQUET_EAGER,
+                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if Lib.RX_DF_STRING_IDS in graphs:
-        built = graphs[Lib.RX_DF_STRING_IDS]
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_DF_STRING_IDS,
-                lambda graph=built.graph: graph.search(**string_traversal).paths,
-                build_times=built.build_times,
+        if Lib.RX_NATIVE_PARQUET_LAZY in graphs:
+            built = graphs[Lib.RX_NATIVE_PARQUET_LAZY]
+            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_NATIVE_PARQUET_LAZY,
+                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if Lib.RX_PYTHON in graphs:
-        built = graphs[Lib.RX_PYTHON]
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.RX_PYTHON,
-                lambda graph=built.graph: graph.search(**traversal).paths,
-                build_times=built.build_times,
+        if Lib.RX_DF_STRING_IDS in graphs:
+            built = graphs[Lib.RX_DF_STRING_IDS]
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_DF_STRING_IDS,
+                    lambda graph=built.graph, string_traversal=string_traversal: graph.search(
+                        **string_traversal
+                    ).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if built := graphs.get(Lib.NETWORKX):
-        nxg = built.graph
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.NETWORKX,
-                lambda: py_travel(
-                    lambda n: ((d, e) for _, d, e in nxg.out_edges(n, data=True)),
-                    lambda n: nxg.nodes[n],
-                    data.target,
-                    max_paths,
-                ),
-                build_times=built.build_times,
+        if Lib.RX_PYTHON in graphs:
+            built = graphs[Lib.RX_PYTHON]
+            cases.append(
+                Case(
+                    alg,
+                    Lib.RX_PYTHON,
+                    lambda graph=built.graph, traversal=traversal: graph.search(
+                        **traversal
+                    ).paths,
+                    build_times=built.build_times,
+                )
             )
-        )
-    if built := graphs.get(Lib.IGRAPH):
-        igg = built.graph
-        cases.append(
-            Case(
-                Alg.TRAVERSAL,
-                Lib.IGRAPH,
-                lambda: py_travel(
-                    lambda n: (
-                        (e.target, e.attributes()) for e in igg.es.select(_source=n)
+        if built := graphs.get(Lib.NETWORKX):
+            nxg = built.graph
+            cases.append(
+                Case(
+                    alg,
+                    Lib.NETWORKX,
+                    lambda strategy=strategy: py_weighted_budget(
+                        lambda n: ((d, e) for _, d, e in nxg.out_edges(n, data=True)),
+                        data.target,
+                        max_paths,
+                        strategy=strategy,
                     ),
-                    lambda n: igg.vs[n].attributes(),
-                    data.target,
-                    max_paths,
-                ),
-                build_times=built.build_times,
+                    build_times=built.build_times,
+                )
             )
-        )
+        if built := graphs.get(Lib.IGRAPH):
+            igg = built.graph
+            cases.append(
+                Case(
+                    alg,
+                    Lib.IGRAPH,
+                    lambda strategy=strategy: py_weighted_budget(
+                        lambda n: (
+                            (e.target, e.attributes()) for e in igg.es.select(_source=n)
+                        ),
+                        data.target,
+                        max_paths,
+                        strategy=strategy,
+                    ),
+                    build_times=built.build_times,
+                )
+            )
     return cases
 
 
@@ -746,22 +748,22 @@ def travel_graphs(
             nodes, edges = data.nodes.to_dicts(), data.edges.to_dicts()
         return nodes, edges
 
-    if libraries.matches(Lib.RX_DF) or libraries.matches(Lib.RX_RUST_KERNEL):
+    if libraries.matches(Lib.RX_DF) or libraries.matches(Lib.RX_NATIVE_INMEMORY):
         built = build_graph(lambda: rxg.Graph(data.nodes, data.edges))
         if libraries.matches(Lib.RX_DF):
             graphs[Lib.RX_DF] = built
-        if libraries.matches(Lib.RX_RUST_KERNEL):
-            graphs[Lib.RX_RUST_KERNEL] = built
-    if libraries.matches(Lib.RX_PARQUET_EAGER) or libraries.matches(
-        Lib.RX_PARQUET_LAZY
+        if libraries.matches(Lib.RX_NATIVE_INMEMORY):
+            graphs[Lib.RX_NATIVE_INMEMORY] = built
+    if libraries.matches(Lib.RX_NATIVE_PARQUET_EAGER) or libraries.matches(
+        Lib.RX_NATIVE_PARQUET_LAZY
     ):
         node_path, edge_path = parquet_paths(data, "travel")
-        if libraries.matches(Lib.RX_PARQUET_EAGER):
-            graphs[Lib.RX_PARQUET_EAGER] = build_graph(
+        if libraries.matches(Lib.RX_NATIVE_PARQUET_EAGER):
+            graphs[Lib.RX_NATIVE_PARQUET_EAGER] = build_graph(
                 lambda: rxg.Graph.from_parquet(node_path, edge_path, payloads="eager")
             )
-        if libraries.matches(Lib.RX_PARQUET_LAZY):
-            graphs[Lib.RX_PARQUET_LAZY] = build_graph(
+        if libraries.matches(Lib.RX_NATIVE_PARQUET_LAZY):
+            graphs[Lib.RX_NATIVE_PARQUET_LAZY] = build_graph(
                 lambda: rxg.Graph.from_parquet(node_path, edge_path, payloads="lazy")
             )
     if libraries.matches(Lib.RX_DF_STRING_IDS):
@@ -821,41 +823,11 @@ def travel_igraph_graph(
     return graph
 
 
-def travel_search_kwargs(
-    target: int | str, start_nodes: list[int | str], max_paths: int
-) -> dict[str, Any]:
-    s, d, e = (
-        (lambda n: rxg.col(f"{Scope.STATE}.{n}")),
-        (lambda n: rxg.col(f"{Scope.DEST}.{n}")),
-        (lambda n: rxg.col(f"{Scope.EDGE}.{n}")),
-    )
-    return {
-        "start_nodes": start_nodes,
-        "visit": (s(Field.DETOURS) == 0)
-        & ~d(Field.CLOSED)
-        & (e(Field.RELIABILITY) >= 70)
-        & (e(Field.ROUTE_KIND) != RouteKind.SKIP)
-        & (s(Field.HOPS) < 18)
-        & ((s(Field.SPENT) + e(Field.PRICE)) <= 950)
-        & (e(Field.DEPARTURE) >= s(Field.READY_AT))
-        & ((s(Field.RISK) + d(Field.RISK)) <= 90),
-        "next_state": {
-            Field.SPENT: s(Field.SPENT) + e(Field.PRICE),
-            Field.HOPS: s(Field.HOPS) + 1,
-            Field.READY_AT: e(Field.ARRIVAL) + d(Field.MIN_CONNECTION),
-            Field.RISK: s(Field.RISK) + d(Field.RISK),
-            Field.DETOURS: s(Field.DETOURS) + e(Field.DETOUR_COST),
-        },
-        "stop": rxg.col(f"{Scope.DEST}.{Field.ID}") == target,
-        "initial_state": INIT,
-        "max_depth": 18,
-        "max_paths": max_paths,
-        "strategy": "dfs",
-    }
-
-
 def weighted_budget_search_kwargs(
-    target: int | str, start_nodes: list[int | str], max_paths: int
+    target: int | str,
+    start_nodes: list[int | str],
+    max_paths: int,
+    strategy: str = "bfs",
 ) -> dict[str, Any]:
     s, d, e = (
         (lambda n: rxg.col(f"{Scope.STATE}.{n}")),
@@ -872,12 +844,15 @@ def weighted_budget_search_kwargs(
         "initial_state": {Field.SPENT: 0},
         "max_depth": 18,
         "max_paths": max_paths,
-        "strategy": "dfs",
+        "strategy": strategy,
     }
 
 
 def weighted_budget_kernel_kwargs(
-    target: int | str, start_nodes: list[int | str], max_paths: int
+    target: int | str,
+    start_nodes: list[int | str],
+    max_paths: int,
+    strategy: str = "bfs",
 ) -> dict[str, Any]:
     return {
         "start_nodes": start_nodes,
@@ -890,7 +865,7 @@ def weighted_budget_kernel_kwargs(
         "columns": [Field.PRICE.value],
         "max_depth": 18,
         "max_paths": max_paths,
-        "strategy": "dfs",
+        "strategy": strategy,
     }
 
 
@@ -923,46 +898,30 @@ def parquet_paths(data: Data, kind: str) -> tuple[Path, Path]:
     return node_path, edge_path
 
 
-def py_travel(
+def py_weighted_budget(
     out_edges: Callable[[int], Any],
-    node_data: Callable[[int], dict[str, Any]],
     target: int,
     max_paths: int,
+    budget: int = 950,
+    strategy: str = "bfs",
 ) -> list[tuple[int, ...]]:
-    frontier, paths = [(0, (0,), INIT)], []
+    frontier, paths = deque([(0, (0,), 0)]), []
     while frontier and len(paths) < max_paths:
-        node, path, state = frontier.pop()
+        node, path, spent = (
+            frontier.popleft() if strategy == "bfs" else frontier.pop()
+        )
         for dst, edge in out_edges(node):
-            dest = node_data(dst)
-            if dst in path or not visit(dest, edge, state):
+            next_spent = spent + edge[Field.PRICE]
+            if dst in path or next_spent > budget:
                 continue
-            next_state = {
-                Field.SPENT: state[Field.SPENT] + edge[Field.PRICE],
-                Field.HOPS: state[Field.HOPS] + 1,
-                Field.READY_AT: edge[Field.ARRIVAL] + dest[Field.MIN_CONNECTION],
-                Field.RISK: state[Field.RISK] + dest[Field.RISK],
-                Field.DETOURS: state[Field.DETOURS] + edge[Field.DETOUR_COST],
-            }
             next_path = (*path, dst)
-            paths.append(next_path) if dst == target else frontier.append(
-                (dst, next_path, next_state)
-            )
+            if dst == target:
+                paths.append(next_path)
+            else:
+                frontier.append((dst, next_path, next_spent))
             if len(paths) >= max_paths:
                 break
     return paths
-
-
-def visit(dest: dict[str, Any], edge: dict[str, Any], state: dict[str, int]) -> bool:
-    return (
-        state[Field.DETOURS] == 0
-        and not dest[Field.CLOSED]
-        and edge[Field.RELIABILITY] >= 70
-        and edge[Field.ROUTE_KIND] != RouteKind.SKIP
-        and state[Field.HOPS] < 18
-        and state[Field.SPENT] + edge[Field.PRICE] <= 950
-        and edge[Field.DEPARTURE] >= state[Field.READY_AT]
-        and state[Field.RISK] + dest[Field.RISK] <= 90
-    )
 
 
 def measure(case: Case, scale: Scale, data: Data, warmups: int, runs: int) -> Result:
@@ -1187,9 +1146,9 @@ def opt(name: Lib | str) -> Any | None:
 def is_rx(library: Lib | str) -> bool:
     return library in (
         Lib.RX_DF,
-        Lib.RX_RUST_KERNEL,
-        Lib.RX_PARQUET_EAGER,
-        Lib.RX_PARQUET_LAZY,
+        Lib.RX_NATIVE_INMEMORY,
+        Lib.RX_NATIVE_PARQUET_EAGER,
+        Lib.RX_NATIVE_PARQUET_LAZY,
         Lib.RX_DF_STRING_IDS,
         Lib.RX_PYTHON,
     )

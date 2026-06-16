@@ -32,6 +32,9 @@ pub(crate) trait SearchAdapter {
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>>;
     fn initial_state(&self, node: NodeId) -> Result<Self::State>;
+    fn prefetch_outgoing(&self, _nodes: &[NodeId]) -> Result<()> {
+        Ok(())
+    }
     fn out_degree(&self, node: NodeId) -> Result<usize>;
     fn for_each_outgoing<F>(&self, node: NodeId, visit: F) -> Result<()>
     where
@@ -136,6 +139,10 @@ fn search_serial_cfg<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::
 where
     A: SearchAdapter,
 {
+    if matches!(cfg.strategy, TraversalStrategy::BreadthFirst) {
+        return search_bfs_serial(adapter, cfg);
+    }
+
     let (mut arena, mut frontier, mut stats) = initial_arena(adapter, cfg)?;
     let mut paths = Vec::new();
     let mut progress = Progress::new(cfg.progress);
@@ -193,6 +200,56 @@ where
     Ok(SearchOutput { paths, stats })
 }
 
+fn search_bfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
+where
+    A: SearchAdapter,
+{
+    let (mut arena, frontier, mut stats) = initial_arena(adapter, cfg)?;
+    let mut frontier = frontier.into_iter().collect::<Vec<_>>();
+    let mut paths = Vec::new();
+    let mut progress = Progress::new(cfg.progress);
+
+    while !frontier.is_empty() {
+        progress.tick(&stats);
+        let frontier_nodes = frontier
+            .iter()
+            .map(|&path| arena[path].node)
+            .collect::<Vec<_>>();
+        adapter.prefetch_outgoing(&frontier_nodes)?;
+        let edge_count = frontier.iter().try_fold(0usize, |sum, &path| {
+            Ok::<_, anyhow::Error>(sum + adapter.out_degree(arena[path].node)?)
+        })?;
+        let (edges, local) = eval_frontier_serial(adapter, &arena, &frontier, edge_count, cfg)?;
+        merge_stats(&mut stats, local);
+
+        let mut next = Vec::with_capacity(edges.len());
+        for (parent, edge) in edges {
+            let stop = edge.stop;
+            let child = push_entry(&mut arena, parent, edge);
+            stats.accepted_edges += 1;
+            stats.path_entries += 1;
+            stats.max_depth = stats.max_depth.max(arena[child].depth);
+            if stop {
+                paths.push(adapter.materialize(&arena, child, cfg.intermediate_states)?);
+                stats.stopped_paths += 1;
+                if let Some(max) = cfg.max_paths
+                    && paths.len() >= max
+                {
+                    paths.truncate(max);
+                    progress.finish(&stats);
+                    return Ok(SearchOutput { paths, stats });
+                }
+            } else {
+                next.push(child);
+            }
+        }
+        frontier = next;
+    }
+
+    progress.finish(&stats);
+    Ok(SearchOutput { paths, stats })
+}
+
 fn search_bfs_parallel<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
 where
     A: SearchAdapter + Sync,
@@ -207,6 +264,11 @@ where
 
     while !frontier.is_empty() {
         progress.tick(&stats);
+        let frontier_nodes = frontier
+            .iter()
+            .map(|&path| arena[path].node)
+            .collect::<Vec<_>>();
+        adapter.prefetch_outgoing(&frontier_nodes)?;
         let edge_count = frontier.iter().try_fold(0usize, |sum, &path| {
             Ok::<_, anyhow::Error>(sum + adapter.out_degree(arena[path].node)?)
         })?;
@@ -734,4 +796,8 @@ fn merge_stats(into: &mut SearchStats, from: SearchStats) {
     into.max_depth = into.max_depth.max(from.max_depth);
     into.materialized_node_payloads += from.materialized_node_payloads;
     into.materialized_edge_payloads += from.materialized_edge_payloads;
+    into.lazy_payload_read_calls += from.lazy_payload_read_calls;
+    into.lazy_payload_requested_rows += from.lazy_payload_requested_rows;
+    into.lazy_payload_selected_rows += from.lazy_payload_selected_rows;
+    into.lazy_payload_row_groups += from.lazy_payload_row_groups;
 }

@@ -371,6 +371,7 @@ mod tests {
                 max_depth: 2,
                 materialized_node_payloads: 0,
                 materialized_edge_payloads: 0,
+                ..SearchStats::default()
             }
         );
     }

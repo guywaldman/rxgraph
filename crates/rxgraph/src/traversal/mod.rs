@@ -106,4 +106,12 @@ pub struct SearchStats {
     pub materialized_node_payloads: usize,
     /// Native edge payload structs materialized by a lazy typed store.
     pub materialized_edge_payloads: usize,
+    /// Lazy Parquet payload read calls issued during typed native traversal.
+    pub lazy_payload_read_calls: usize,
+    /// Payload rows requested by lazy typed traversal.
+    pub lazy_payload_requested_rows: usize,
+    /// Physical rows selected from Parquet row groups for lazy payload reads.
+    pub lazy_payload_selected_rows: usize,
+    /// Parquet row groups selected for lazy payload reads.
+    pub lazy_payload_row_groups: usize,
 }

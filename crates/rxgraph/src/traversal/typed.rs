@@ -11,7 +11,10 @@ use std::{
     collections::HashMap,
     fs::File,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -27,7 +30,7 @@ use parquet::arrow::arrow_reader::{
 };
 
 use crate::{
-    dsl::StateRow,
+    dsl::{StateRow, Value, arrow_value},
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId},
     traversal::{RunOptions, SearchStats, native},
 };
@@ -185,6 +188,22 @@ impl<'a> ArrowRow<'a> {
             )),
             other => bail!("column {col:?} must be Utf8, got {other:?}"),
         }
+    }
+
+    /// Reads `col` as a DSL value, including nested list and struct values.
+    pub fn value(&self, col: &str) -> Result<Value> {
+        let array = self.column(col)?;
+        arrow_value::array_row_to_value(array.as_ref(), self.row)
+    }
+
+    /// Reads `col` as a list value.
+    pub fn list(&self, col: &str) -> Result<Option<Vec<Value>>> {
+        self.value(col)?.into_list()
+    }
+
+    /// Reads `col` as a struct value, preserving Arrow field order.
+    pub fn struct_fields(&self, col: &str) -> Result<Option<Vec<(String, Value)>>> {
+        self.value(col)?.into_struct()
     }
 
     fn column(&self, col: &str) -> Result<&ArrayRef> {
@@ -457,6 +476,11 @@ where
     let mut owned = owned_result(result, &adapter)?;
     owned.stats.materialized_node_payloads = store.loaded_node_count();
     owned.stats.materialized_edge_payloads = store.loaded_edge_count();
+    let io = store.io_stats();
+    owned.stats.lazy_payload_read_calls = io.read_calls;
+    owned.stats.lazy_payload_requested_rows = io.requested_rows;
+    owned.stats.lazy_payload_selected_rows = io.selected_rows;
+    owned.stats.lazy_payload_row_groups = io.row_groups;
     Ok(owned)
 }
 
@@ -838,6 +862,43 @@ struct ParquetPayloadFile {
     file: File,
     metadata: ArrowReaderMetadata,
     row_group_offsets: Vec<usize>,
+    stats: LazyPayloadIoStats,
+}
+
+#[derive(Default)]
+struct LazyPayloadIoStats {
+    read_calls: AtomicUsize,
+    requested_rows: AtomicUsize,
+    selected_rows: AtomicUsize,
+    row_groups: AtomicUsize,
+}
+
+#[derive(Default, Clone, Copy)]
+struct LazyPayloadIoSnapshot {
+    read_calls: usize,
+    requested_rows: usize,
+    selected_rows: usize,
+    row_groups: usize,
+}
+
+impl LazyPayloadIoStats {
+    fn record_read(&self, requested_rows: usize, selected_rows: usize, row_groups: usize) {
+        self.read_calls.fetch_add(1, Ordering::Relaxed);
+        self.requested_rows
+            .fetch_add(requested_rows, Ordering::Relaxed);
+        self.selected_rows
+            .fetch_add(selected_rows, Ordering::Relaxed);
+        self.row_groups.fetch_add(row_groups, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> LazyPayloadIoSnapshot {
+        LazyPayloadIoSnapshot {
+            read_calls: self.read_calls.load(Ordering::Relaxed),
+            requested_rows: self.requested_rows.load(Ordering::Relaxed),
+            selected_rows: self.selected_rows.load(Ordering::Relaxed),
+            row_groups: self.row_groups.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl ParquetPayloadFile {
@@ -853,6 +914,7 @@ impl ParquetPayloadFile {
             file,
             metadata,
             row_group_offsets,
+            stats: LazyPayloadIoStats::default(),
         })
     }
 
@@ -861,6 +923,11 @@ impl ParquetPayloadFile {
         if fields.is_empty() {
             return empty_batch(rows.len());
         }
+        self.stats.record_read(
+            rows.len(),
+            selection.selected_rows,
+            selection.row_groups.len(),
+        );
 
         let file = self
             .file
@@ -929,6 +996,10 @@ impl ParquetPayloadFile {
             .partition_point(|&offset| offset <= row)
             - 1
     }
+
+    fn stats(&self) -> LazyPayloadIoSnapshot {
+        self.stats.snapshot()
+    }
 }
 
 struct RowGroupSelection {
@@ -995,6 +1066,17 @@ impl<'a, N, E> ParquetGraphStore<'a, N, E> {
             .iter()
             .filter(|cell| cell.get().is_some())
             .count()
+    }
+
+    fn io_stats(&self) -> LazyPayloadIoSnapshot {
+        let node = self.node_file.stats();
+        let edge = self.edge_file.stats();
+        LazyPayloadIoSnapshot {
+            read_calls: node.read_calls + edge.read_calls,
+            requested_rows: node.requested_rows + edge.requested_rows,
+            selected_rows: node.selected_rows + edge.selected_rows,
+            row_groups: node.row_groups + edge.row_groups,
+        }
     }
 }
 

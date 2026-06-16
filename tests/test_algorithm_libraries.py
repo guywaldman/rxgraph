@@ -1,9 +1,9 @@
-from collections import defaultdict
+from collections import defaultdict, deque
 
 from benches.main import (
-    INIT,
     Result,
     Scale,
+    TRAVERSAL_STRATEGIES,
     best_by_bench,
     fmt_count,
     plain_speedup,
@@ -13,7 +13,7 @@ from benches.main import (
     travel_cases,
     travel_data,
     travel_graphs,
-    visit,
+    traversal_max_paths,
     weighted_budget_search_kwargs,
 )
 
@@ -41,39 +41,60 @@ def test_algorithm_cases_match_networkx_and_igraph() -> None:
 def test_traversal_matches_reference_libraries() -> None:
     data = travel_data(96, 8)
     cases = travel_cases(data, max_paths=8)
-    by_lib = {case.lib: case.run() for case in cases}
+    by_alg = defaultdict(dict)
+    for case in cases:
+        by_alg[case.alg][case.lib] = case.run()
 
-    for library in [
-        "rxgraph-df",
-        "rxgraph-df-string-ids",
-        "rxgraph-python",
-        "networkx",
-        "igraph",
-    ]:
-        assert library in by_lib
+    for alg, strategy in TRAVERSAL_STRATEGIES:
+        by_lib = by_alg[alg]
+        for library in [
+            "rxgraph-df",
+            "rxgraph-df-string-ids",
+            "rxgraph-python",
+            "networkx",
+            "igraph",
+        ]:
+            assert library in by_lib
 
-    reference = sorted(reference_travel_paths(data, max_paths=8))
-    assert normalize_rx_paths(by_lib["rxgraph-df"]) == reference
-    assert normalize_rx_paths(by_lib["rxgraph-df-string-ids"]) == reference
-    assert normalize_rx_paths(by_lib["rxgraph-python"]) == reference
-    assert normalize_reference_paths(by_lib["networkx"]) == reference
-    assert normalize_reference_paths(by_lib["igraph"]) == reference
+        reference = sorted(reference_travel_paths(data, max_paths=8, strategy=strategy))
+        assert normalize_rx_paths(by_lib["rxgraph-df"]) == reference
+        assert normalize_rx_paths(by_lib["rxgraph-df-string-ids"]) == reference
+        assert normalize_rx_paths(by_lib["rxgraph-python"]) == reference
+        assert normalize_reference_paths(by_lib["networkx"]) == reference
+        assert normalize_reference_paths(by_lib["igraph"]) == reference
 
 
 def test_traversal_includes_rust_kernel_case_matching_budget_dsl() -> None:
     data = travel_data(96, 8)
     graphs = travel_graphs(data)
     cases = travel_cases(data, max_paths=8, graphs=graphs)
-    rust_case = next(case for case in cases if case.lib == "rxgraph-rust-kernel")
-    dsl_paths = (
-        graphs["rxgraph-df"]
-        .graph.search(**weighted_budget_search_kwargs(data.target, [0], 8))
-        .paths
-    )
+    by_alg_lib = {(case.alg, case.lib): case for case in cases}
 
-    assert rust_case.alg == "traversal"
-    assert normalize_rx_paths(rust_case.run()) == normalize_rx_paths(dsl_paths)
-    assert normalize_rx_paths(dsl_paths)
+    for alg, strategy in TRAVERSAL_STRATEGIES:
+        rust_case = by_alg_lib[(alg, "rxgraph-native-inmemory")]
+        dsl_paths = (
+            graphs["rxgraph-df"]
+            .graph.search(**weighted_budget_search_kwargs(data.target, [0], 8, strategy))
+            .paths
+        )
+
+        assert rust_case.alg == alg
+        assert normalize_rx_paths(rust_case.run()) == normalize_rx_paths(dsl_paths)
+        assert normalize_rx_paths(dsl_paths)
+
+
+def test_traversal_max_paths_scale_with_graph_size() -> None:
+    args = type("Args", (), {"max_paths": 50, "mid_nodes": 100_000})()
+
+    assert traversal_max_paths(Scale("low", 10_000, 1), args) == 5
+    assert traversal_max_paths(Scale("mid", 100_000, 1), args) == 50
+    assert traversal_max_paths(Scale("high", 1_000_000, 1), args) == 500
+
+
+def test_travel_data_contains_requested_paths() -> None:
+    data = travel_data(1_000, 25)
+
+    assert len(reference_travel_paths(data, max_paths=25)) == 25
 
 
 def test_benchmark_report_helpers_are_human_readable() -> None:
@@ -114,30 +135,28 @@ def result(library: str, median: float) -> Result:
     )
 
 
-def reference_travel_paths(data, max_paths: int) -> list[tuple[int, ...]]:
-    nodes = {row["id"]: row for row in data.nodes.to_dicts()}
+def reference_travel_paths(
+    data, max_paths: int, strategy: str = "bfs"
+) -> list[tuple[int, ...]]:
     edges = defaultdict(list)
     for row in data.edges.to_dicts():
         edges[row["src"]].append(row)
 
-    frontier, paths = [(0, (0,), INIT)], []
+    frontier, paths = deque([(0, (0,), 0)]), []
     while frontier and len(paths) < max_paths:
-        node, path, state = frontier.pop()
+        node, path, spent = (
+            frontier.popleft() if strategy == "bfs" else frontier.pop()
+        )
         for edge in edges[node]:
             dst = edge["dest"]
-            if dst in path or not visit(nodes[dst], edge, state):
+            next_spent = spent + edge["price"]
+            if dst in path or next_spent > 950:
                 continue
-            next_state = {
-                "spent": state["spent"] + edge["price"],
-                "hops": state["hops"] + 1,
-                "ready_at": edge["arrival"] + nodes[dst]["min_connection"],
-                "risk": state["risk"] + nodes[dst]["risk"],
-                "detours": state["detours"] + edge["detour_cost"],
-            }
             next_path = (*path, dst)
-            paths.append(next_path) if dst == data.target else frontier.append(
-                (dst, next_path, next_state)
-            )
+            if dst == data.target:
+                paths.append(next_path)
+            else:
+                frontier.append((dst, next_path, next_spent))
             if len(paths) >= max_paths:
                 break
     return paths
