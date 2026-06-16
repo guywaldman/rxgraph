@@ -1,5 +1,8 @@
 import os
+import tempfile
+from pathlib import Path
 
+import polars as pl
 import pytest
 
 REQUIRE_PLUGIN = "RXGRAPH_REQUIRE_KERNEL_PLUGIN_EXAMPLE"
@@ -18,27 +21,51 @@ def _import_plugin():
 
 
 def _assert_hop_budget_search(rxg) -> None:
-    graph = rxg.Graph.from_edges(
-        [("a", "b"), ("b", "c"), ("c", "d")],
-        nodes=[
-            ("a", {"target": False}),
-            ("b", {"target": False}),
-            ("c", {"target": True}),
-            ("d", {"target": False}),
-        ],
-    )
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        nodes = tmp / "nodes.parquet"
+        edges = tmp / "edges.parquet"
 
-    result = graph.search(
-        start_nodes=["a"],
-        kernel="hop_budget",
-        params={"max_hops": 3, "target_col": "target"},
-        max_paths=10,
-        parallel=False,
-    )
+        pl.DataFrame(
+            {
+                "id": ["a", "b", "c", "d"],
+                "profile": [
+                    {"target": False},
+                    {"target": False},
+                    {"target": True},
+                    {"target": False},
+                ],
+            }
+        ).write_parquet(nodes)
+        pl.DataFrame(
+            {
+                "id": ["ab", "bc", "cd"],
+                "src": ["a", "b", "c"],
+                "dest": ["b", "c", "d"],
+                "policy": [
+                    {"enabled": True, "hop_costs": [1]},
+                    {"enabled": True, "hop_costs": [1, 1]},
+                    {"enabled": True, "hop_costs": [1]},
+                ],
+            }
+        ).write_parquet(edges)
+
+        graph = rxg.Graph.from_parquet(nodes, edges, payloads="lazy")
+        result = graph.search(
+            start_nodes=["a"],
+            kernel="hop_budget",
+            params={
+                "max_hops": 10,
+                "profile_col": "profile",
+                "policy_col": "policy",
+            },
+            max_paths=10,
+            parallel=False,
+        )
 
     assert result.paths[0].nodes == ["a", "b", "c"]
-    assert result.paths[0].edges == [0, 1]
-    assert result.paths[0].state == {"hops": 2}
+    assert result.paths[0].edges == ["ab", "bc"]
+    assert result.paths[0].state == {"hops": 3}
 
 
 def test_rust_kernel_plugin_import_after_rxgraph_e2e() -> None:

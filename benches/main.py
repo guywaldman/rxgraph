@@ -445,7 +445,9 @@ def id_frame(n: int) -> pl.DataFrame:
 
 
 def edge_frame(
-    src: pl.Series | None = None, dest: pl.Series | None = None, price: int | None = None
+    src: pl.Series | None = None,
+    dest: pl.Series | None = None,
+    price: int | None = None,
 ) -> pl.DataFrame:
     if src is None or dest is None:
         return pl.DataFrame(
@@ -637,42 +639,54 @@ def travel_cases(
                 Case(
                     alg,
                     Lib.RX_DF,
-                    lambda graph=built.graph, traversal=traversal: graph.search(
-                        **traversal
-                    ).paths,
+                    lambda graph=built.graph, traversal=traversal: (
+                        graph.search(**traversal).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
         if Lib.RX_NATIVE_INMEMORY in graphs:
             built = graphs[Lib.RX_NATIVE_INMEMORY]
-            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            native = weighted_budget_kernel_kwargs(
+                data.target, [0], max_paths, strategy
+            )
             cases.append(
                 Case(
                     alg,
                     Lib.RX_NATIVE_INMEMORY,
-                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    lambda graph=built.graph, native=native: (
+                        graph.search(**native).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
         if Lib.RX_NATIVE_PARQUET_EAGER in graphs:
             built = graphs[Lib.RX_NATIVE_PARQUET_EAGER]
-            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            native = weighted_budget_kernel_kwargs(
+                data.target, [0], max_paths, strategy
+            )
             cases.append(
                 Case(
                     alg,
                     Lib.RX_NATIVE_PARQUET_EAGER,
-                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    lambda graph=built.graph, native=native: (
+                        graph.search(**native).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
         if Lib.RX_NATIVE_PARQUET_LAZY in graphs:
             built = graphs[Lib.RX_NATIVE_PARQUET_LAZY]
-            native = weighted_budget_kernel_kwargs(data.target, [0], max_paths, strategy)
+            native = weighted_budget_kernel_kwargs(
+                data.target, [0], max_paths, strategy
+            )
             cases.append(
                 Case(
                     alg,
                     Lib.RX_NATIVE_PARQUET_LAZY,
-                    lambda graph=built.graph, native=native: graph.search(**native).paths,
+                    lambda graph=built.graph, native=native: (
+                        graph.search(**native).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
@@ -682,9 +696,9 @@ def travel_cases(
                 Case(
                     alg,
                     Lib.RX_DF_STRING_IDS,
-                    lambda graph=built.graph, string_traversal=string_traversal: graph.search(
-                        **string_traversal
-                    ).paths,
+                    lambda graph=built.graph, string_traversal=string_traversal: (
+                        graph.search(**string_traversal).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
@@ -694,9 +708,9 @@ def travel_cases(
                 Case(
                     alg,
                     Lib.RX_PYTHON,
-                    lambda graph=built.graph, traversal=traversal: graph.search(
-                        **traversal
-                    ).paths,
+                    lambda graph=built.graph, traversal=traversal: (
+                        graph.search(**traversal).paths
+                    ),
                     build_times=built.build_times,
                 )
             )
@@ -907,9 +921,7 @@ def py_weighted_budget(
 ) -> list[tuple[int, ...]]:
     frontier, paths = deque([(0, (0,), 0)]), []
     while frontier and len(paths) < max_paths:
-        node, path, spent = (
-            frontier.popleft() if strategy == "bfs" else frontier.pop()
-        )
+        node, path, spent = frontier.popleft() if strategy == "bfs" else frontier.pop()
         for dst, edge in out_edges(node):
             next_spent = spent + edge[Field.PRICE]
             if dst in path or next_spent > budget:

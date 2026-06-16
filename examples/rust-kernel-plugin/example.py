@@ -12,7 +12,12 @@ with tempfile.TemporaryDirectory() as tmp:
     pl.DataFrame(
         {
             "id": ["a", "b", "c", "d"],
-            "target": [False, False, True, False],
+            "profile": [
+                {"target": False},
+                {"target": False},
+                {"target": True},
+                {"target": False},
+            ],
         }
     ).write_parquet(nodes)
     pl.DataFrame(
@@ -20,6 +25,11 @@ with tempfile.TemporaryDirectory() as tmp:
             "id": ["ab", "bc", "cd"],
             "src": ["a", "b", "c"],
             "dest": ["b", "c", "d"],
+            "policy": [
+                {"enabled": True, "hop_costs": [1]},
+                {"enabled": True, "hop_costs": [1, 1]},
+                {"enabled": True, "hop_costs": [1]},
+            ],
         }
     ).write_parquet(edges)
 
@@ -27,12 +37,12 @@ with tempfile.TemporaryDirectory() as tmp:
     result = graph.search(
         start_nodes=["a"],
         kernel="hop_budget",
-        params={"max_hops": 3, "target_col": "target"},
+        params={"max_hops": 10, "profile_col": "profile", "policy_col": "policy"},
         max_paths=10,
         parallel=False,
     )
 
     assert result.paths[0].nodes == ["a", "b", "c"]
-    assert result.paths[0].state == {"hops": 2}
+    assert result.paths[0].state == {"hops": 3}
     assert result.stats.materialized_node_payloads < graph.node_count
     print("OK:", result.paths[0].nodes, result.paths[0].state)

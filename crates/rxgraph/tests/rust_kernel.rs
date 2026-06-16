@@ -1,20 +1,29 @@
 //! Integration tests for the example native kernel, exercised through the
 //! public `rxgraph` API exactly as an external Rust consumer would.
 
-use std::sync::Arc;
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow::{
     array::{
-        Array, ArrayRef, Int64Array, ListArray, RecordBatch, StringArray, StructArray, record_batch,
+        Array, ArrayRef, BooleanArray, Int64Array, ListArray, RecordBatch, StringArray,
+        StructArray, UInt64Array, record_batch,
     },
     datatypes::{DataType, Field as ArrowField, Int64Type, Schema},
 };
+use parquet::arrow::ArrowWriter;
 use pretty_assertions::assert_eq;
 use rxgraph::{
-    ArrowRow, DslExpr as e, DslKernel, Graph, GraphId, RunOptions, TraversalConfigBuilder,
-    TraversalStrategy, Value,
+    ArrowRow, ArrowStruct, DslExpr as e, DslKernel, Graph, GraphId, OwnedGraphId, ParquetPaths,
+    PayloadField, RunOptions, StateRow, TraversalConfigBuilder, TraversalStrategy, TypedKernel,
+    Value,
     examples::kernels::{BudgetState, WeightedBudget},
+    traversal::native,
 };
 
 /// Builds a small weighted graph with u64 IDs:
@@ -241,6 +250,23 @@ fn dsl_equivalent_kernel_matches_native_node_sequences() -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct RowMeta {
+    name: String,
+    score: Option<i64>,
+}
+
+impl TryFrom<ArrowStruct<'_>> for RowMeta {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowStruct<'_>) -> Result<Self> {
+        Ok(Self {
+            name: row.string("name")?.context("meta.name is required")?,
+            score: row.i64("score")?,
+        })
+    }
+}
+
 #[test]
 fn arrow_row_reads_nested_values() -> Result<()> {
     let items =
@@ -264,6 +290,18 @@ fn arrow_row_reads_nested_values() -> Result<()> {
     )?;
 
     let row = ArrowRow::new(&batch, 0);
+    let item_list = row.list_items("items")?.context("items is required")?;
+    assert_eq!(item_list.len(), 2);
+    assert_eq!(item_list.u64(0)?, Some(1));
+    assert_eq!(item_list.u64(1)?, Some(2));
+    assert_eq!(item_list.values()?, vec![Value::I64(1), Value::I64(2)]);
+    assert_eq!(
+        row.struct_as::<RowMeta>("meta")?,
+        Some(RowMeta {
+            name: "a".to_string(),
+            score: Some(7),
+        })
+    );
     assert_eq!(
         row.value("items")?,
         Value::List(vec![Value::I64(1), Value::I64(2)])
@@ -279,6 +317,14 @@ fn arrow_row_reads_nested_values() -> Result<()> {
 
     let row = ArrowRow::new(&batch, 1);
     assert_eq!(row.list("items")?, None);
+    assert!(row.list_items("items")?.is_none());
+    assert_eq!(
+        row.struct_as::<RowMeta>("meta")?,
+        Some(RowMeta {
+            name: "b".to_string(),
+            score: None,
+        })
+    );
     assert_eq!(
         row.struct_fields("meta")?,
         Some(vec![
@@ -287,6 +333,231 @@ fn arrow_row_reads_nested_values() -> Result<()> {
         ])
     );
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CompoundState {
+    spent: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompoundPolicy {
+    enabled: bool,
+    limit: u64,
+}
+
+impl TryFrom<ArrowStruct<'_>> for CompoundPolicy {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowStruct<'_>) -> Result<Self> {
+        Ok(Self {
+            enabled: row.bool("enabled")?.unwrap_or(false),
+            limit: row.u64("limit")?.unwrap_or(0),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CompoundEdge {
+    charges: Vec<u64>,
+    policy: CompoundPolicy,
+}
+
+impl CompoundEdge {
+    fn total_charge(&self) -> u64 {
+        self.charges.iter().sum()
+    }
+}
+
+impl TryFrom<ArrowRow<'_>> for CompoundEdge {
+    type Error = anyhow::Error;
+
+    fn try_from(row: ArrowRow<'_>) -> Result<Self> {
+        let charges = row.list_items("charges")?.context("charges is required")?;
+        let charges = (0..charges.len())
+            .map(|index| {
+                charges
+                    .u64(index)?
+                    .with_context(|| format!("charges[{index}] cannot be null"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            charges,
+            policy: row.struct_as("policy")?.context("policy is required")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CompoundBudget;
+
+impl TypedKernel for CompoundBudget {
+    type Node = ();
+    type Edge = CompoundEdge;
+    type State = CompoundState;
+
+    fn edge_fields(&self) -> Vec<PayloadField> {
+        vec![PayloadField::new("charges"), PayloadField::new("policy")]
+    }
+
+    fn initial_state(
+        &self,
+        _cx: &native::StartCtx<'_, Self::Node, Self::Edge>,
+    ) -> Result<Self::State> {
+        Ok(CompoundState::default())
+    }
+
+    fn visit(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
+        let edge = cx.edge()?;
+        let next_spent = cx.state().spent.saturating_add(edge.total_charge());
+        Ok(edge.policy.enabled && next_spent <= edge.policy.limit)
+    }
+
+    fn next_state(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Self::State> {
+        Ok(CompoundState {
+            spent: cx.state().spent.saturating_add(cx.edge()?.total_charge()),
+        })
+    }
+
+    fn stop(
+        &self,
+        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<bool> {
+        Ok(cx.dest_external_id()? == Some(GraphId::U64(2)))
+    }
+
+    fn state_row(&self, state: &Self::State) -> StateRow {
+        vec![("spent".to_string(), Value::U64(state.spent))]
+    }
+}
+
+fn compound_graph_batches() -> Result<(RecordBatch, RecordBatch)> {
+    let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2, 3]))?;
+    let charges = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+        Some(vec![Some(2), Some(3)]),
+        Some(vec![Some(4)]),
+        Some(vec![Some(9), Some(9)]),
+        Some(vec![Some(1)]),
+    ]);
+    let policy = StructArray::from(vec![
+        (
+            Arc::new(ArrowField::new("enabled", DataType::Boolean, true)),
+            Arc::new(BooleanArray::from(vec![
+                Some(true),
+                Some(true),
+                Some(true),
+                Some(false),
+            ])) as ArrayRef,
+        ),
+        (
+            Arc::new(ArrowField::new("limit", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![
+                Some(10),
+                Some(10),
+                Some(10),
+                Some(10),
+            ])) as ArrayRef,
+        ),
+    ]);
+    let edges = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            ArrowField::new(ID_COL, DataType::UInt64, false),
+            ArrowField::new(EDGE_SRC_COL, DataType::UInt64, false),
+            ArrowField::new(EDGE_DEST_COL, DataType::UInt64, false),
+            ArrowField::new("charges", charges.data_type().clone(), true),
+            ArrowField::new("policy", policy.data_type().clone(), true),
+        ])),
+        vec![
+            Arc::new(UInt64Array::from(vec![10, 11, 12, 13])),
+            Arc::new(UInt64Array::from(vec![0, 1, 0, 0])),
+            Arc::new(UInt64Array::from(vec![1, 2, 2, 3])),
+            Arc::new(charges),
+            Arc::new(policy),
+        ],
+    )?;
+    Ok((nodes, edges))
+}
+
+#[test]
+fn typed_kernel_decodes_compound_edge_payloads() -> Result<()> {
+    let (nodes, edges) = compound_graph_batches()?;
+    let graph = Graph::new(nodes, edges)?;
+
+    let result = rxgraph::boxed_typed_run(CompoundBudget).run_eager(&graph, run_opts())?;
+
+    assert_eq!(result.paths.len(), 1);
+    assert_eq!(
+        result.paths[0].nodes,
+        vec![
+            OwnedGraphId::U64(0),
+            OwnedGraphId::U64(1),
+            OwnedGraphId::U64(2),
+        ]
+    );
+    assert_eq!(
+        result.paths[0].edges,
+        vec![OwnedGraphId::U64(10), OwnedGraphId::U64(11)]
+    );
+    assert_eq!(spent(&result.paths[0].state), 9);
+    Ok(())
+}
+
+#[test]
+fn typed_kernel_decodes_compound_parquet_payloads() -> Result<()> {
+    let (nodes, edges) = compound_graph_batches()?;
+    let nodes_path = temp_parquet_path("compound-nodes");
+    let edges_path = temp_parquet_path("compound-edges");
+    write_parquet(&nodes_path, &nodes)?;
+    write_parquet(&edges_path, &edges)?;
+
+    let eager_graph = Graph::from_parquet(nodes_path.clone(), edges_path.clone())?;
+    let eager = rxgraph::boxed_typed_run(CompoundBudget).run_eager(&eager_graph, run_opts())?;
+
+    let lazy_graph = Graph::from_parquet_topology(nodes_path.clone(), edges_path.clone())?;
+    let lazy = rxgraph::boxed_typed_run(CompoundBudget).run_parquet_lazy(
+        &lazy_graph,
+        ParquetPaths {
+            nodes: nodes_path.clone(),
+            edges: edges_path.clone(),
+        },
+        run_opts(),
+    )?;
+
+    let _ = std::fs::remove_file(nodes_path);
+    let _ = std::fs::remove_file(edges_path);
+
+    assert_eq!(eager.paths.len(), 1);
+    assert_eq!(lazy.paths.len(), 1);
+    assert_eq!(eager.paths[0].nodes, lazy.paths[0].nodes);
+    assert_eq!(eager.paths[0].edges, lazy.paths[0].edges);
+    assert_eq!(spent(&eager.paths[0].state), 9);
+    assert_eq!(spent(&lazy.paths[0].state), 9);
+    Ok(())
+}
+
+fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
+    let file = File::create(path)?;
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None)?;
+    writer.write(batch)?;
+    writer.close()?;
+    Ok(())
+}
+
+fn temp_parquet_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before UNIX_EPOCH")
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "rxgraph-{name}-{}-{nanos}.parquet",
+        std::process::id()
+    ))
 }
 
 // ---------------------------------------------------------------------------

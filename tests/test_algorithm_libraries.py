@@ -74,7 +74,9 @@ def test_traversal_includes_rust_kernel_case_matching_budget_dsl() -> None:
         rust_case = by_alg_lib[(alg, "rxgraph-native-inmemory")]
         dsl_paths = (
             graphs["rxgraph-df"]
-            .graph.search(**weighted_budget_search_kwargs(data.target, [0], 8, strategy))
+            .graph.search(
+                **weighted_budget_search_kwargs(data.target, [0], 8, strategy)
+            )
             .paths
         )
 
@@ -144,9 +146,7 @@ def reference_travel_paths(
 
     frontier, paths = deque([(0, (0,), 0)]), []
     while frontier and len(paths) < max_paths:
-        node, path, spent = (
-            frontier.popleft() if strategy == "bfs" else frontier.pop()
-        )
+        node, path, spent = frontier.popleft() if strategy == "bfs" else frontier.pop()
         for edge in edges[node]:
             dst = edge["dest"]
             next_spent = spent + edge["price"]

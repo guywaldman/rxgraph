@@ -40,7 +40,8 @@ pub use registry::{
 };
 pub use typed::ParquetPaths;
 pub use typed::{
-    ArrowRow, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel, TypedPayloadCache,
+    ArrowList, ArrowRow, ArrowStruct, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel,
+    TypedPayloadCache,
 };
 pub(crate) use typed::{read_parquet_tables, read_parquet_topology};
 

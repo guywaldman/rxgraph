@@ -20,8 +20,10 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::{
     array::{
-        Array, ArrayRef, BooleanArray, Float64Array, Int64Array, LargeStringArray, RecordBatch,
-        StringArray, StringViewArray, UInt64Array,
+        Array, ArrayRef, BooleanArray, Float32Array, Float64Array, Int8Array, Int16Array,
+        Int32Array, Int64Array, LargeListArray, LargeStringArray, ListArray, RecordBatch,
+        StringArray, StringViewArray, StructArray, UInt8Array, UInt16Array, UInt32Array,
+        UInt64Array,
     },
     datatypes::{DataType, Field, FieldRef, Schema},
 };
@@ -49,145 +51,27 @@ impl<'a> ArrowRow<'a> {
 
     /// Reads `col` as `u64`, accepting lossless integer coercions.
     pub fn u64(&self, col: &str) -> Result<Option<u64>> {
-        let array = self.column(col)?;
-        if array.is_null(self.row) {
-            return Ok(None);
-        }
-        match array.data_type() {
-            DataType::UInt64 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .context("UInt64 column downcast failed")?
-                    .value(self.row),
-            )),
-            DataType::Int64 => {
-                let value = array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("Int64 column downcast failed")?
-                    .value(self.row);
-                if value < 0 {
-                    bail!("cannot read negative value {value} as u64");
-                }
-                Ok(Some(value as u64))
-            }
-            other => bail!("column {col:?} must be UInt64/Int64, got {other:?}"),
-        }
+        read_u64(self.column(col)?.as_ref(), self.row, col)
     }
 
     /// Reads `col` as `i64`, accepting lossless integer coercions.
     pub fn i64(&self, col: &str) -> Result<Option<i64>> {
-        let array = self.column(col)?;
-        if array.is_null(self.row) {
-            return Ok(None);
-        }
-        match array.data_type() {
-            DataType::Int64 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("Int64 column downcast failed")?
-                    .value(self.row),
-            )),
-            DataType::UInt64 => {
-                let value = array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .context("UInt64 column downcast failed")?
-                    .value(self.row);
-                if value > i64::MAX as u64 {
-                    bail!("cannot read u64 {value} as i64");
-                }
-                Ok(Some(value as i64))
-            }
-            other => bail!("column {col:?} must be Int64/UInt64, got {other:?}"),
-        }
+        read_i64(self.column(col)?.as_ref(), self.row, col)
     }
 
     /// Reads `col` as `f64`.
     pub fn f64(&self, col: &str) -> Result<Option<f64>> {
-        let array = self.column(col)?;
-        if array.is_null(self.row) {
-            return Ok(None);
-        }
-        match array.data_type() {
-            DataType::Float64 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<Float64Array>()
-                    .context("Float64 column downcast failed")?
-                    .value(self.row),
-            )),
-            DataType::Int64 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("Int64 column downcast failed")?
-                    .value(self.row) as f64,
-            )),
-            DataType::UInt64 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .context("UInt64 column downcast failed")?
-                    .value(self.row) as f64,
-            )),
-            other => bail!("column {col:?} must be numeric, got {other:?}"),
-        }
+        read_f64(self.column(col)?.as_ref(), self.row, col)
     }
 
     /// Reads `col` as `bool`.
     pub fn bool(&self, col: &str) -> Result<Option<bool>> {
-        let array = self.column(col)?;
-        if array.is_null(self.row) {
-            return Ok(None);
-        }
-        match array.data_type() {
-            DataType::Boolean => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<BooleanArray>()
-                    .context("Boolean column downcast failed")?
-                    .value(self.row),
-            )),
-            other => bail!("column {col:?} must be Boolean, got {other:?}"),
-        }
+        read_bool(self.column(col)?.as_ref(), self.row, col)
     }
 
     /// Reads `col` as an owned string.
     pub fn string(&self, col: &str) -> Result<Option<String>> {
-        let array = self.column(col)?;
-        if array.is_null(self.row) {
-            return Ok(None);
-        }
-        match array.data_type() {
-            DataType::Utf8 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .context("Utf8 column downcast failed")?
-                    .value(self.row)
-                    .to_string(),
-            )),
-            DataType::LargeUtf8 => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<LargeStringArray>()
-                    .context("LargeUtf8 column downcast failed")?
-                    .value(self.row)
-                    .to_string(),
-            )),
-            DataType::Utf8View => Ok(Some(
-                array
-                    .as_any()
-                    .downcast_ref::<StringViewArray>()
-                    .context("Utf8View column downcast failed")?
-                    .value(self.row)
-                    .to_string(),
-            )),
-            other => bail!("column {col:?} must be Utf8, got {other:?}"),
-        }
+        read_string(self.column(col)?.as_ref(), self.row, col)
     }
 
     /// Reads `col` as a DSL value, including nested list and struct values.
@@ -201,9 +85,27 @@ impl<'a> ArrowRow<'a> {
         self.value(col)?.into_list()
     }
 
+    /// Reads `col` as a typed Arrow list view.
+    pub fn list_items(&self, col: &str) -> Result<Option<ArrowList>> {
+        read_list(self.column(col)?.as_ref(), self.row, col)
+    }
+
     /// Reads `col` as a struct value, preserving Arrow field order.
     pub fn struct_fields(&self, col: &str) -> Result<Option<Vec<(String, Value)>>> {
         self.value(col)?.into_struct()
+    }
+
+    /// Reads `col` as a typed Arrow struct row view.
+    pub fn struct_(&self, col: &str) -> Result<Option<ArrowStruct<'_>>> {
+        read_struct(self.column(col)?.as_ref(), self.row, col)
+    }
+
+    /// Reads `col` as a custom struct decoded from [`ArrowStruct`].
+    pub fn struct_as<T>(&self, col: &str) -> Result<Option<T>>
+    where
+        T: for<'row> TryFrom<ArrowStruct<'row>, Error = anyhow::Error>,
+    {
+        self.struct_(col)?.map(T::try_from).transpose()
     }
 
     fn column(&self, col: &str) -> Result<&ArrayRef> {
@@ -214,6 +116,439 @@ impl<'a> ArrowRow<'a> {
             .with_context(|| format!("missing payload column {col:?}"))?;
         Ok(self.batch.column(index))
     }
+}
+
+/// A projected Arrow struct row handed to nested native payload decoders.
+pub struct ArrowStruct<'a> {
+    array: &'a StructArray,
+    row: usize,
+}
+
+impl<'a> ArrowStruct<'a> {
+    /// Reads `field` as `u64`, accepting lossless integer coercions.
+    pub fn u64(&self, field: &str) -> Result<Option<u64>> {
+        read_u64(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as `i64`, accepting lossless integer coercions.
+    pub fn i64(&self, field: &str) -> Result<Option<i64>> {
+        read_i64(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as `f64`.
+    pub fn f64(&self, field: &str) -> Result<Option<f64>> {
+        read_f64(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as `bool`.
+    pub fn bool(&self, field: &str) -> Result<Option<bool>> {
+        read_bool(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as an owned string.
+    pub fn string(&self, field: &str) -> Result<Option<String>> {
+        read_string(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as a DSL value, including nested list and struct values.
+    pub fn value(&self, field: &str) -> Result<Value> {
+        arrow_value::array_row_to_value(self.field(field)?.as_ref(), self.row)
+    }
+
+    /// Reads `field` as a list value.
+    pub fn list(&self, field: &str) -> Result<Option<Vec<Value>>> {
+        self.value(field)?.into_list()
+    }
+
+    /// Reads `field` as a typed Arrow list view.
+    pub fn list_items(&self, field: &str) -> Result<Option<ArrowList>> {
+        read_list(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as a struct value, preserving Arrow field order.
+    pub fn struct_fields(&self, field: &str) -> Result<Option<Vec<(String, Value)>>> {
+        self.value(field)?.into_struct()
+    }
+
+    /// Reads `field` as a typed Arrow struct row view.
+    pub fn struct_(&self, field: &str) -> Result<Option<ArrowStruct<'_>>> {
+        read_struct(self.field(field)?.as_ref(), self.row, field)
+    }
+
+    /// Reads `field` as a custom struct decoded from [`ArrowStruct`].
+    pub fn struct_as<T>(&self, field: &str) -> Result<Option<T>>
+    where
+        T: for<'row> TryFrom<ArrowStruct<'row>, Error = anyhow::Error>,
+    {
+        self.struct_(field)?.map(T::try_from).transpose()
+    }
+
+    fn field(&self, name: &str) -> Result<&ArrayRef> {
+        let index = self
+            .array
+            .fields()
+            .iter()
+            .position(|field| field.name() == name)
+            .with_context(|| format!("missing struct field {name:?}"))?;
+        Ok(&self.array.columns()[index])
+    }
+}
+
+/// A projected Arrow list value handed to native payload decoders.
+pub struct ArrowList {
+    array: ArrayRef,
+}
+
+impl ArrowList {
+    /// Number of items in the list.
+    pub fn len(&self) -> usize {
+        self.array.len()
+    }
+
+    /// Whether the list has no items.
+    pub fn is_empty(&self) -> bool {
+        self.array.is_empty()
+    }
+
+    /// Reads `index` as `u64`, accepting lossless integer coercions.
+    pub fn u64(&self, index: usize) -> Result<Option<u64>> {
+        self.check_index(index)?;
+        read_u64(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as `i64`, accepting lossless integer coercions.
+    pub fn i64(&self, index: usize) -> Result<Option<i64>> {
+        self.check_index(index)?;
+        read_i64(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as `f64`.
+    pub fn f64(&self, index: usize) -> Result<Option<f64>> {
+        self.check_index(index)?;
+        read_f64(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as `bool`.
+    pub fn bool(&self, index: usize) -> Result<Option<bool>> {
+        self.check_index(index)?;
+        read_bool(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as an owned string.
+    pub fn string(&self, index: usize) -> Result<Option<String>> {
+        self.check_index(index)?;
+        read_string(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as a DSL value, including nested list and struct values.
+    pub fn value(&self, index: usize) -> Result<Value> {
+        self.check_index(index)?;
+        arrow_value::array_row_to_value(self.array.as_ref(), index)
+    }
+
+    /// Reads every list item as a DSL value.
+    pub fn values(&self) -> Result<Vec<Value>> {
+        (0..self.len()).map(|index| self.value(index)).collect()
+    }
+
+    /// Reads `index` as a nested typed Arrow list view.
+    pub fn list_items(&self, index: usize) -> Result<Option<ArrowList>> {
+        self.check_index(index)?;
+        read_list(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as a struct value, preserving Arrow field order.
+    pub fn struct_fields(&self, index: usize) -> Result<Option<Vec<(String, Value)>>> {
+        self.value(index)?.into_struct()
+    }
+
+    /// Reads `index` as a typed Arrow struct row view.
+    pub fn struct_(&self, index: usize) -> Result<Option<ArrowStruct<'_>>> {
+        self.check_index(index)?;
+        read_struct(self.array.as_ref(), index, "list item")
+    }
+
+    /// Reads `index` as a custom struct decoded from [`ArrowStruct`].
+    pub fn struct_as<T>(&self, index: usize) -> Result<Option<T>>
+    where
+        T: for<'row> TryFrom<ArrowStruct<'row>, Error = anyhow::Error>,
+    {
+        self.struct_(index)?.map(T::try_from).transpose()
+    }
+
+    fn check_index(&self, index: usize) -> Result<()> {
+        if index >= self.len() {
+            bail!(
+                "list index {index} out of bounds for list of length {}",
+                self.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn read_u64(array: &dyn Array, row: usize, label: &str) -> Result<Option<u64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let value = match array.data_type() {
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .context("UInt8 column downcast failed")?
+            .value(row) as u64,
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .context("UInt16 column downcast failed")?
+            .value(row) as u64,
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .context("UInt32 column downcast failed")?
+            .value(row) as u64,
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .context("UInt64 column downcast failed")?
+            .value(row),
+        DataType::Int8 => non_negative_i64(
+            array
+                .as_any()
+                .downcast_ref::<Int8Array>()
+                .context("Int8 column downcast failed")?
+                .value(row) as i64,
+        )?,
+        DataType::Int16 => non_negative_i64(
+            array
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .context("Int16 column downcast failed")?
+                .value(row) as i64,
+        )?,
+        DataType::Int32 => non_negative_i64(
+            array
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .context("Int32 column downcast failed")?
+                .value(row) as i64,
+        )?,
+        DataType::Int64 => non_negative_i64(
+            array
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("Int64 column downcast failed")?
+                .value(row),
+        )?,
+        other => bail!("{label:?} must be an integer column, got {other:?}"),
+    };
+    Ok(Some(value))
+}
+
+fn non_negative_i64(value: i64) -> Result<u64> {
+    if value < 0 {
+        bail!("cannot read negative value {value} as u64");
+    }
+    Ok(value as u64)
+}
+
+fn read_i64(array: &dyn Array, row: usize, label: &str) -> Result<Option<i64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let value = match array.data_type() {
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .context("Int8 column downcast failed")?
+            .value(row) as i64,
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .context("Int16 column downcast failed")?
+            .value(row) as i64,
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context("Int32 column downcast failed")?
+            .value(row) as i64,
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("Int64 column downcast failed")?
+            .value(row),
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .context("UInt8 column downcast failed")?
+            .value(row) as i64,
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .context("UInt16 column downcast failed")?
+            .value(row) as i64,
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .context("UInt32 column downcast failed")?
+            .value(row) as i64,
+        DataType::UInt64 => {
+            let value = array
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .context("UInt64 column downcast failed")?
+                .value(row);
+            if value > i64::MAX as u64 {
+                bail!("cannot read u64 {value} as i64");
+            }
+            value as i64
+        }
+        other => bail!("{label:?} must be an integer column, got {other:?}"),
+    };
+    Ok(Some(value))
+}
+
+fn read_f64(array: &dyn Array, row: usize, label: &str) -> Result<Option<f64>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let value = match array.data_type() {
+        DataType::Float32 => array
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .context("Float32 column downcast failed")?
+            .value(row) as f64,
+        DataType::Float64 => array
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .context("Float64 column downcast failed")?
+            .value(row),
+        DataType::Int8 => array
+            .as_any()
+            .downcast_ref::<Int8Array>()
+            .context("Int8 column downcast failed")?
+            .value(row) as f64,
+        DataType::Int16 => array
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .context("Int16 column downcast failed")?
+            .value(row) as f64,
+        DataType::Int32 => array
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .context("Int32 column downcast failed")?
+            .value(row) as f64,
+        DataType::Int64 => array
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("Int64 column downcast failed")?
+            .value(row) as f64,
+        DataType::UInt8 => array
+            .as_any()
+            .downcast_ref::<UInt8Array>()
+            .context("UInt8 column downcast failed")?
+            .value(row) as f64,
+        DataType::UInt16 => array
+            .as_any()
+            .downcast_ref::<UInt16Array>()
+            .context("UInt16 column downcast failed")?
+            .value(row) as f64,
+        DataType::UInt32 => array
+            .as_any()
+            .downcast_ref::<UInt32Array>()
+            .context("UInt32 column downcast failed")?
+            .value(row) as f64,
+        DataType::UInt64 => array
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .context("UInt64 column downcast failed")?
+            .value(row) as f64,
+        other => bail!("{label:?} must be numeric, got {other:?}"),
+    };
+    Ok(Some(value))
+}
+
+fn read_bool(array: &dyn Array, row: usize, label: &str) -> Result<Option<bool>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Boolean => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<BooleanArray>()
+                .context("Boolean column downcast failed")?
+                .value(row),
+        )),
+        other => bail!("{label:?} must be Boolean, got {other:?}"),
+    }
+}
+
+fn read_string(array: &dyn Array, row: usize, label: &str) -> Result<Option<String>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    match array.data_type() {
+        DataType::Utf8 => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .context("Utf8 column downcast failed")?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::LargeUtf8 => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<LargeStringArray>()
+                .context("LargeUtf8 column downcast failed")?
+                .value(row)
+                .to_string(),
+        )),
+        DataType::Utf8View => Ok(Some(
+            array
+                .as_any()
+                .downcast_ref::<StringViewArray>()
+                .context("Utf8View column downcast failed")?
+                .value(row)
+                .to_string(),
+        )),
+        other => bail!("{label:?} must be Utf8, got {other:?}"),
+    }
+}
+
+fn read_list(array: &dyn Array, row: usize, label: &str) -> Result<Option<ArrowList>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<ListArray>() {
+        return Ok(Some(ArrowList {
+            array: array.value(row),
+        }));
+    }
+    if let Some(array) = array.as_any().downcast_ref::<LargeListArray>() {
+        return Ok(Some(ArrowList {
+            array: array.value(row),
+        }));
+    }
+    bail!(
+        "{label:?} must be List/LargeList, got {:?}",
+        array.data_type()
+    )
+}
+
+fn read_struct<'a>(
+    array: &'a dyn Array,
+    row: usize,
+    label: &str,
+) -> Result<Option<ArrowStruct<'a>>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    if let Some(array) = array.as_any().downcast_ref::<StructArray>() {
+        return Ok(Some(ArrowStruct { array, row }));
+    }
+    bail!("{label:?} must be Struct, got {:?}", array.data_type())
 }
 
 impl TryFrom<ArrowRow<'_>> for () {
@@ -720,7 +1055,7 @@ fn read_selected_parquet_with_builder(
                 .with_context(|| format!("missing parquet column {:?}", field.source))
         })
         .collect::<Result<Vec<_>>>()?;
-    let projection = parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), indexes);
+    let projection = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indexes);
     let ranges = rows.iter().copied().map(|row| row..row + 1);
     let reader = builder
         .with_projection(projection)
@@ -765,7 +1100,7 @@ fn read_projected_parquet_range(
                 .with_context(|| format!("missing parquet column {:?}", field.source))
         })
         .collect::<Result<Vec<_>>>()?;
-    let projection = parquet::arrow::ProjectionMask::leaves(builder.parquet_schema(), indexes);
+    let projection = parquet::arrow::ProjectionMask::roots(builder.parquet_schema(), indexes);
     let mut builder = builder.with_projection(projection);
     if let Some(offset) = offset {
         builder = builder.with_offset(offset);
