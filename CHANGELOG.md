@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.9.0](https://github.com/guywaldman/rxgraph/compare/v0.8.0...v0.9.0) (2026-06-16)
+
+
+### Features
+
+* add support for compound fields in typed kernel ([f2c02c2](https://github.com/guywaldman/rxgraph/commit/f2c02c27b2ee150df2657b75bdb4f4adeecf2846))
+* **rxgraph:** add file-backed native traversal kernels ([b51a19d](https://github.com/guywaldman/rxgraph/commit/b51a19d54711bb3ebf2d96c6d3cf1018a4ba54b5))
+
 ## [0.8.0](https://github.com/guywaldman/rxgraph/compare/v0.7.0...v0.8.0) (2026-06-15)
 
 
