@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/guywaldman/rxgraph/compare/v0.9.0...v0.10.0) (2026-06-23)
+
+
+### Features
+
+* expose `max_visits_per_node` in Python bindings ([78e08f6](https://github.com/guywaldman/rxgraph/commit/78e08f60b28c64164071157c8a149e55a297fdf7))
+
 ## [0.9.0](https://github.com/guywaldman/rxgraph/compare/v0.8.0...v0.9.0) (2026-06-16)
 
 
