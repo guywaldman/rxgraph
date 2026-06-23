@@ -172,6 +172,7 @@ impl PyGraph {
         if let Some(max_paths) = traversal.max_paths {
             builder = builder.with_max_paths(max_paths);
         }
+        builder = builder.with_max_revisits_per_node(traversal.max_revisits_per_node);
 
         PySearchResult::from_result(
             py,
@@ -190,7 +191,7 @@ impl PyGraph {
     /// calling this; no ID remapping happens here.
     ///
     /// Result marshalling is identical to the DSL `search` path.
-    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false))]
+    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_revisits_per_node = 0))]
     #[allow(clippy::too_many_arguments)]
     fn search_kernel(
         &self,
@@ -204,6 +205,7 @@ impl PyGraph {
         parallel: bool,
         intermediate_states: bool,
         progress: bool,
+        max_revisits_per_node: usize,
     ) -> PyResult<PySearchResult> {
         let params_json = py_dict_to_json(params)?;
         let run = RunOptions {
@@ -211,7 +213,7 @@ impl PyGraph {
             max_depth,
             max_paths,
             strategy: parse_strategy(strategy)?,
-            max_revisits_per_node: 0,
+            max_revisits_per_node,
             parallel,
             intermediate_states,
             progress,
@@ -466,12 +468,13 @@ struct PyTraversal {
     parallel: bool,
     intermediate_states: bool,
     progress: bool,
+    max_revisits_per_node: usize,
 }
 
 #[pymethods]
 impl PyTraversal {
     #[new]
-    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false))]
+    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_revisits_per_node = 0))]
     // Internal and mirrors the Python keyword API, so OK to have a lot of variables
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -483,6 +486,7 @@ impl PyTraversal {
         parallel: bool,
         intermediate_states: bool,
         progress: bool,
+        max_revisits_per_node: usize,
     ) -> PyResult<Self> {
         let strategy = parse_strategy(strategy)?;
 
@@ -495,6 +499,7 @@ impl PyTraversal {
             parallel,
             intermediate_states,
             progress,
+            max_revisits_per_node,
         })
     }
 }

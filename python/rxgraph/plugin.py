@@ -258,6 +258,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             parallel: bool | str = True,
             intermediate_states: bool = False,
             progress: bool = False,
+            max_revisits_per_node: int = 0,
         ) -> "SearchResult":
             """Run a stateful traversal.
 
@@ -288,6 +289,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             :param parallel: ``True``/``False`` or one of ``"on"``/``"off"``/``"auto"``.
             :param intermediate_states: Whether to include per-node state history on returned paths (false by default).
             :param progress: Whether to report running counters on stderr (live spinner on a terminal/TTY, plain log lines otherwise).
+            :param max_revisits_per_node: Maximum number of times a node may be revisited within a single path (0 by default, i.e. no revisits).
 
             >>> import rxgraph as rxg
             >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
@@ -311,6 +313,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                     parallel=parallel,
                     intermediate_states=intermediate_states,
                     progress=progress,
+                    max_revisits_per_node=max_revisits_per_node,
                 )
 
             stop = _default_stop(stop, max_paths)
@@ -330,6 +333,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 parallel,
                 intermediate_states,
                 progress,
+                max_revisits_per_node,
             )
 
             inner = self._inner.search(traversal._to_inner(self))
@@ -357,6 +361,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             parallel: bool | str,
             intermediate_states: bool,
             progress: bool,
+            max_revisits_per_node: int = 0,
         ) -> "SearchResult":
             if any(arg is not None for arg in (visit, next_state, stop, initial_state)):
                 raise ValueError(
@@ -378,6 +383,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 _parallel_bool(parallel),
                 intermediate_states,
                 progress,
+                max_revisits_per_node,
             )
             return SearchResult._from_inner(
                 inner, self._id_to_label, self._edge_id_to_label
@@ -560,6 +566,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             parallel: bool | str = True,
             intermediate_states: bool = False,
             progress: bool = False,
+            max_revisits_per_node: int = 0,
         ) -> None:
             """Create a reusable traversal configuration.
 
@@ -572,6 +579,8 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             :param intermediate_states: Include per-node state history on returned paths.
             :param progress: Report progress on stderr (spinner on a terminal, log lines
                 otherwise).
+            :param max_revisits_per_node: Maximum number of times a node may be revisited
+                within a single path (0 by default, i.e. no revisits).
             """
             self.kernel = kernel
             self.start_nodes = list(start_nodes)
@@ -581,6 +590,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             self.parallel = _parallel_bool(parallel)
             self.intermediate_states = intermediate_states
             self.progress = progress
+            self.max_revisits_per_node = max_revisits_per_node
 
         def _to_inner(self, graph: Graph) -> _rxgraph.Traversal:
             return _rxgraph.Traversal(
@@ -592,6 +602,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 self.parallel,
                 self.intermediate_states,
                 self.progress,
+                self.max_revisits_per_node,
             )
 
     @dataclass(slots=True)

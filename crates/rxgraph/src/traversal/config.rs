@@ -131,6 +131,15 @@ impl TraversalConfigBuilder {
         self
     }
 
+    /// Sets the maximum number of times a node may be revisited within a single
+    /// path.
+    ///
+    /// Defaults to `0` (no revisits).
+    pub fn with_max_revisits_per_node(mut self, max_revisits_per_node: usize) -> Self {
+        self.max_revisits_per_node = max_revisits_per_node;
+        self
+    }
+
     /// Enables or disables Rayon-backed parallel traversal.
     ///
     /// Parallel traversal is enabled by default. Path ordering is unspecified

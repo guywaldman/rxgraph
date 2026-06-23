@@ -84,6 +84,7 @@ class Graph:
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
         progress: bool = False,
+        max_revisits_per_node: int = 0,
     ) -> SearchResult:
         """Run a stateful traversal.
 
