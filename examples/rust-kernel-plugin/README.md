@@ -20,9 +20,9 @@ those projected Arrow rows into native structs with `TryFrom<ArrowRow<'_>>`, the
 
 ```rust
 use anyhow::{Context, Result};
-use rxgraph::{ArrowRow, ArrowStruct, PayloadField, StateRow, TypedKernel, Value, traversal::native};
+use rxgraph::{ArrowRow, ArrowStruct, PayloadField, Transition, TypedKernel, traversal::native};
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct HopState {
     hops: u64,
 }
@@ -133,32 +133,22 @@ impl TypedKernel for HopBudget {
         Ok(HopState::default())
     }
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
+    ) -> Result<Transition<Self::State>> {
         let edge = cx.edge()?;
-        Ok(edge.enabled && cx.state().hops.saturating_add(edge.cost()) <= self.max_hops)
-    }
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State> {
-        Ok(HopState {
-            hops: cx.state().hops.saturating_add(cx.edge()?.cost()),
+        let state = HopState {
+            hops: cx.state().hops.saturating_add(edge.cost()),
+        };
+        if !edge.enabled || state.hops > self.max_hops {
+            return Ok(Transition::Reject);
+        }
+        Ok(if state.hops == self.max_hops || cx.dest()?.target {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
         })
-    }
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        Ok(cx.state().hops >= self.max_hops || cx.dest()?.target)
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("hops".to_string(), Value::U64(state.hops))]
     }
 }
 
@@ -248,13 +238,13 @@ plugin pytest coverage.
 
 ## Native context
 
-A typed kernel's `visit`/`next_state`/`stop` receive a
+A typed kernel's `transition` receives a
 `native::EdgeCtx<'_, '_, Node, Edge, State>` for the candidate edge
 `(src)-[edge]->(dest)`.
 
 | Accessor | Returns | Notes |
 | --- | --- | --- |
-| `state()` | `&State` | Parent state in `visit`/`next_state`; child state in `stop`. |
+| `state()` | `&State` | Parent state for the candidate edge. |
 | `src_id()` / `dest_id()` / `edge_id()` | `NodeId` / `NodeId` / `EdgeId` | Internal row ids. |
 | `src_external_id()` / `dest_external_id()` / `edge_external_id()` | `Result<Option<GraphId>>` | External ids, if present. |
 | `src()` / `dest()` / `edge()` | `Result<&Node>` / `Result<&Node>` / `Result<&Edge>` | Native structs decoded via `TryFrom<ArrowRow<'_>>`. |

@@ -1,11 +1,7 @@
 //! Native Rust traversal kernel abstraction.
 //!
-//! A [`Kernel`] supplies the same three decisions the DSL makes for every
-//! candidate edge `(src)-[edge]->(dest)`:
-//!
-//! 1. [`Kernel::visit`]: whether the edge may be accepted.
-//! 2. [`Kernel::next_state`]: how per-path state changes after accepting it.
-//! 3. [`Kernel::stop`]: whether the newly accepted path should be emitted.
+//! A [`Kernel`] maps each candidate edge `(src)-[edge]->(dest)` to one fused
+//! [`Transition`](crate::Transition).
 //!
 //! The engine ([`Graph::search_with`](crate::Graph::search_with)) is generic
 //! over `K: Kernel`, so a kernel's per-edge calls are statically dispatched -
@@ -20,13 +16,125 @@
 
 use std::{cell::RefCell, collections::HashMap};
 
-use anyhow::Result;
-use arrow::record_batch::RecordBatch;
+use anyhow::{Context, Result};
+use arrow::{
+    array::{Array, BooleanArray, Float64Array, Int64Array, UInt64Array},
+    record_batch::RecordBatch,
+};
 
 use crate::{
-    dsl::{StateRow, Value, arrow_value::ColumnReader},
+    dsl::{Value, arrow_value::ColumnReader},
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId},
+    traversal::Transition,
 };
+
+mod sealed {
+    pub trait FieldValue {}
+}
+
+/// Primitive value supported by pre-bound node and edge fields.
+///
+/// This trait is sealed; rxgraph implements it for `bool`, `u64`, `i64`, and
+/// `f64`. Binding is exact and does not perform the coercions used by the
+/// name-based [`EdgeCtx`] getters.
+pub trait FieldValue: sealed::FieldValue + Copy + Send + Sync + 'static {
+    #[doc(hidden)]
+    type Array: Array + Clone + Send + Sync + 'static;
+
+    #[doc(hidden)]
+    fn downcast(array: &dyn Array) -> Option<&Self::Array>;
+
+    #[doc(hidden)]
+    fn read(array: &Self::Array, row: usize) -> Self;
+}
+
+macro_rules! field_value {
+    ($value:ty, $array:ty) => {
+        impl sealed::FieldValue for $value {}
+
+        impl FieldValue for $value {
+            type Array = $array;
+
+            #[inline]
+            fn downcast(array: &dyn Array) -> Option<&Self::Array> {
+                array.as_any().downcast_ref()
+            }
+
+            #[inline]
+            fn read(array: &Self::Array, row: usize) -> Self {
+                array.value(row)
+            }
+        }
+    };
+}
+
+field_value!(bool, BooleanArray);
+field_value!(u64, UInt64Array);
+field_value!(i64, Int64Array);
+field_value!(f64, Float64Array);
+
+#[derive(Clone)]
+struct BoundField<T: FieldValue> {
+    array: T::Array,
+    owner: usize,
+}
+
+impl<T: FieldValue> BoundField<T> {
+    fn bind(batch: &RecordBatch, name: &str) -> Result<Self> {
+        let column = batch
+            .column_by_name(name)
+            .with_context(|| format!("column {name:?} is missing"))?;
+        let array = T::downcast(column.as_ref())
+            .with_context(|| {
+                format!(
+                    "column {name:?} has type {:?}, expected {}",
+                    column.data_type(),
+                    std::any::type_name::<T>()
+                )
+            })?
+            .clone();
+        Ok(Self {
+            array,
+            owner: batch.schema_ref() as *const _ as usize,
+        })
+    }
+
+    #[inline]
+    fn read(&self, batch: &RecordBatch, row: usize) -> Option<T> {
+        debug_assert_eq!(self.owner, batch.schema_ref() as *const _ as usize);
+        if self.array.is_null(row) {
+            None
+        } else {
+            Some(T::read(&self.array, row))
+        }
+    }
+}
+
+/// A primitive node payload column bound once for zero-lookup hot-path reads.
+///
+/// This is a snapshot of the current payload array. Rebind it after calling
+/// [`Graph::set_payloads`].
+#[derive(Clone)]
+pub struct NodeField<T: FieldValue>(BoundField<T>);
+
+/// A primitive edge payload column bound once for zero-lookup hot-path reads.
+///
+/// This is a snapshot of the current payload array. Rebind it after calling
+/// [`Graph::set_payloads`].
+#[derive(Clone)]
+pub struct EdgeField<T: FieldValue>(BoundField<T>);
+
+impl Graph {
+    /// Binds an exact primitive node payload column for native kernel use.
+    pub fn node_field<T: FieldValue>(&self, name: &str) -> Result<NodeField<T>> {
+        Ok(NodeField(BoundField::bind(self.repo.node_batch(), name)?))
+    }
+
+    /// Binds an exact primitive edge payload column for native kernel use.
+    pub fn edge_field<T: FieldValue>(&self, name: &str) -> Result<EdgeField<T>> {
+        Ok(EdgeField(BoundField::bind(self.repo.edge_batch(), name)?))
+    }
+}
 
 /// Memoizes [`ColumnReader`]s bound per payload column for a single search.
 ///
@@ -87,30 +195,17 @@ impl PayloadCache {
 /// A native traversal predicate/state machine.
 ///
 /// Implementors decide edge acceptance, state evolution, and stopping. The
-/// associated [`State`](Kernel::State) is the per-path payload carried through
-/// the search and materialized via [`state_row`](Kernel::state_row).
+/// associated [`State`](Kernel::State) is carried through the search and
+/// returned directly to Rust callers.
 pub trait Kernel {
     /// Per-path state carried along each path.
     type State: Clone;
 
     /// Initial state for a path that begins at `start`.
-    fn initial_state(&self, graph: &Graph, start: NodeId) -> Self::State;
+    fn initial_state(&self, graph: &Graph, start: NodeId) -> Result<Self::State>;
 
-    /// Whether the candidate edge in `cx` may be accepted.
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool>;
-
-    /// State for the child path after accepting the edge in `cx`.
-    ///
-    /// The parent state is available as [`EdgeCtx::state`].
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State>;
-
-    /// Whether the accepted path should be emitted.
-    ///
-    /// `cx` carries the *child* state produced by [`next_state`](Kernel::next_state).
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool>;
-
-    /// Materializes the named state row for a returned path.
-    fn state_row(&self, state: &Self::State) -> StateRow;
+    /// Evaluates edge acceptance, child state, and completion in one call.
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>>;
 }
 
 /// Per-edge context passed to a [`Kernel`].
@@ -150,21 +245,6 @@ impl<'a, S> EdgeCtx<'a, S> {
         }
     }
 
-    /// Returns a context borrowing `state` in place of the current one.
-    ///
-    /// Mirrors the DSL's `with_state`; used to evaluate `stop` against the
-    /// child state produced by `next_state`.
-    pub fn with_state<'b>(&'b self, state: &'b S) -> EdgeCtx<'b, S> {
-        EdgeCtx {
-            graph: self.graph,
-            src: self.src,
-            dest: self.dest,
-            edge: self.edge,
-            state,
-            cache: self.cache,
-        }
-    }
-
     /// The graph being traversed.
     pub fn graph(&self) -> &'a Graph {
         self.graph
@@ -188,6 +268,30 @@ impl<'a, S> EdgeCtx<'a, S> {
     /// The per-path state.
     pub fn state(&self) -> &S {
         self.state
+    }
+
+    /// Reads a pre-bound field from the source node.
+    #[inline]
+    pub fn src_field<T: FieldValue>(&self, field: &NodeField<T>) -> Option<T> {
+        field
+            .0
+            .read(self.graph.repo.node_batch(), self.src as usize)
+    }
+
+    /// Reads a pre-bound field from the destination node.
+    #[inline]
+    pub fn dest_field<T: FieldValue>(&self, field: &NodeField<T>) -> Option<T> {
+        field
+            .0
+            .read(self.graph.repo.node_batch(), self.dest as usize)
+    }
+
+    /// Reads a pre-bound field from the current edge.
+    #[inline]
+    pub fn edge_field<T: FieldValue>(&self, field: &EdgeField<T>) -> Option<T> {
+        field
+            .0
+            .read(self.graph.repo.edge_batch(), self.edge as usize)
     }
 
     /// External id of the source node, if present.
@@ -415,8 +519,45 @@ fn as_str(value: Value) -> Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array},
+        datatypes::{DataType, Field, Schema},
+    };
+
     use super::{as_f64, as_i64, as_u64};
-    use crate::dsl::Value;
+    use crate::{Graph, dsl::Value};
+
+    fn field_graph() -> Graph {
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("score", DataType::UInt64, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![0, 1])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![Some(7), None])),
+            ],
+        )
+        .unwrap();
+        let edges = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::UInt64, false),
+                Field::new("src", DataType::UInt64, false),
+                Field::new("dest", DataType::UInt64, false),
+                Field::new("allowed", DataType::Boolean, true),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(vec![0])) as ArrayRef,
+                Arc::new(UInt64Array::from(vec![0])),
+                Arc::new(UInt64Array::from(vec![1])),
+                Arc::new(BooleanArray::from(vec![Some(true)])),
+            ],
+        )
+        .unwrap();
+        Graph::new(nodes, edges).unwrap()
+    }
 
     #[test]
     fn as_u64_coercion() {
@@ -447,5 +588,18 @@ mod tests {
         assert_eq!(as_f64(Value::U64(9)).unwrap(), Some(9.0));
         assert_eq!(as_f64(Value::Null).unwrap(), None);
         assert!(as_f64(Value::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn bound_fields_read_exact_types_and_nulls() {
+        let graph = field_graph();
+        let score = graph.node_field::<u64>("score").unwrap();
+        let allowed = graph.edge_field::<bool>("allowed").unwrap();
+
+        assert_eq!(score.0.read(graph.repo.node_batch(), 0), Some(7));
+        assert_eq!(score.0.read(graph.repo.node_batch(), 1), None);
+        assert_eq!(allowed.0.read(graph.repo.edge_batch(), 0), Some(true));
+        assert!(graph.edge_field::<u64>("allowed").is_err());
+        assert!(graph.edge_field::<bool>("missing").is_err());
     }
 }

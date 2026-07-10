@@ -38,11 +38,12 @@ pub use python::register;
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
-    ArrowList, ArrowRow, ArrowStruct, BoxedRun, EdgeCtx, GraphPath, Kernel, KernelEntry,
-    OwnedGraphPath, OwnedSearchResult, ParquetPaths, PayloadField, RunKernel, RunOptions,
-    SearchResult, SearchStats, TraversalConfig, TraversalConfigBuilder, TraversalStrategy,
-    TypedKernel, TypedKernelEntry, TypedPayloadCache, boxed_run, boxed_typed_run, build_kernel,
-    build_typed_kernel, register_kernel, search_native, try_build_kernel, try_build_typed_kernel,
+    ArrowList, ArrowRow, ArrowStruct, BoxedRun, EdgeCtx, EdgeField, FieldValue, FirstResult,
+    GraphPath, Kernel, KernelEntry, NodeField, OwnedGraphPath, OwnedSearchResult, ParquetPaths,
+    PathsResult, PayloadField, RunKernel, RunOptions, SearchResult, SearchStats, Transition,
+    TraversalConfig, TraversalConfigBuilder, TraversalStrategy, TypedKernel, TypedKernelEntry,
+    TypedPayloadCache, boxed_run, boxed_typed_run, build_kernel, build_typed_kernel,
+    register_kernel, search_native, try_build_kernel, try_build_typed_kernel,
 };
 
 // Re-exported so plugin crates can register kernels without their own dependency.

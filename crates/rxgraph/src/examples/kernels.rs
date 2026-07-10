@@ -8,13 +8,12 @@
 use anyhow::{Result, anyhow};
 
 use crate::{
-    dsl::{StateRow, Value},
     graph::{Graph, NodeId, OwnedGraphId},
-    traversal::{ArrowRow, EdgeCtx, Kernel, PayloadField, TypedKernel, native},
+    traversal::{ArrowRow, EdgeCtx, Kernel, PayloadField, Transition, TypedKernel, native},
 };
 
 /// Per-path state for [`WeightedBudget`]: the weight accumulated so far.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct BudgetState {
     /// Total edge weight spent along the current path.
     pub spent: u64,
@@ -25,9 +24,9 @@ pub struct BudgetState {
 /// Traversal accumulates `weight_col` along each path. An edge is accepted only
 /// while `spent + weight <= budget`, and a path stops once it reaches `target`.
 ///
-/// A null/missing weight rejects the edge (returns `Ok(false)` from
-/// [`visit`](Kernel::visit)): a missing cost is treated as "cannot price this
-/// hop", which is safer for a budget than silently charging zero.
+/// A null/missing weight rejects the edge: a missing cost is treated as
+/// "cannot price this hop", which is safer for a budget than silently charging
+/// zero.
 #[derive(Clone, Debug)]
 pub struct WeightedBudget {
     /// Edge payload column holding the `u64` weight.
@@ -41,33 +40,25 @@ pub struct WeightedBudget {
 impl Kernel for WeightedBudget {
     type State = BudgetState;
 
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
-        BudgetState { spent: 0 }
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
+        Ok(BudgetState { spent: 0 })
     }
 
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
         // Null/missing weight rejects the edge (see type docs).
         let Some(weight) = cx.edge_u64(&self.weight_col)? else {
-            return Ok(false);
+            return Ok(Transition::Reject);
         };
-        Ok(cx.state().spent.saturating_add(weight) <= self.budget)
-    }
-
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
-        // `next_state` runs only after `visit` accepted the edge, so the weight
-        // is present; default to 0 defensively rather than re-erroring.
-        let weight = cx.edge_u64(&self.weight_col)?.unwrap_or(0);
-        Ok(BudgetState {
+        let state = BudgetState {
             spent: cx.state().spent.saturating_add(weight),
+        };
+        Ok(if state.spent > self.budget {
+            Transition::Reject
+        } else if cx.dest_id() == Some(self.target.as_ref()) {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
         })
-    }
-
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
-        Ok(cx.dest_id() == Some(self.target.as_ref()))
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("spent".to_string(), Value::U64(state.spent))]
     }
 }
 
@@ -157,31 +148,20 @@ impl TypedKernel for WeightedBudgetTyped {
         Ok(BudgetState { spent: 0 })
     }
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        Ok(cx.state().spent.saturating_add(cx.edge()?.weight) <= self.budget)
-    }
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State> {
-        Ok(BudgetState {
+    ) -> Result<Transition<Self::State>> {
+        let state = BudgetState {
             spent: cx.state().spent.saturating_add(cx.edge()?.weight),
+        };
+        Ok(if state.spent > self.budget {
+            Transition::Reject
+        } else if cx.dest_external_id()? == Some(self.target.as_ref()) {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
         })
-    }
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        Ok(cx.dest_external_id()? == Some(self.target.as_ref()))
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("spent".to_string(), Value::U64(state.spent))]
     }
 }
 

@@ -16,10 +16,11 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use serde::Serialize;
 
 use crate::{
-    Graph,
+    Graph, StateRow, Value,
     traversal::{
         Kernel, RunOptions, SearchResult,
         typed::{self, OwnedSearchResult, ParquetPaths, TypedKernel, TypedPayloadCache},
@@ -122,21 +123,77 @@ inventory::collect!(TypedKernelEntry);
 pub fn boxed_run<K>(kernel: K) -> BoxedRun
 where
     K: Kernel + Clone + Send + Sync + 'static,
-    K::State: Send + Sync + Clone,
+    K::State: Send + Sync + Clone + Serialize,
 {
-    struct Runner<K>(K);
+    boxed_run_with_state_encoder(kernel, encode_state)
+}
 
-    impl<K> RunKernel for Runner<K>
+/// Wraps a kernel with an explicit result-state encoder.
+pub fn boxed_run_with_state_encoder<K, F>(kernel: K, encode: F) -> BoxedRun
+where
+    K: Kernel + Clone + Send + Sync + 'static,
+    K::State: Send + Sync + Clone,
+    F: Fn(&K::State) -> Result<StateRow> + Send + Sync + 'static,
+{
+    struct Runner<K, F>(K, F);
+
+    impl<K, F> RunKernel for Runner<K, F>
     where
         K: Kernel + Clone + Send + Sync + 'static,
         K::State: Send + Sync + Clone,
+        F: Fn(&K::State) -> Result<StateRow> + Send + Sync + 'static,
     {
         fn run<'g>(&self, graph: &'g Graph, run: RunOptions) -> Result<SearchResult<'g>> {
-            graph.search_with(self.0.clone(), run)
+            graph
+                .search_paths_with(self.0.clone(), run)?
+                .try_map_state(&self.1)
         }
     }
 
-    Box::new(Runner(kernel))
+    Box::new(Runner(kernel, encode))
+}
+
+pub(crate) fn encode_state<T: Serialize>(state: &T) -> Result<StateRow> {
+    let serde_json::Value::Object(fields) = serde_json::to_value(state)? else {
+        bail!("kernel state must serialize as an object")
+    };
+    let mut row = fields
+        .into_iter()
+        .map(|(name, value)| Ok((name, value_from_json(value)?)))
+        .collect::<Result<StateRow>>()?;
+    row.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(row)
+}
+
+fn value_from_json(value: serde_json::Value) -> Result<Value> {
+    Ok(match value {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(value) => Value::Bool(value),
+        serde_json::Value::Number(value) if value.is_u64() => {
+            Value::U64(value.as_u64().context("invalid u64 state value")?)
+        }
+        serde_json::Value::Number(value) if value.is_i64() => {
+            Value::I64(value.as_i64().context("invalid i64 state value")?)
+        }
+        serde_json::Value::Number(value) => {
+            Value::F64(value.as_f64().context("invalid f64 state value")?)
+        }
+        serde_json::Value::String(value) => Value::Str(value.into()),
+        serde_json::Value::Array(values) => Value::List(
+            values
+                .into_iter()
+                .map(value_from_json)
+                .collect::<Result<_>>()?,
+        ),
+        serde_json::Value::Object(fields) => {
+            let mut fields = fields
+                .into_iter()
+                .map(|(name, value)| Ok((name, value_from_json(value)?)))
+                .collect::<Result<Vec<_>>>()?;
+            fields.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Struct(fields)
+        }
+    })
 }
 
 /// Wraps a concrete [`TypedKernel`] into a boxed typed native runner.
@@ -145,7 +202,7 @@ where
     K: TypedKernel + Clone + Send + Sync + 'static,
     K::Node: Send + Sync + 'static,
     K::Edge: Send + Sync + 'static,
-    K::State: Send + Sync + Clone,
+    K::State: Send + Sync + Clone + Serialize,
 {
     struct Runner<K>(K);
 
@@ -154,7 +211,7 @@ where
         K: TypedKernel + Clone + Send + Sync + 'static,
         K::Node: Send + Sync + 'static,
         K::Edge: Send + Sync + 'static,
-        K::State: Send + Sync + Clone,
+        K::State: Send + Sync + Clone + Serialize,
     {
         fn run_eager(&self, graph: &Graph, run: RunOptions) -> Result<OwnedSearchResult> {
             typed::run_typed_eager(graph, self.0.clone(), run)

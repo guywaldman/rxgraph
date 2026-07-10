@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "quick": {
+      "search": {"starts": 128, "depth": 12, "fanout": 16},
+      "topology_nodes": 10000,
+      "warmups": 1,
+      "runs": 3
+    },
+    "standard": {
+      "search": {"starts": 2048, "depth": 24, "fanout": 64},
+      "topology_nodes": 100000,
+      "warmups": 2,
+      "runs": 7
+    },
+    "large": {
+      "search": {"starts": 8192, "depth": 32, "fanout": 128},
+      "topology_nodes": null,
+      "warmups": 1,
+      "runs": 3
+    }
+  }
+}

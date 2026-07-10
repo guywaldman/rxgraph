@@ -56,7 +56,25 @@ const EDGE_DEST_COL: &str = "dest";
 
 /// `(node ids, edge ids, spent)` for each returned path, sorted for stable
 /// comparison regardless of traversal order.
-fn summarize(result: &rxgraph::SearchResult<'_>) -> Vec<(Vec<u64>, Vec<u64>, u64)> {
+trait SpentState {
+    fn spent(&self) -> u64;
+}
+
+impl SpentState for BudgetState {
+    fn spent(&self) -> u64 {
+        self.spent
+    }
+}
+
+impl SpentState for StateRow {
+    fn spent(&self) -> u64 {
+        spent(self)
+    }
+}
+
+fn summarize<S: SpentState>(
+    result: &rxgraph::SearchResult<'_, S>,
+) -> Vec<(Vec<u64>, Vec<u64>, u64)> {
     let mut rows = result
         .paths
         .iter()
@@ -64,7 +82,7 @@ fn summarize(result: &rxgraph::SearchResult<'_>) -> Vec<(Vec<u64>, Vec<u64>, u64
             (
                 p.nodes.iter().map(u64_id).collect::<Vec<_>>(),
                 p.edges.iter().map(u64_id).collect::<Vec<_>>(),
-                spent(&p.state),
+                p.state.spent(),
             )
         })
         .collect::<Vec<_>>();
@@ -133,7 +151,7 @@ fn static_kernel_initial_state_is_zero() -> Result<()> {
     };
     // initial_state ignores graph/start and starts at 0.
     use rxgraph::Kernel;
-    assert_eq!(kernel.initial_state(&graph, 0), BudgetState { spent: 0 });
+    assert_eq!(kernel.initial_state(&graph, 0)?, BudgetState { spent: 0 });
     Ok(())
 }
 
@@ -335,7 +353,7 @@ fn arrow_row_reads_nested_values() -> Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 struct CompoundState {
     spent: u64,
 }
@@ -407,33 +425,21 @@ impl TypedKernel for CompoundBudget {
         Ok(CompoundState::default())
     }
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
+    ) -> Result<rxgraph::Transition<Self::State>> {
         let edge = cx.edge()?;
         let next_spent = cx.state().spent.saturating_add(edge.total_charge());
-        Ok(edge.policy.enabled && next_spent <= edge.policy.limit)
-    }
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State> {
-        Ok(CompoundState {
-            spent: cx.state().spent.saturating_add(cx.edge()?.total_charge()),
+        if !edge.policy.enabled || next_spent > edge.policy.limit {
+            return Ok(rxgraph::Transition::Reject);
+        }
+        let state = CompoundState { spent: next_spent };
+        Ok(if cx.dest_external_id()? == Some(GraphId::U64(2)) {
+            rxgraph::Transition::Complete(state)
+        } else {
+            rxgraph::Transition::Continue(state)
         })
-    }
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        Ok(cx.dest_external_id()? == Some(GraphId::U64(2)))
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("spent".to_string(), Value::U64(state.spent))]
     }
 }
 

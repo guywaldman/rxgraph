@@ -11,15 +11,13 @@
 //! the hop budget is used.
 
 use anyhow::{Context, Result};
-use rxgraph::{
-    ArrowRow, ArrowStruct, PayloadField, StateRow, TypedKernel, Value, traversal::native,
-};
+use rxgraph::{ArrowRow, ArrowStruct, PayloadField, Transition, TypedKernel, traversal::native};
 
 /// Per-path state carried by [`HopBudget`].
 ///
 /// Kept deliberately tiny and `Copy`; the engine clones state for every child
 /// path, so cheap state keeps search fast.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct HopState {
     /// Number of edges accepted so far on this path.
     hops: u64,
@@ -154,41 +152,28 @@ impl TypedKernel for HopBudget {
         Ok(HopState::default())
     }
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
+    ) -> Result<Transition<Self::State>> {
         // `cx.state()` is the parent path's state. Edge policy is a native
         // struct decoded from Arrow before traversal calls into this kernel.
         let edge = cx.edge()?;
         let next_hops = cx.state().hops.saturating_add(edge.cost());
-        Ok(edge.enabled && next_hops <= self.max_hops)
-    }
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State> {
-        Ok(HopState {
-            hops: cx.state().hops.saturating_add(cx.edge()?.cost()),
-        })
-    }
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        // `cx` here carries the *child* state produced by `next_state`.
+        if !edge.enabled || next_hops > self.max_hops {
+            return Ok(Transition::Reject);
+        }
+        let state = HopState { hops: next_hops };
         // Emit the path if we reached the hop budget...
-        if cx.state().hops >= self.max_hops {
-            return Ok(true);
+        if state.hops >= self.max_hops {
+            return Ok(Transition::Complete(state));
         }
         // ...or if the destination node's `profile` marks it as a goal.
-        Ok(cx.dest()?.is_goal())
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("hops".to_string(), Value::U64(state.hops))]
+        Ok(if cx.dest()?.is_goal() {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
+        })
     }
 }
 

@@ -501,3 +501,30 @@ def test_kernel_schema_errors_are_informative() -> None:
             max_depth=1,
             max_paths=1,
         )
+
+
+def test_search_first_is_stable_and_needs_no_limit() -> None:
+    graph = rxg.Graph.from_edges([("a", "b"), ("a", "c")])
+
+    assert [graph.search_first(start_nodes=["a"]).nodes for _ in range(4)] == [
+        ["a", "b"]
+    ] * 4
+
+
+def test_max_visits_per_node_counts_total_occurrences() -> None:
+    graph = rxg.Graph.from_edges([("a", "b"), ("b", "a")])
+    result = graph.search_paths(
+        start_nodes=["a"],
+        stop=pl.col("dest.id") == graph.node_id("a"),
+        max_depth=2,
+        max_paths=1,
+        max_visits_per_node=2,
+    )
+
+    assert result.paths[0].nodes == ["a", "b", "a"]
+    with pytest.raises(RuntimeError, match="max_visits_per_node"):
+        graph.search_paths(
+            start_nodes=["a"],
+            max_paths=1,
+            max_visits_per_node=0,
+        )

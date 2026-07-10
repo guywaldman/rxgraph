@@ -119,6 +119,51 @@ println!("paths={} evaluated={}", result.paths.len(), result.stats.evaluated_edg
 Search can run depth-first or breadth-first, with optional Rayon-backed
 parallelism and optional per-node intermediate state materialization.
 
+### Native Rust fast path
+
+Native kernels should bind primitive Arrow fields once instead of performing a
+name lookup for every candidate edge:
+
+```rust
+use rxgraph::{EdgeCtx, EdgeField, Graph, Kernel, NodeId, Transition};
+
+#[derive(Clone)]
+struct BudgetKernel {
+    price: EdgeField<u64>,
+    budget: u64,
+}
+
+impl Kernel for BudgetKernel {
+    type State = u64;
+
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    fn transition(&self, cx: &EdgeCtx<'_, u64>) -> anyhow::Result<Transition<u64>> {
+        let spent = cx.state() + cx.edge_field(&self.price).unwrap_or(0);
+        Ok(if spent > self.budget {
+            Transition::Reject
+        } else {
+            Transition::Continue(spent)
+        })
+    }
+}
+
+# fn example(graph: &Graph) -> anyhow::Result<()> {
+let kernel = BudgetKernel {
+    price: graph.edge_field("price")?,
+    budget: 100,
+};
+# let _ = kernel;
+# Ok(())
+# }
+```
+
+The name-based `EdgeCtx` getters remain available for convenience and coercion.
+Pre-bound fields use exact Arrow types and are the intended maximum-throughput
+path.
+
 ## Python Bindings
 
 Python bindings are published as the `rxgraph` package on PyPI. The same PyO3
