@@ -84,7 +84,7 @@ class Graph:
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
         progress: bool = False,
-        max_revisits_per_node: int = 0,
+        max_visits_per_node: int = 1,
     ) -> SearchResult:
         """Run a stateful traversal.
 
@@ -103,6 +103,41 @@ class Graph:
         native kernels and do not need ``columns``.
         """
         ...
+    def search_paths(
+        self,
+        *,
+        start_nodes: Iterable[Hashable],
+        visit: Expr | str | None = None,
+        next_state: Mapping[str, Expr | str] | None = None,
+        stop: Expr | str | None = None,
+        initial_state: Mapping[str, Any] | None = None,
+        kernel: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        columns: Iterable[str] | None = None,
+        max_depth: int | None = None,
+        max_paths: int | None = None,
+        strategy: Literal["dfs", "bfs"] = "dfs",
+        parallel: bool | Literal["auto", "off", "on"] = True,
+        intermediate_states: bool = False,
+        progress: bool = False,
+        max_visits_per_node: int = 1,
+    ) -> SearchResult: ...
+    def search_first(
+        self,
+        *,
+        start_nodes: Iterable[Hashable],
+        visit: Expr | str | None = None,
+        next_state: Mapping[str, Expr | str] | None = None,
+        stop: Expr | str | None = None,
+        initial_state: Mapping[str, Any] | None = None,
+        kernel: str | None = None,
+        params: Mapping[str, Any] | None = None,
+        columns: Iterable[str] | None = None,
+        max_depth: int | None = None,
+        intermediate_states: bool = False,
+        progress: bool = False,
+        max_visits_per_node: int = 1,
+    ) -> SearchPath | None: ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
         ...

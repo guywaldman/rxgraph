@@ -10,10 +10,9 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 
 use crate::{
-    dsl::StateRow,
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId},
     traversal::{
-        RunOptions, SearchStats,
+        RunOptions, SearchStats, Transition,
         engine::{self, PathEntry, SearchAdapter},
     },
 };
@@ -118,16 +117,6 @@ impl<'store, 'state, N, E, S> EdgeCtx<'store, 'state, N, E, S> {
         }
     }
 
-    fn with_state<'b>(&'b self, state: &'b S) -> EdgeCtx<'store, 'b, N, E, S> {
-        EdgeCtx {
-            store: self.store,
-            src: self.src,
-            dest: self.dest,
-            edge: self.edge,
-            state,
-        }
-    }
-
     /// Internal source node row ID.
     pub fn src_id(&self) -> NodeId {
         self.src
@@ -191,22 +180,11 @@ pub trait Kernel {
     /// Initial state for a path that begins at `cx.id()`.
     fn initial_state(&self, cx: &StartCtx<'_, Self::Node, Self::Edge>) -> Result<Self::State>;
 
-    /// Whether the candidate edge in `cx` may be accepted.
-    fn visit(&self, cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>) -> Result<bool>;
-
-    /// State for the child path after accepting the edge in `cx`.
-    fn next_state(
+    /// Evaluates edge acceptance, child state, and completion in one call.
+    fn transition(
         &self,
         cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State>;
-
-    /// Whether the accepted path should be emitted.
-    ///
-    /// `cx` carries the child state produced by [`Kernel::next_state`].
-    fn stop(&self, cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>) -> Result<bool>;
-
-    /// Materializes the path state into the public named-row representation.
-    fn state_row(&self, state: &Self::State) -> StateRow;
+    ) -> Result<Transition<Self::State>>;
 }
 
 /// One node in a returned native path.
@@ -250,6 +228,13 @@ pub struct SearchResult<'a, N, E, S> {
     /// Materialized stopped paths.
     pub paths: Vec<Path<'a, N, E, S>>,
     /// Counters for completed work.
+    pub stats: SearchStats,
+}
+
+/// Deterministic first native path plus traversal counters.
+#[derive(Debug)]
+pub struct FirstResult<'a, N, E, S> {
+    pub path: Option<Path<'a, N, E, S>>,
     pub stats: SearchStats,
 }
 
@@ -359,6 +344,39 @@ where
     })
 }
 
+/// Explicit path-enumeration entrypoint for a native store.
+pub fn search_paths<'a, K, G>(
+    store: &'a G,
+    kernel: K,
+    run: RunOptions,
+) -> Result<SearchResult<'a, K::Node, K::Edge, K::State>>
+where
+    K: Kernel,
+    G: GraphStore<Node = K::Node, Edge = K::Edge>,
+{
+    search_native(store, kernel, run)
+}
+
+/// Returns the canonical shallowest native path using stable store edge order.
+pub fn search_first<'a, K, G>(
+    store: &'a G,
+    kernel: K,
+    mut run: RunOptions,
+) -> Result<FirstResult<'a, K::Node, K::Edge, K::State>>
+where
+    K: Kernel,
+    G: GraphStore<Node = K::Node, Edge = K::Edge>,
+{
+    run.max_paths = Some(1);
+    run.strategy = crate::TraversalStrategy::BreadthFirst;
+    run.parallel = false;
+    let mut result = search_native(store, kernel, run)?;
+    Ok(FirstResult {
+        path: result.paths.pop(),
+        stats: result.stats,
+    })
+}
+
 struct NativeSearchAdapter<'store, 'kernel, G, K> {
     store: &'store G,
     kernel: &'kernel K,
@@ -418,12 +436,11 @@ where
     ) -> Result<Option<(Self::State, bool)>> {
         let store: StoreRef<'store, K::Node, K::Edge> = self.store;
         let cx = EdgeCtx::new(store, src, dest, edge, state);
-        if !self.kernel.visit(&cx)? {
-            return Ok(None);
-        }
-        let state = self.kernel.next_state(&cx)?;
-        let stop = self.kernel.stop(&cx.with_state(&state))?;
-        Ok(Some((state, stop)))
+        Ok(match self.kernel.transition(&cx)? {
+            Transition::Reject => None,
+            Transition::Continue(state) => Some((state, false)),
+            Transition::Complete(state) => Some((state, true)),
+        })
     }
 
     fn materialize(
@@ -503,7 +520,7 @@ mod tests {
     use arrow::array::record_batch;
     use pretty_assertions::assert_eq;
 
-    use crate::{TraversalStrategy, dsl::Value};
+    use crate::TraversalStrategy;
 
     use super::*;
 
@@ -556,33 +573,27 @@ mod tests {
             })
         }
 
-        fn visit(&self, cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>) -> Result<bool> {
-            let edge = cx.edge()?;
-            let dest = cx.dest()?;
-            Ok(edge.allowed
-                && !dest.blocked
-                && cx.state().total_risk.saturating_add(edge.risk) <= self.max_risk)
-        }
-
-        fn next_state(
+        fn transition(
             &self,
             cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-        ) -> Result<Self::State> {
+        ) -> Result<Transition<Self::State>> {
             let edge = cx.edge()?;
             let dest = cx.dest()?;
+            if !(edge.allowed
+                && !dest.blocked
+                && cx.state().total_risk.saturating_add(edge.risk) <= self.max_risk)
+            {
+                return Ok(Transition::Reject);
+            }
             let mut next = cx.state().clone();
             next.total_risk += edge.risk;
             next.seen.insert(cx.dest_id());
             next.labels.insert(cx.dest_id(), dest.label);
-            Ok(next)
-        }
-
-        fn stop(&self, cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>) -> Result<bool> {
-            Ok(cx.dest()?.target)
-        }
-
-        fn state_row(&self, state: &Self::State) -> StateRow {
-            vec![("total_risk".to_string(), Value::U64(state.total_risk))]
+            Ok(if dest.target {
+                Transition::Complete(next)
+            } else {
+                Transition::Continue(next)
+            })
         }
     }
 

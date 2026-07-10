@@ -34,8 +34,8 @@ pub struct TraversalConfig {
     pub max_paths: Option<usize>,
     /// Search order.
     pub strategy: TraversalStrategy,
-    /// Maximum revisits allowed per node inside one path.
-    pub max_revisits_per_node: usize,
+    /// Maximum occurrences of any node inside one path.
+    pub max_visits_per_node: usize,
     /// Whether Rayon-backed parallel traversal is enabled.
     pub parallel: bool,
     /// Whether returned paths include per-node state history.
@@ -51,7 +51,7 @@ pub struct TraversalConfig {
 /// Builder for a [`TraversalConfig`].
 ///
 /// The builder defaults to depth-first traversal, no depth/path limits, no node
-/// revisits inside a path, and parallel traversal enabled.
+/// one visit per node inside a path, and parallel traversal enabled.
 ///
 /// ```
 /// use rxgraph::{DslExpr as e, DslKernel, Value, TraversalConfigBuilder};
@@ -76,7 +76,7 @@ pub struct TraversalConfigBuilder {
     max_depth: Option<usize>,
     max_paths: Option<usize>,
     strategy: TraversalStrategy,
-    max_revisits_per_node: usize,
+    max_visits_per_node: usize,
     parallel: bool,
     intermediate_states: bool,
     progress: bool,
@@ -91,7 +91,7 @@ impl TraversalConfigBuilder {
             max_depth: None,
             max_paths: None,
             strategy: TraversalStrategy::DepthFirst,
-            max_revisits_per_node: 0,
+            max_visits_per_node: 1,
             parallel: true,
             intermediate_states: false,
             progress: false,
@@ -131,12 +131,11 @@ impl TraversalConfigBuilder {
         self
     }
 
-    /// Sets the maximum number of times a node may be revisited within a single
-    /// path.
+    /// Sets the maximum number of times a node may occur within one path.
     ///
-    /// Defaults to `0` (no revisits).
-    pub fn with_max_revisits_per_node(mut self, max_revisits_per_node: usize) -> Self {
-        self.max_revisits_per_node = max_revisits_per_node;
+    /// Defaults to `1` (no revisits). Zero is rejected when search starts.
+    pub fn with_max_visits_per_node(mut self, max_visits_per_node: usize) -> Self {
+        self.max_visits_per_node = max_visits_per_node;
         self
     }
 
@@ -175,7 +174,7 @@ impl TraversalConfigBuilder {
             max_depth: self.max_depth,
             max_paths: self.max_paths,
             strategy: self.strategy,
-            max_revisits_per_node: self.max_revisits_per_node,
+            max_visits_per_node: self.max_visits_per_node,
             parallel: self.parallel,
             intermediate_states: self.intermediate_states,
             progress: self.progress,

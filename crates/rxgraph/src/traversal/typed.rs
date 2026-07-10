@@ -602,22 +602,10 @@ pub trait TypedKernel: Clone {
         cx: &native::StartCtx<'_, Self::Node, Self::Edge>,
     ) -> Result<Self::State>;
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool>;
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State>;
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool>;
-
-    fn state_row(&self, state: &Self::State) -> StateRow;
+    ) -> Result<crate::Transition<Self::State>>;
 }
 
 #[derive(Clone)]
@@ -646,29 +634,11 @@ where
         self.kernel.initial_state(cx)
     }
 
-    fn visit(
+    fn transition(
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        self.kernel.visit(cx)
-    }
-
-    fn next_state(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<Self::State> {
-        self.kernel.next_state(cx)
-    }
-
-    fn stop(
-        &self,
-        cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
-    ) -> Result<bool> {
-        self.kernel.stop(cx)
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        self.kernel.state_row(state)
+    ) -> Result<crate::Transition<Self::State>> {
+        self.kernel.transition(cx)
     }
 }
 
@@ -752,6 +722,7 @@ pub(crate) fn run_typed_eager<K>(
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
+    K::State: serde::Serialize,
 {
     let node_batch = project_batch(graph.node_payloads(), &kernel.node_fields())?;
     let edge_batch = project_batch(graph.edge_payloads(), &kernel.edge_fields())?;
@@ -770,6 +741,7 @@ where
     K: TypedKernel + 'static,
     K::Node: 'static,
     K::Edge: 'static,
+    K::State: serde::Serialize,
 {
     let payloads = cache.payloads(graph, &kernel)?;
     run_typed_payloads(graph, kernel, &payloads.nodes, &payloads.edges, run)
@@ -784,11 +756,12 @@ fn run_typed_payloads<K>(
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
+    K::State: serde::Serialize,
 {
     let store = native::EagerGraphStore::new(graph, nodes, edges)?;
     let adapter = TypedKernelAdapter::new(kernel);
     let result = native::search_native(&store, adapter.clone(), run)?;
-    owned_result(result, &adapter)
+    owned_result(result)
 }
 
 pub(crate) fn run_typed_parquet_lazy<K>(
@@ -799,6 +772,7 @@ pub(crate) fn run_typed_parquet_lazy<K>(
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
+    K::State: serde::Serialize,
 {
     let store = ParquetGraphStore::<K::Node, K::Edge>::new(
         graph,
@@ -808,7 +782,7 @@ where
     )?;
     let adapter = TypedKernelAdapter::new(kernel);
     let result = native::search_native(&store, adapter.clone(), run)?;
-    let mut owned = owned_result(result, &adapter)?;
+    let mut owned = owned_result(result)?;
     owned.stats.materialized_node_payloads = store.loaded_node_count();
     owned.stats.materialized_edge_payloads = store.loaded_edge_count();
     let io = store.io_stats();
@@ -819,19 +793,17 @@ where
     Ok(owned)
 }
 
-pub(crate) fn owned_result<N, E, S, K>(
+pub(crate) fn owned_result<N, E, S>(
     result: native::SearchResult<'_, N, E, S>,
-    kernel: &K,
 ) -> Result<OwnedSearchResult>
 where
-    K: native::Kernel<Node = N, Edge = E, State = S> + ?Sized,
-    S: Clone,
+    S: Clone + serde::Serialize,
 {
     let paths = result
         .paths
         .into_iter()
         .map(|path| {
-            let final_state = kernel.state_row(&path.state);
+            let final_state = super::registry::encode_state(&path.state)?;
             let intermediate_states = path
                 .nodes
                 .iter()
@@ -840,10 +812,9 @@ where
                     path.nodes
                         .iter()
                         .map(|node| {
-                            node.state
-                                .as_ref()
-                                .map(|state| kernel.state_row(state))
-                                .context("missing intermediate state")
+                            let state =
+                                node.state.as_ref().context("missing intermediate state")?;
+                            super::registry::encode_state(state)
                         })
                         .collect::<Result<Vec<_>>>()
                 })

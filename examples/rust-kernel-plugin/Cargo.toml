@@ -15,6 +15,7 @@ pyo3 = { version = "0.28", features = ["extension-module"] }
 # In-repo example uses the path dep, however external consumers should depend on the published
 # crate instead. e.g., `rxgraph = { version = "0.6", features = ["python"] }`
 rxgraph = { path = "../../crates/rxgraph", features = ["python"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]

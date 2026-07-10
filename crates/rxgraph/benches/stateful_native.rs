@@ -1,17 +1,16 @@
-use std::{hint::black_box, sync::Arc};
+use std::{env, hint::black_box, sync::Arc, time::Instant};
 
 use anyhow::Result;
 use arrow::{
     array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array},
     datatypes::{DataType, Field, Schema},
 };
-use criterion::{Criterion, criterion_group, criterion_main};
-use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, RunOptions, StateRow, TraversalStrategy, Value};
+use criterion::Criterion;
+use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, RunOptions, Transition, TraversalStrategy};
 
-const CASES: usize = 128;
-const DEPTH: usize = 12;
-const FANOUT: usize = 64;
-const DECOYS: usize = 1_024;
+const DEFAULT_CASES: usize = 128;
+const DEFAULT_DEPTH: usize = 12;
+const DEFAULT_FANOUT: usize = 64;
 
 #[derive(Clone, Copy)]
 struct SearchState {
@@ -21,32 +20,30 @@ struct SearchState {
 #[derive(Clone, Copy)]
 struct SearchKernel {
     target: u64,
+    budget: u64,
 }
 
 impl Kernel for SearchKernel {
     type State = SearchState;
 
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
-        SearchState { spent: 0 }
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
+        Ok(SearchState { spent: 0 })
     }
 
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
-        Ok(cx.edge_bool("allowed")?.unwrap_or(false)
-            && cx.state().spent + cx.edge_u64("cost")?.unwrap_or(0) <= DEPTH as u64)
-    }
-
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
-        Ok(SearchState {
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
+        if !cx.edge_bool("allowed")?.unwrap_or(false) {
+            return Ok(Transition::Reject);
+        }
+        let state = SearchState {
             spent: cx.state().spent + cx.edge_u64("cost")?.unwrap_or(0),
+        };
+        Ok(if state.spent > self.budget {
+            Transition::Reject
+        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
         })
-    }
-
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
-        Ok(cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)))
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        vec![("spent".into(), Value::U64(state.spent))]
     }
 }
 
@@ -54,12 +51,18 @@ struct Workload {
     graph: Graph,
     starts: Vec<rxgraph::OwnedGraphId>,
     kernel: SearchKernel,
+    cases: usize,
+    depth: usize,
 }
 
 impl Workload {
     fn new() -> Self {
-        let chain_nodes = CASES * DEPTH;
-        let target = (chain_nodes + DECOYS) as u64;
+        let cases = env_usize("RXGRAPH_NATIVE_CASES", DEFAULT_CASES);
+        let depth = env_usize("RXGRAPH_NATIVE_DEPTH", DEFAULT_DEPTH);
+        let fanout = env_usize("RXGRAPH_NATIVE_FANOUT", DEFAULT_FANOUT);
+        let decoys = env_usize("RXGRAPH_NATIVE_DECOYS", fanout * 16);
+        let chain_nodes = cases * depth;
+        let target = (chain_nodes + decoys) as u64;
         let node_count = target as usize + 1;
         let nodes = batch(
             vec![Field::new("id", DataType::UInt64, false)],
@@ -68,17 +71,17 @@ impl Workload {
             ))],
         );
 
-        let edge_count = CASES * DEPTH * (FANOUT + 1);
+        let edge_count = cases * depth * (fanout + 1);
         let mut ids = Vec::with_capacity(edge_count);
         let mut srcs = Vec::with_capacity(edge_count);
         let mut dests = Vec::with_capacity(edge_count);
         let mut costs = Vec::with_capacity(edge_count);
         let mut allowed = Vec::with_capacity(edge_count);
 
-        for case in 0..CASES {
-            for depth in 0..DEPTH {
-                let src = (case * DEPTH + depth) as u64;
-                let dest = if depth + 1 == DEPTH { target } else { src + 1 };
+        for case in 0..cases {
+            for level in 0..depth {
+                let src = (case * depth + level) as u64;
+                let dest = if level + 1 == depth { target } else { src + 1 };
                 push_edge(
                     &mut ids,
                     &mut srcs,
@@ -90,7 +93,7 @@ impl Workload {
                     1,
                     true,
                 );
-                for decoy in 0..FANOUT {
+                for decoy in 0..fanout {
                     push_edge(
                         &mut ids,
                         &mut srcs,
@@ -98,8 +101,8 @@ impl Workload {
                         &mut costs,
                         &mut allowed,
                         src,
-                        (chain_nodes + (case * 131 + depth * 67 + decoy) % DECOYS) as u64,
-                        DEPTH as u64 + 1,
+                        (chain_nodes + (case * 131 + level * 67 + decoy) % decoys) as u64,
+                        depth as u64 + 1,
                         false,
                     );
                 }
@@ -123,30 +126,38 @@ impl Workload {
             ],
         );
         let graph = Graph::new(nodes, edges).unwrap();
-        let starts = (0..CASES)
-            .map(|case| ((case * DEPTH) as u64).into())
+        let starts = (0..cases)
+            .map(|case| ((case * depth) as u64).into())
             .collect();
         Self {
             graph,
             starts,
-            kernel: SearchKernel { target },
+            kernel: SearchKernel {
+                target,
+                budget: depth as u64,
+            },
+            cases,
+            depth,
         }
     }
 
     fn run(&self, strategy: TraversalStrategy, parallel: bool, first: bool) -> RunOptions {
         RunOptions {
-            start_nodes: if first {
-                self.starts[..1].to_vec()
-            } else {
-                self.starts.clone()
-            },
-            max_depth: Some(DEPTH),
-            max_paths: Some(if first { 1 } else { CASES }),
+            start_nodes: self.starts.clone(),
+            max_depth: Some(self.depth),
+            max_paths: Some(if first { 1 } else { self.cases }),
             strategy,
             parallel,
             ..RunOptions::default()
         }
     }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -219,5 +230,59 @@ fn bench_stateful_native(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_stateful_native);
-criterion_main!(benches);
+fn measure_large(label: &str, run: impl FnOnce()) {
+    let started = Instant::now();
+    run();
+    eprintln!("stateful_native/{label} {:?}", started.elapsed());
+}
+
+fn main() {
+    if env::var_os("RXGRAPH_NATIVE_LARGE").is_some() {
+        let workload = Workload::new();
+        eprintln!(
+            "stateful_native large: nodes={} edges={} cases={} depth={}",
+            workload.graph.node_count(),
+            workload.graph.edge_count(),
+            workload.cases,
+            workload.depth,
+        );
+        measure_large("paths_dfs_serial", || {
+            black_box(
+                workload
+                    .graph
+                    .search_with(
+                        workload.kernel,
+                        workload.run(TraversalStrategy::DepthFirst, false, false),
+                    )
+                    .unwrap(),
+            );
+        });
+        measure_large("paths_bfs_parallel", || {
+            black_box(
+                workload
+                    .graph
+                    .search_with(
+                        workload.kernel,
+                        workload.run(TraversalStrategy::BreadthFirst, true, false),
+                    )
+                    .unwrap(),
+            );
+        });
+        measure_large("first_bfs_serial", || {
+            black_box(
+                workload
+                    .graph
+                    .search_with(
+                        workload.kernel,
+                        workload.run(TraversalStrategy::BreadthFirst, false, true),
+                    )
+                    .unwrap(),
+            );
+        });
+        return;
+    }
+
+    let mut criterion = Criterion::default().configure_from_args();
+    bench_stateful_native(&mut criterion);
+    criterion.final_summary();
+}

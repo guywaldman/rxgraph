@@ -1,9 +1,11 @@
+use std::marker::PhantomData;
+
 use anyhow::{Context, Result};
 
 use crate::{
     graph::{EdgeId, Graph, GraphRepo, NodeId, OwnedGraphId},
     traversal::{
-        EdgeCtx, GraphPath, Kernel, SearchResult,
+        EdgeCtx, FirstResult, GraphPath, Kernel, SearchResult, Transition,
         config::{TraversalConfig, TraversalStrategy},
         engine::{self, PathEntry, SearchAdapter},
         kernel::PayloadCache,
@@ -26,8 +28,8 @@ pub struct RunOptions {
     pub max_paths: Option<usize>,
     /// Search order.
     pub strategy: TraversalStrategy,
-    /// Maximum revisits allowed per node inside one path.
-    pub max_revisits_per_node: usize,
+    /// Maximum occurrences of any node inside one path. Must be at least one.
+    pub max_visits_per_node: usize,
     /// Whether Rayon-backed parallel traversal is enabled.
     pub parallel: bool,
     /// Whether returned paths include per-node state history.
@@ -43,7 +45,7 @@ impl Default for RunOptions {
             max_depth: None,
             max_paths: None,
             strategy: TraversalStrategy::default(),
-            max_revisits_per_node: 0,
+            max_visits_per_node: 1,
             parallel: true,
             intermediate_states: false,
             progress: false,
@@ -64,7 +66,7 @@ impl Graph {
             max_depth,
             max_paths,
             strategy,
-            max_revisits_per_node,
+            max_visits_per_node,
             parallel,
             intermediate_states,
             progress,
@@ -75,29 +77,16 @@ impl Graph {
             max_depth,
             max_paths,
             strategy,
-            max_revisits_per_node,
+            max_visits_per_node,
             parallel,
             intermediate_states,
             progress,
         };
-        self.search_with(kernel, run)
-    }
-
-    /// Runs a native [`Kernel`] traversal and materializes matching paths.
-    ///
-    /// The engine is monomorphized over `K`, so per-edge kernel calls are
-    /// statically dispatched.
-    pub fn search_with<K: Kernel + Sync>(
-        &self,
-        kernel: K,
-        run: RunOptions,
-    ) -> Result<SearchResult<'_>>
-    where
-        K::State: Send + Sync + Clone,
-    {
         let adapter = GraphSearchAdapter {
             graph: self,
             kernel: &kernel,
+            project: |state: &crate::dsl::StateValues| Ok(kernel.state_row(state)),
+            output: PhantomData,
         };
         let result = engine::search(&adapter, run)?;
         Ok(SearchResult {
@@ -105,19 +94,87 @@ impl Graph {
             stats: result.stats,
         })
     }
+
+    /// Explicit path-enumeration entrypoint.
+    pub fn search_paths(&self, config: TraversalConfig) -> Result<SearchResult<'_>> {
+        self.search(config)
+    }
+
+    /// Returns the canonical shallowest path, using stable start and edge order.
+    pub fn search_first(&self, mut config: TraversalConfig) -> Result<FirstResult<'_>> {
+        config.max_paths = Some(1);
+        config.strategy = TraversalStrategy::BreadthFirst;
+        config.parallel = false;
+        Ok(self.search_paths(config)?.into_first())
+    }
+
+    /// Runs a native [`Kernel`] traversal and returns typed matching paths.
+    ///
+    /// The engine is monomorphized over `K`, so per-edge kernel calls are
+    /// statically dispatched.
+    pub fn search_paths_with<K: Kernel + Sync>(
+        &self,
+        kernel: K,
+        run: RunOptions,
+    ) -> Result<SearchResult<'_, K::State>>
+    where
+        K::State: Send + Sync + Clone,
+    {
+        let adapter = GraphSearchAdapter {
+            graph: self,
+            kernel: &kernel,
+            project: |state: &K::State| Ok(state.clone()),
+            output: PhantomData,
+        };
+        let result = engine::search(&adapter, run)?;
+        Ok(SearchResult {
+            paths: result.paths,
+            stats: result.stats,
+        })
+    }
+
+    /// Returns the canonical shallowest typed path.
+    pub fn search_first_with<K: Kernel + Sync>(
+        &self,
+        kernel: K,
+        mut run: RunOptions,
+    ) -> Result<FirstResult<'_, K::State>>
+    where
+        K::State: Send + Sync + Clone,
+    {
+        run.max_paths = Some(1);
+        run.strategy = TraversalStrategy::BreadthFirst;
+        run.parallel = false;
+        Ok(self.search_paths_with(kernel, run)?.into_first())
+    }
+
+    /// Compatibility alias for [`Graph::search_paths_with`].
+    pub fn search_with<K: Kernel + Sync>(
+        &self,
+        kernel: K,
+        run: RunOptions,
+    ) -> Result<SearchResult<'_, K::State>>
+    where
+        K::State: Send + Sync + Clone,
+    {
+        self.search_paths_with(kernel, run)
+    }
 }
 
-struct GraphSearchAdapter<'g, 'k, K> {
+struct GraphSearchAdapter<'g, 'k, K, P, O> {
     graph: &'g Graph,
     kernel: &'k K,
+    project: P,
+    output: PhantomData<fn() -> O>,
 }
 
-impl<'g, 'k, K> SearchAdapter for GraphSearchAdapter<'g, 'k, K>
+impl<'g, 'k, K, P, O> SearchAdapter for GraphSearchAdapter<'g, 'k, K, P, O>
 where
     K: Kernel,
+    P: Fn(&K::State) -> Result<O>,
 {
     type State = K::State;
-    type Path = GraphPath<'g>;
+    type Path = GraphPath<'g, O>;
     type Cache = PayloadCache;
 
     fn resolve_node(&self, external: crate::GraphId<'_>) -> Result<Option<NodeId>> {
@@ -125,7 +182,7 @@ where
     }
 
     fn initial_state(&self, node: NodeId) -> Result<Self::State> {
-        Ok(self.kernel.initial_state(self.graph, node))
+        self.kernel.initial_state(self.graph, node)
     }
 
     fn out_degree(&self, node: NodeId) -> Result<usize> {
@@ -158,12 +215,11 @@ where
         cache: &Self::Cache,
     ) -> Result<Option<(Self::State, bool)>> {
         let cx = EdgeCtx::new(self.graph, src, dest, edge, state, cache);
-        if !self.kernel.visit(&cx)? {
-            return Ok(None);
-        }
-        let state = self.kernel.next_state(&cx)?;
-        let stop = self.kernel.stop(&cx.with_state(&state))?;
-        Ok(Some((state, stop)))
+        Ok(match self.kernel.transition(&cx)? {
+            Transition::Reject => None,
+            Transition::Continue(state) => Some((state, false)),
+            Transition::Complete(state) => Some((state, true)),
+        })
     }
 
     fn materialize(
@@ -174,7 +230,7 @@ where
     ) -> Result<Self::Path> {
         let mut nodes = Vec::with_capacity(arena[path].depth + 1);
         let mut edges = Vec::with_capacity(arena[path].depth);
-        let state = self.kernel.state_row(&arena[path].state);
+        let state = (self.project)(&arena[path].state)?;
         let mut states = intermediate_states.then(|| Vec::with_capacity(nodes.capacity()));
 
         loop {
@@ -193,7 +249,7 @@ where
                 );
             }
             if let Some(states) = &mut states {
-                states.push(self.kernel.state_row(&arena[path].state));
+                states.push((self.project)(&arena[path].state)?);
             }
             match arena[path].parent {
                 Some(parent) => path = parent,
@@ -456,6 +512,66 @@ mod tests {
         assert!(result.paths.is_empty());
         assert_eq!(result.stats.skipped_revisits, 1);
         assert_eq!(result.stats.stopped_paths, 0);
+    }
+
+    #[test]
+    fn max_visits_counts_total_occurrences_and_rejects_zero() {
+        let graph = graph();
+        let config = TraversalConfigBuilder::new(DslKernel::new(
+            e::bool_lit(true),
+            [],
+            e::dest_id().eq(e::string_lit("a")),
+            [],
+        ))
+        .with_start_nodes(["a"])
+        .with_max_depth(2)
+        .with_max_visits_per_node(2)
+        .with_parallelism(false)
+        .build();
+        let result = graph.search_paths(config).unwrap();
+        assert_eq!(path_set(&result), vec![vec!["a", "b", "a"]]);
+
+        let invalid = TraversalConfigBuilder::new(DslKernel::new(
+            e::bool_lit(true),
+            [],
+            e::bool_lit(false),
+            [],
+        ))
+        .with_start_nodes(["a"])
+        .with_max_visits_per_node(0)
+        .build();
+        assert!(
+            graph
+                .search_paths(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("max_visits_per_node")
+        );
+    }
+
+    #[test]
+    fn search_first_is_canonical_bfs() {
+        let graph = branching_graph();
+        let config = || {
+            TraversalConfigBuilder::new(DslKernel::new(
+                e::bool_lit(true),
+                [],
+                e::dest("kind").eq(e::string_lit("end")),
+                [],
+            ))
+            .with_start_nodes(["s"])
+            .with_strategy(TraversalStrategy::DepthFirst)
+            .with_parallelism(true)
+            .build()
+        };
+
+        for _ in 0..4 {
+            let first = graph.search_first(config()).unwrap().path.unwrap();
+            assert_eq!(
+                first.nodes,
+                vec![GraphId::Str("s"), GraphId::Str("c"), GraphId::Str("z")]
+            );
+        }
     }
 
     #[test]

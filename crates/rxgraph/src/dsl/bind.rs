@@ -9,7 +9,7 @@ use crate::{
         ops::scalar::ScalarOp,
     },
     graph::{EDGE_DEST_COL, EDGE_SRC_COL, Graph, GraphId, GraphRepo, ID_COL, NodeId},
-    traversal::{EdgeCtx, Kernel},
+    traversal::{EdgeCtx, Kernel, Transition},
 };
 
 #[derive(Debug)]
@@ -82,28 +82,23 @@ impl BoundKernel {
 impl Kernel for BoundKernel {
     type State = StateValues;
 
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Self::State {
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
         // The DSL's initial state is independent of the start node.
-        self.initial_state().clone()
+        Ok(self.initial_state().clone())
     }
 
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
         let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
-        BoundKernel::visit(self, &ctx)
-    }
-
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State> {
-        let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
-        BoundKernel::next_state(self, cx.state(), &ctx)
-    }
-
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool> {
-        let ctx = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), cx.state());
-        BoundKernel::stop(self, &ctx)
-    }
-
-    fn state_row(&self, state: &Self::State) -> StateRow {
-        BoundKernel::state_row(self, state)
+        if !BoundKernel::visit(self, &ctx)? {
+            return Ok(Transition::Reject);
+        }
+        let state = BoundKernel::next_state(self, cx.state(), &ctx)?;
+        let child = EvalCtx::new(cx.graph(), cx.src(), cx.dest(), cx.edge(), &state);
+        Ok(if BoundKernel::stop(self, &child)? {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
+        })
     }
 }
 

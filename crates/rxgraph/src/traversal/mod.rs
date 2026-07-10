@@ -51,7 +51,7 @@ pub(crate) use typed::{read_parquet_tables, read_parquet_topology};
 /// [`GraphId::U64`](crate::graph::GraphId::U64); for string-ID graphs they are
 /// [`GraphId::Str`](crate::graph::GraphId::Str).
 #[derive(Debug, Clone, PartialEq)]
-pub struct GraphPath<'a> {
+pub struct GraphPath<'a, S = StateRow> {
     /// External node IDs in path order, including the start and final node.
     pub nodes: Vec<GraphId<'a>>,
     /// Edge IDs in path order.
@@ -59,13 +59,24 @@ pub struct GraphPath<'a> {
     /// Final named state after the last accepted edge.
     ///
     /// For a zero-edge path this is the kernel's initial state.
-    pub state: StateRow,
+    pub state: S,
     /// Optional per-node state history in path order.
     ///
     /// Present only when [`TraversalConfigBuilder::with_intermediate_states`]
     /// is enabled. The first entry is the initial state at the start node; the
     /// final entry equals [`GraphPath::state`].
-    pub intermediate_states: Option<Vec<StateRow>>,
+    pub intermediate_states: Option<Vec<S>>,
+}
+
+/// Result of evaluating one candidate edge.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Transition<S> {
+    /// Reject the edge without creating child state.
+    Reject,
+    /// Accept the edge and continue traversal from the child state.
+    Continue(S),
+    /// Accept the edge and emit the completed path without expanding it.
+    Complete(S),
 }
 
 /// Result of a graph traversal.
@@ -73,11 +84,58 @@ pub struct GraphPath<'a> {
 /// `paths` contains only stopped paths, never intermediate frontier states.
 /// Use `stats` to inspect how much work was evaluated.
 #[derive(Debug)]
-pub struct SearchResult<'a> {
+pub struct SearchResult<'a, S = StateRow> {
     /// Materialized paths. Order is unspecified when parallel traversal is enabled.
-    pub paths: Vec<GraphPath<'a>>,
+    pub paths: Vec<GraphPath<'a, S>>,
     /// Counters for the completed work.
     pub stats: SearchStats,
+}
+
+/// Deterministic first completed path plus traversal counters.
+#[derive(Debug)]
+pub struct FirstResult<'a, S = StateRow> {
+    pub path: Option<GraphPath<'a, S>>,
+    pub stats: SearchStats,
+}
+
+/// Explicit name for a path-enumeration result.
+pub type PathsResult<'a, S = StateRow> = SearchResult<'a, S>;
+
+impl<'a, S> SearchResult<'a, S> {
+    pub(crate) fn into_first(mut self) -> FirstResult<'a, S> {
+        FirstResult {
+            path: self.paths.pop(),
+            stats: self.stats,
+        }
+    }
+
+    /// Converts path state at the result boundary without affecting traversal.
+    pub fn try_map_state<T>(
+        self,
+        mut map: impl FnMut(&S) -> anyhow::Result<T>,
+    ) -> anyhow::Result<SearchResult<'a, T>> {
+        let paths = self
+            .paths
+            .into_iter()
+            .map(|path| {
+                let state = map(&path.state)?;
+                let intermediate_states = path
+                    .intermediate_states
+                    .map(|states| states.iter().map(&mut map).collect())
+                    .transpose()?;
+                Ok(GraphPath {
+                    nodes: path.nodes,
+                    edges: path.edges,
+                    state,
+                    intermediate_states,
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(SearchResult {
+            paths,
+            stats: self.stats,
+        })
+    }
 }
 
 /// Traversal counters.

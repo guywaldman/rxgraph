@@ -3,7 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use rayon::prelude::*;
 
 use crate::{
@@ -71,7 +71,7 @@ struct RunConfig {
     max_depth: usize,
     max_paths: Option<usize>,
     strategy: TraversalStrategy,
-    max_revisits_per_node: usize,
+    max_visits_per_node: usize,
     intermediate_states: bool,
     progress: bool,
 }
@@ -83,7 +83,7 @@ impl RunConfig {
             max_depth: run.max_depth.unwrap_or(usize::MAX),
             max_paths: run.max_paths,
             strategy: run.strategy,
-            max_revisits_per_node: run.max_revisits_per_node,
+            max_visits_per_node: run.max_visits_per_node,
             intermediate_states: run.intermediate_states,
             progress: run.progress,
         }
@@ -114,6 +114,9 @@ where
     A::Path: Send,
     A::Cache: Send,
 {
+    if run.max_visits_per_node == 0 {
+        bail!("max_visits_per_node must be at least 1");
+    }
     let strategy = run.strategy;
     let parallel = run.parallel;
     let cfg = RunConfig::from_run(run);
@@ -132,6 +135,9 @@ pub(crate) fn search_serial<A>(adapter: &A, run: RunOptions) -> Result<SearchOut
 where
     A: SearchAdapter,
 {
+    if run.max_visits_per_node == 0 {
+        bail!("max_visits_per_node must be at least 1");
+    }
     search_serial_cfg(adapter, &RunConfig::from_run(run))
 }
 
@@ -524,7 +530,7 @@ fn eval_arena_edge<A>(
 where
     A: SearchAdapter,
 {
-    if !can_visit_arena(arena, parent, dest, cfg.max_revisits_per_node, visit_counts) {
+    if !can_visit_arena(arena, parent, dest, cfg.max_visits_per_node, visit_counts) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
@@ -664,7 +670,7 @@ where
             arena,
             task,
             dest,
-            cfg.max_revisits_per_node,
+            cfg.max_visits_per_node,
             visit_counts.as_ref(),
         ) {
             stats.skipped_revisits += 1;
@@ -756,18 +762,18 @@ fn can_visit_arena<S>(
     arena: &[PathEntry<S>],
     mut path: usize,
     node: NodeId,
-    max_revisits: usize,
+    max_visits: usize,
     visit_counts: Option<&VisitCounts>,
 ) -> bool {
     if let Some(visit_counts) = visit_counts {
-        return visit_counts.get(&node).copied().unwrap_or(0) <= max_revisits;
+        return visit_counts.get(&node).copied().unwrap_or(0) < max_visits;
     }
 
     let mut visits = 0usize;
     loop {
         if arena[path].node == node {
             visits += 1;
-            if visits > max_revisits {
+            if visits >= max_visits {
                 return false;
             }
         }

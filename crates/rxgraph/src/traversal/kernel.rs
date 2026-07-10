@@ -1,11 +1,7 @@
 //! Native Rust traversal kernel abstraction.
 //!
-//! A [`Kernel`] supplies the same three decisions the DSL makes for every
-//! candidate edge `(src)-[edge]->(dest)`:
-//!
-//! 1. [`Kernel::visit`]: whether the edge may be accepted.
-//! 2. [`Kernel::next_state`]: how per-path state changes after accepting it.
-//! 3. [`Kernel::stop`]: whether the newly accepted path should be emitted.
+//! A [`Kernel`] maps each candidate edge `(src)-[edge]->(dest)` to one fused
+//! [`Transition`](crate::Transition).
 //!
 //! The engine ([`Graph::search_with`](crate::Graph::search_with)) is generic
 //! over `K: Kernel`, so a kernel's per-edge calls are statically dispatched -
@@ -24,8 +20,9 @@ use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 
 use crate::{
-    dsl::{StateRow, Value, arrow_value::ColumnReader},
+    dsl::{Value, arrow_value::ColumnReader},
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId},
+    traversal::Transition,
 };
 
 /// Memoizes [`ColumnReader`]s bound per payload column for a single search.
@@ -87,30 +84,17 @@ impl PayloadCache {
 /// A native traversal predicate/state machine.
 ///
 /// Implementors decide edge acceptance, state evolution, and stopping. The
-/// associated [`State`](Kernel::State) is the per-path payload carried through
-/// the search and materialized via [`state_row`](Kernel::state_row).
+/// associated [`State`](Kernel::State) is carried through the search and
+/// returned directly to Rust callers.
 pub trait Kernel {
     /// Per-path state carried along each path.
     type State: Clone;
 
     /// Initial state for a path that begins at `start`.
-    fn initial_state(&self, graph: &Graph, start: NodeId) -> Self::State;
+    fn initial_state(&self, graph: &Graph, start: NodeId) -> Result<Self::State>;
 
-    /// Whether the candidate edge in `cx` may be accepted.
-    fn visit(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool>;
-
-    /// State for the child path after accepting the edge in `cx`.
-    ///
-    /// The parent state is available as [`EdgeCtx::state`].
-    fn next_state(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Self::State>;
-
-    /// Whether the accepted path should be emitted.
-    ///
-    /// `cx` carries the *child* state produced by [`next_state`](Kernel::next_state).
-    fn stop(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<bool>;
-
-    /// Materializes the named state row for a returned path.
-    fn state_row(&self, state: &Self::State) -> StateRow;
+    /// Evaluates edge acceptance, child state, and completion in one call.
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>>;
 }
 
 /// Per-edge context passed to a [`Kernel`].
@@ -147,21 +131,6 @@ impl<'a, S> EdgeCtx<'a, S> {
             edge,
             state,
             cache,
-        }
-    }
-
-    /// Returns a context borrowing `state` in place of the current one.
-    ///
-    /// Mirrors the DSL's `with_state`; used to evaluate `stop` against the
-    /// child state produced by `next_state`.
-    pub fn with_state<'b>(&'b self, state: &'b S) -> EdgeCtx<'b, S> {
-        EdgeCtx {
-            graph: self.graph,
-            src: self.src,
-            dest: self.dest,
-            edge: self.edge,
-            state,
-            cache: self.cache,
         }
     }
 
