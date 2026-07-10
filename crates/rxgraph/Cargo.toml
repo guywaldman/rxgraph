@@ -55,5 +55,9 @@ name = "flight_routes"
 harness = false
 
 [[bench]]
+name = "stateful_native"
+harness = false
+
+[[bench]]
 name = "memory"
 harness = false
