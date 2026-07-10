@@ -6,7 +6,9 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use criterion::Criterion;
-use rxgraph::{EdgeCtx, Graph, Kernel, NodeId, RunOptions, Transition, TraversalStrategy};
+use rxgraph::{
+    EdgeCtx, EdgeField, Graph, Kernel, NodeId, RunOptions, Transition, TraversalStrategy,
+};
 
 const DEFAULT_CASES: usize = 128;
 const DEFAULT_DEPTH: usize = 12;
@@ -78,10 +80,43 @@ impl Kernel for SearchKernel {
     }
 }
 
+#[derive(Clone)]
+struct BoundSearchKernel {
+    allowed: EdgeField<bool>,
+    cost: EdgeField<u64>,
+    target: u64,
+    budget: u64,
+}
+
+impl Kernel for BoundSearchKernel {
+    type State = SearchState;
+
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
+        Ok(SearchState { spent: 0 })
+    }
+
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
+        if !cx.edge_field(&self.allowed).unwrap_or(false) {
+            return Ok(Transition::Reject);
+        }
+        let state = SearchState {
+            spent: cx.state().spent + cx.edge_field(&self.cost).unwrap_or(0),
+        };
+        Ok(if state.spent > self.budget {
+            Transition::Reject
+        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
+        })
+    }
+}
+
 struct Workload {
     graph: Graph,
     starts: Vec<rxgraph::OwnedGraphId>,
     kernel: SearchKernel,
+    bound_kernel: BoundSearchKernel,
     topology_kernel: TopologyKernel,
     cases: usize,
     depth: usize,
@@ -175,6 +210,12 @@ impl Workload {
             ],
         );
         let graph = Graph::new(nodes, edges).unwrap();
+        let bound_kernel = BoundSearchKernel {
+            allowed: graph.edge_field("allowed").unwrap(),
+            cost: graph.edge_field("cost").unwrap(),
+            target,
+            budget: depth as u64,
+        };
         let starts = (0..cases)
             .map(|case| ((case * depth) as u64).into())
             .collect();
@@ -185,6 +226,7 @@ impl Workload {
                 target,
                 budget: depth as u64,
             },
+            bound_kernel,
             topology_kernel: TopologyKernel {
                 target,
                 budget: depth as u64,
@@ -253,6 +295,19 @@ fn bench_stateful_native(c: &mut Criterion) {
                 workload
                     .graph
                     .search_paths_with(
+                        workload.bound_kernel.clone(),
+                        workload.run(TraversalStrategy::DepthFirst, false, false),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    group.bench_function("paths_dfs_named_serial", |b| {
+        b.iter(|| {
+            black_box(
+                workload
+                    .graph
+                    .search_paths_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::DepthFirst, false, false),
                     )
@@ -279,7 +334,7 @@ fn bench_stateful_native(c: &mut Criterion) {
                 workload
                     .graph
                     .search_paths_with(
-                        workload.kernel,
+                        workload.bound_kernel.clone(),
                         workload.run(TraversalStrategy::BreadthFirst, false, false),
                     )
                     .unwrap(),
@@ -305,7 +360,7 @@ fn bench_stateful_native(c: &mut Criterion) {
                 workload
                     .graph
                     .search_paths_with(
-                        workload.kernel,
+                        workload.bound_kernel.clone(),
                         workload.run(TraversalStrategy::BreadthFirst, true, false),
                     )
                     .unwrap(),
@@ -318,7 +373,7 @@ fn bench_stateful_native(c: &mut Criterion) {
                 workload
                     .graph
                     .search_first_with(
-                        workload.kernel,
+                        workload.bound_kernel.clone(),
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
                     )
                     .unwrap(),
@@ -331,7 +386,7 @@ fn bench_stateful_native(c: &mut Criterion) {
                 skewed
                     .graph
                     .search_paths_with(
-                        skewed.kernel,
+                        skewed.bound_kernel.clone(),
                         skewed.run(TraversalStrategy::BreadthFirst, true, false),
                     )
                     .unwrap(),
@@ -364,6 +419,19 @@ fn main() {
                     workload
                         .graph
                         .search_paths_with(
+                            workload.bound_kernel.clone(),
+                            workload.run(TraversalStrategy::DepthFirst, false, false),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
+        if selected("paths_dfs_named_serial") {
+            measure_large("paths_dfs_named_serial", || {
+                black_box(
+                    workload
+                        .graph
+                        .search_paths_with(
                             workload.kernel,
                             workload.run(TraversalStrategy::DepthFirst, false, false),
                         )
@@ -390,7 +458,7 @@ fn main() {
                     workload
                         .graph
                         .search_paths_with(
-                            workload.kernel,
+                            workload.bound_kernel.clone(),
                             workload.run(TraversalStrategy::BreadthFirst, false, false),
                         )
                         .unwrap(),
@@ -403,7 +471,7 @@ fn main() {
                     workload
                         .graph
                         .search_paths_with(
-                            workload.kernel,
+                            workload.bound_kernel.clone(),
                             workload.run(TraversalStrategy::BreadthFirst, true, false),
                         )
                         .unwrap(),
@@ -429,7 +497,7 @@ fn main() {
                     workload
                         .graph
                         .search_first_with(
-                            workload.kernel,
+                            workload.bound_kernel.clone(),
                             workload.run(TraversalStrategy::BreadthFirst, false, true),
                         )
                         .unwrap(),
@@ -450,7 +518,7 @@ fn main() {
                     skewed
                         .graph
                         .search_paths_with(
-                            skewed.kernel,
+                            skewed.bound_kernel.clone(),
                             skewed.run(TraversalStrategy::BreadthFirst, true, false),
                         )
                         .unwrap(),

@@ -31,7 +31,7 @@ use crate::{dsl::StateRow, graph::GraphId};
 
 pub use algo::RunOptions;
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
-pub use kernel::{EdgeCtx, Kernel};
+pub use kernel::{EdgeCtx, EdgeField, FieldValue, Kernel, NodeField};
 pub use native::search_native;
 pub use registry::{
     BoxedRun, BoxedTypedRun, KernelEntry, RunKernel, RunTypedKernel, TypedKernelEntry, boxed_run,
