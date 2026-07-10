@@ -29,7 +29,7 @@ mod typed;
 
 use crate::{dsl::StateRow, graph::GraphId};
 
-pub use algo::{FilteredGraph, RunOptions};
+pub use algo::RunOptions;
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
 pub use kernel::{EdgeCtx, EdgeField, FieldValue, Kernel, NodeField};
 pub use native::search_native;

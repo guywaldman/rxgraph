@@ -4,8 +4,15 @@ import polars as pl
 import pytest
 import rxgraph as rxg
 
-from benches.data import Profile, SearchShape, cache_root, prepare_search, profiles
-from benches.main import report_payload
+from benches.data import (
+    Profile,
+    SearchShape,
+    cache_root,
+    prepare_search,
+    profiles,
+    selected_profiles,
+)
+from benches.main import baseline_key, core_display_rows, report_payload
 from benches.measure import Measurement, TimedCase, as_json, measure_cases
 
 
@@ -25,6 +32,17 @@ def test_profile_dimensions_are_exact() -> None:
     assert large.search.edge_count == 33_816_576
     assert standard.topology_nodes == 100_000
     assert large.topology_nodes is None
+
+
+def test_scale_only_changes_workload_width() -> None:
+    scaled = selected_profiles("standard", 0.5)[0]
+
+    assert scaled.scale == 0.5
+    assert scaled.search.starts == 1_024
+    assert scaled.search.depth == 24
+    assert scaled.search.fanout == 64
+    assert scaled.topology_nodes == 50_000
+    assert scaled.search.edge_count == 1_597_440
 
 
 def test_search_cache_hits_and_generated_rows_are_deterministic(
@@ -134,6 +152,48 @@ def test_benchmark_report_json_schema_is_versioned() -> None:
         "schema_version": 1,
         "profiles": [{"profile": "quick"}],
     }
+
+
+def test_baseline_alias_and_validation() -> None:
+    assert baseline_key("native/serial") == "native-bound/serial"
+    assert baseline_key("dsl/parallel") == "dsl/parallel"
+    with pytest.raises(Exception, match="ENGINE/MODE"):
+        baseline_key("native-bound")
+    with pytest.raises(Exception, match="unknown baseline engine"):
+        baseline_key("native-filtered/serial")
+
+
+def test_best_column_uses_each_implementation_fastest_sample() -> None:
+    report = {
+        "setup": {"graph_construction_seconds": 0.0},
+        "core_search": {
+            "graph": {"nodes": 2, "edges": 1},
+            "cases": [
+                {
+                    "engine": "dsl",
+                    "execution": "serial",
+                    "operation": "dfs",
+                    "samples_seconds": [0.5, 0.3, 0.4],
+                    "median_seconds": 0.4,
+                    "p90_seconds": 0.5,
+                    "result_paths": 1,
+                },
+                {
+                    "engine": "native-bound",
+                    "execution": "serial",
+                    "operation": "dfs",
+                    "samples_seconds": [0.2, 0.6, 0.5],
+                    "median_seconds": 0.5,
+                    "p90_seconds": 0.6,
+                    "result_paths": 1,
+                },
+            ],
+        },
+    }
+
+    rows = core_display_rows(report, "native-bound/serial")
+
+    assert [row["best_seconds"] for row in rows] == [0.3, 0.2]
 
 
 def test_python_parallel_edge_stats_reflect_actual_execution() -> None:

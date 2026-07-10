@@ -3,9 +3,9 @@ use std::marker::PhantomData;
 use anyhow::{Context, Result};
 
 use crate::{
-    graph::{EdgeId, Graph, GraphRepo, NodeId, Offset, OwnedGraphId},
+    graph::{EdgeId, Graph, GraphRepo, NodeId, OwnedGraphId},
     traversal::{
-        EdgeCtx, EdgeField, FirstResult, GraphPath, Kernel, SearchResult, Transition,
+        EdgeCtx, FirstResult, GraphPath, Kernel, SearchResult, Transition,
         config::{TraversalConfig, TraversalStrategy},
         engine::{self, PathEntry, SearchAdapter},
         kernel::PayloadCache,
@@ -54,43 +54,6 @@ impl Default for RunOptions {
 }
 
 impl Graph {
-    /// Builds a reusable view containing only edges accepted by `keep`.
-    ///
-    /// The view owns a compact filtered CSR but borrows node/edge payloads and
-    /// identity from this graph. Building it is `O(edges)`; subsequent searches
-    /// visit only retained edges.
-    pub fn filter_edges(&self, mut keep: impl FnMut(EdgeId) -> bool) -> FilteredGraph<'_> {
-        let mut offsets = Vec::with_capacity(self.node_count() + 1);
-        let mut edges = Vec::new();
-        let mut dests = Vec::new();
-        offsets.push(0);
-        for node in 0..self.node_count() as NodeId {
-            let (node_edges, node_dests) = self.repo.outgoing_slice(node);
-            for (&edge, &dest) in node_edges.iter().zip(node_dests) {
-                if keep(edge) {
-                    edges.push(edge);
-                    dests.push(dest);
-                }
-            }
-            offsets.push(edges.len() as Offset);
-        }
-        edges.shrink_to_fit();
-        dests.shrink_to_fit();
-        FilteredGraph {
-            graph: self,
-            topology: FilteredTopology {
-                offsets,
-                edges,
-                dests,
-            },
-        }
-    }
-
-    /// Builds a reusable view retaining edges where a bound boolean field is true.
-    pub fn filter_edges_by(&self, field: &EdgeField<bool>) -> FilteredGraph<'_> {
-        self.filter_edges(|edge| field.selected(self, edge))
-    }
-
     /// Runs a configured DSL traversal and materializes matching paths.
     ///
     /// Start nodes are resolved from external IDs to compact internal IDs before
@@ -121,7 +84,6 @@ impl Graph {
         };
         let adapter = GraphSearchAdapter {
             graph: self,
-            topology: SearchTopology::Graph,
             kernel: &kernel,
             project: |state: &crate::dsl::StateValues| Ok(kernel.state_row(state)),
             output: PhantomData,
@@ -160,7 +122,6 @@ impl Graph {
     {
         let adapter = GraphSearchAdapter {
             graph: self,
-            topology: SearchTopology::Graph,
             kernel: &kernel,
             project: |state: &K::State| Ok(state.clone()),
             output: PhantomData,
@@ -200,86 +161,14 @@ impl Graph {
     }
 }
 
-/// A compact, reusable filtered adjacency view over a [`Graph`].
-pub struct FilteredGraph<'g> {
+struct GraphSearchAdapter<'g, 'k, K, P, O> {
     graph: &'g Graph,
-    topology: FilteredTopology,
-}
-
-impl<'g> FilteredGraph<'g> {
-    /// Number of retained edges.
-    pub fn edge_count(&self) -> usize {
-        self.topology.edges.len()
-    }
-
-    /// Runs a typed native kernel over only the retained edges.
-    pub fn search_paths_with<K: Kernel + Sync>(
-        &self,
-        kernel: K,
-        run: RunOptions,
-    ) -> Result<SearchResult<'g, K::State>>
-    where
-        K::State: Send + Sync + Clone,
-    {
-        let adapter = GraphSearchAdapter {
-            graph: self.graph,
-            topology: SearchTopology::Filtered(&self.topology),
-            kernel: &kernel,
-            project: |state: &K::State| Ok(state.clone()),
-            output: PhantomData,
-        };
-        let result = engine::search(&adapter, run)?;
-        Ok(SearchResult {
-            paths: result.paths,
-            stats: result.stats,
-        })
-    }
-
-    /// Returns the canonical shallowest typed path over retained edges.
-    pub fn search_first_with<K: Kernel + Sync>(
-        &self,
-        kernel: K,
-        mut run: RunOptions,
-    ) -> Result<FirstResult<'g, K::State>>
-    where
-        K::State: Send + Sync + Clone,
-    {
-        run.max_paths = Some(1);
-        run.strategy = TraversalStrategy::BreadthFirst;
-        run.parallel = false;
-        Ok(self.search_paths_with(kernel, run)?.into_first())
-    }
-}
-
-struct FilteredTopology {
-    offsets: Vec<Offset>,
-    edges: Vec<EdgeId>,
-    dests: Vec<NodeId>,
-}
-
-impl FilteredTopology {
-    fn outgoing_slice(&self, node: NodeId) -> (&[EdgeId], &[NodeId]) {
-        let start = self.offsets[node as usize] as usize;
-        let end = self.offsets[node as usize + 1] as usize;
-        (&self.edges[start..end], &self.dests[start..end])
-    }
-}
-
-#[derive(Clone, Copy)]
-enum SearchTopology<'a> {
-    Graph,
-    Filtered(&'a FilteredTopology),
-}
-
-struct GraphSearchAdapter<'g, 't, 'k, K, P, O> {
-    graph: &'g Graph,
-    topology: SearchTopology<'t>,
     kernel: &'k K,
     project: P,
     output: PhantomData<fn() -> O>,
 }
 
-impl<'g, 't, 'k, K, P, O> SearchAdapter for GraphSearchAdapter<'g, 't, 'k, K, P, O>
+impl<'g, 'k, K, P, O> SearchAdapter for GraphSearchAdapter<'g, 'k, K, P, O>
 where
     K: Kernel,
     P: Fn(&K::State) -> Result<O>,
@@ -301,14 +190,14 @@ where
     }
 
     fn out_degree(&self, node: NodeId) -> Result<usize> {
-        Ok(self.outgoing_slice(node).0.len())
+        Ok(self.graph.repo.outgoing_slice(node).0.len())
     }
 
     fn for_each_outgoing<F>(&self, node: NodeId, mut visit: F) -> Result<()>
     where
         F: FnMut(EdgeId, NodeId) -> Result<bool>,
     {
-        let (edges, dests) = self.outgoing_slice(node);
+        let (edges, dests) = self.graph.repo.outgoing_slice(node);
         for (&edge, &dest) in edges.iter().zip(dests) {
             if !visit(edge, dest)? {
                 break;
@@ -318,7 +207,7 @@ where
     }
 
     fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)> {
-        let (edges, dests) = self.outgoing_slice(node);
+        let (edges, dests) = self.graph.repo.outgoing_slice(node);
         Ok((edges[index], dests[index]))
     }
 
@@ -388,15 +277,6 @@ where
             state,
             intermediate_states: states,
         })
-    }
-}
-
-impl<K, P, O> GraphSearchAdapter<'_, '_, '_, K, P, O> {
-    fn outgoing_slice(&self, node: NodeId) -> (&[EdgeId], &[NodeId]) {
-        match self.topology {
-            SearchTopology::Graph => self.graph.repo.outgoing_slice(node),
-            SearchTopology::Filtered(topology) => topology.outgoing_slice(node),
-        }
     }
 }
 
@@ -620,53 +500,6 @@ mod tests {
         assert_eq!(result.stats.accepted_edges, 1);
         assert_eq!(result.stats.rejected_edges, 1);
         assert_eq!(result.stats.max_depth, 1);
-    }
-
-    #[test]
-    fn filtered_graph_reuses_only_selected_edges() {
-        #[derive(Clone, Copy)]
-        struct StopAtD;
-
-        impl Kernel for StopAtD {
-            type State = usize;
-
-            fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
-                Ok(0)
-            }
-
-            fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
-                let state = cx.state() + 1;
-                Ok(if cx.dest_id() == Some(GraphId::Str("d")) {
-                    Transition::Complete(state)
-                } else {
-                    Transition::Continue(state)
-                })
-            }
-        }
-
-        let graph = graph();
-        let ok = graph.edge_field::<bool>("ok").unwrap();
-        let filtered = graph.filter_edges_by(&ok);
-        assert_eq!(filtered.edge_count(), 4);
-
-        let result = filtered
-            .search_paths_with(
-                StopAtD,
-                RunOptions {
-                    start_nodes: vec!["a".into()],
-                    strategy: TraversalStrategy::BreadthFirst,
-                    parallel: false,
-                    ..RunOptions::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(result.paths.len(), 1);
-        assert_eq!(
-            result.paths[0].nodes,
-            vec![GraphId::Str("a"), GraphId::Str("b"), GraphId::Str("d")]
-        );
-        assert_eq!(result.paths[0].state, 2);
-        assert_eq!(result.stats.evaluated_edges, 2);
     }
 
     #[test]

@@ -31,13 +31,6 @@ struct BoundKernel {
     budget: u64,
 }
 
-#[derive(Clone)]
-struct FilteredKernel {
-    cost: EdgeField<u64>,
-    target: u64,
-    budget: u64,
-}
-
 impl Kernel for BoundKernel {
     type State = SearchState;
 
@@ -49,23 +42,6 @@ impl Kernel for BoundKernel {
         if !cx.edge_field(&self.allowed).unwrap_or(false) {
             return Ok(Transition::Reject);
         }
-        transition(
-            cx,
-            cx.edge_field(&self.cost).unwrap_or(0),
-            self.target,
-            self.budget,
-        )
-    }
-}
-
-impl Kernel for FilteredKernel {
-    type State = SearchState;
-
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
-        Ok(SearchState { spent: 0 })
-    }
-
-    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
         transition(
             cx,
             cx.edge_field(&self.cost).unwrap_or(0),
@@ -97,7 +73,6 @@ struct Workload {
     graph: Graph,
     starts: Vec<rxgraph::OwnedGraphId>,
     bound: BoundKernel,
-    filtered: FilteredKernel,
     depth: usize,
 }
 
@@ -122,18 +97,12 @@ impl Workload {
             target,
             budget: depth as u64,
         };
-        let filtered = FilteredKernel {
-            cost: graph.edge_field("cost")?,
-            target,
-            budget: depth as u64,
-        };
         Ok(Self {
             graph,
             starts: (0..starts)
                 .map(|case| ((case * depth) as u64).into())
                 .collect(),
             bound,
-            filtered,
             depth,
         })
     }
@@ -409,8 +378,6 @@ fn main() -> Result<()> {
     // deliberately below the engine's parallel threshold, so do not publish
     // misleading rows that requested Rayon but ran serially.
     let run_parallel = spec.get("profile").and_then(JsonValue::as_str) != Some("quick");
-    let filtered = workload.graph.filter_edges_by(&workload.bound.allowed);
-
     let expected = native_outcome(workload.graph.search_paths_with(
         workload.bound.clone(),
         workload.run(TraversalStrategy::DepthFirst, false, false),
@@ -457,7 +424,6 @@ fn main() -> Result<()> {
             }
             let dsl_name = format!("dsl/{label}/{execution}");
             let bound_name = format!("native-bound/{label}/{execution}");
-            let filtered_name = format!("native-filtered/{label}/{execution}");
             if args.matches(&dsl_name) {
                 cases.push(checked_case(
                     Case {
@@ -497,25 +463,6 @@ fn main() -> Result<()> {
                     runs,
                 )?);
             }
-            if args.matches(&filtered_name) {
-                cases.push(checked_case(
-                    Case {
-                        name: &filtered_name,
-                        engine: "native-filtered",
-                        operation: label,
-                        parallel,
-                        run: Box::new(|| {
-                            native_outcome(filtered.search_paths_with(
-                                workload.filtered.clone(),
-                                workload.run(strategy, parallel, false),
-                            )?)
-                        }),
-                    },
-                    &expected,
-                    warmups,
-                    runs,
-                )?);
-            }
         }
     }
     add!(
@@ -541,65 +488,6 @@ fn main() -> Result<()> {
             workload.run(TraversalStrategy::BreadthFirst, false, true)
         )?)
     );
-    add!(
-        "native-filtered/search_first/serial",
-        "native-filtered",
-        "search_first",
-        false,
-        &expected_first,
-        || native_first(filtered.search_first_with(
-            workload.filtered.clone(),
-            workload.run(TraversalStrategy::BreadthFirst, false, true)
-        )?)
-    );
-
-    if args.matches("native-filtered/build") {
-        let samples_seconds = measure(warmups, runs, || {
-            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
-            Ok(view.edge_count())
-        })?;
-        cases.push(CaseReport {
-            name: "native-filtered/build".to_owned(),
-            engine: "native-filtered".to_owned(),
-            operation: "build".to_owned(),
-            execution: "serial".to_owned(),
-            samples_seconds,
-            result_paths: filtered.edge_count(),
-            evaluated_edges: 0,
-            parallel_edges: 0,
-        });
-    }
-    if args.matches("native-filtered/one-shot-bfs/serial") {
-        let one_shot = {
-            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
-            native_outcome(view.search_paths_with(
-                workload.filtered.clone(),
-                workload.run(TraversalStrategy::BreadthFirst, false, false),
-            )?)?
-        };
-        validate_outcome("native-filtered/one-shot-bfs/serial", &one_shot)?;
-        if one_shot.paths != expected.paths || one_shot.spent != expected.spent {
-            bail!("native-filtered/one-shot-bfs/serial returned different paths or final states");
-        }
-        let samples_seconds = measure(warmups, runs, || {
-            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
-            native_outcome(view.search_paths_with(
-                workload.filtered.clone(),
-                workload.run(TraversalStrategy::BreadthFirst, false, false),
-            )?)
-        })?;
-        cases.push(CaseReport {
-            name: "native-filtered/one-shot-bfs/serial".to_owned(),
-            engine: "native-filtered".to_owned(),
-            operation: "one-shot-bfs".to_owned(),
-            execution: "serial".to_owned(),
-            samples_seconds,
-            result_paths: expected.paths.len(),
-            evaluated_edges: 0,
-            parallel_edges: 0,
-        });
-    }
-
     if cases.is_empty() {
         bail!("filter did not select any core benchmark case");
     }
@@ -615,19 +503,6 @@ fn main() -> Result<()> {
     fs::write(&args.output, serde_json::to_vec_pretty(&report)?)
         .with_context(|| format!("write {}", args.output.display()))?;
     Ok(())
-}
-
-fn measure<T>(warmups: usize, runs: usize, mut run: impl FnMut() -> Result<T>) -> Result<Vec<f64>> {
-    for _ in 0..warmups {
-        run()?;
-    }
-    let mut samples = Vec::with_capacity(runs);
-    for _ in 0..runs {
-        let started = Instant::now();
-        run()?;
-        samples.push(started.elapsed().as_secs_f64());
-    }
-    Ok(samples)
 }
 
 struct Args {

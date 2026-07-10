@@ -124,14 +124,6 @@ pub struct NodeField<T: FieldValue>(BoundField<T>);
 #[derive(Clone)]
 pub struct EdgeField<T: FieldValue>(BoundField<T>);
 
-impl EdgeField<bool> {
-    pub(crate) fn selected(&self, graph: &Graph, edge: EdgeId) -> bool {
-        self.0
-            .read(graph.repo.edge_batch(), edge as usize)
-            .unwrap_or(false)
-    }
-}
-
 impl Graph {
     /// Binds an exact primitive node payload column for native kernel use.
     pub fn node_field<T: FieldValue>(&self, name: &str) -> Result<NodeField<T>> {

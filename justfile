@@ -67,11 +67,11 @@ precommit: setup
 install-hooks: setup
     {{prek}} install
 
-bench profile="all": build-maturin
-    {{python}} -m benches.main --profile {{profile}}
+bench *args: build-maturin
+    {{python}} -m benches.main {{args}}
 
-bench-storage profile="standard": build-maturin
-    {{python}} -m benches.storage --profile {{profile}}
+bench-storage *args: build-maturin
+    {{python}} -m benches.storage {{args}}
 
 bench-clean:
     {{python}} -m benches.data --clear

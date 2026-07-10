@@ -160,18 +160,6 @@ let kernel = BudgetKernel {
 # }
 ```
 
-If a predicate is state-independent and reused across searches, build a compact
-filtered view once. It preserves original edge IDs and payload row alignment:
-
-```rust
-# fn example(graph: &rxgraph::Graph) -> anyhow::Result<()> {
-let allowed = graph.edge_field::<bool>("allowed")?;
-let routes = graph.filter_edges_by(&allowed);
-println!("retained edges={}", routes.edge_count());
-# Ok(())
-# }
-```
-
 The name-based `EdgeCtx` getters remain available for convenience and coercion.
 Pre-bound fields use exact Arrow types and are the intended maximum-throughput
 path.

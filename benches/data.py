@@ -49,6 +49,7 @@ class Profile:
     topology_nodes: int | None
     warmups: int
     runs: int
+    scale: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,14 +77,41 @@ def profiles() -> dict[str, Profile]:
     }
 
 
-def selected_profiles(name: str) -> tuple[Profile, ...]:
+def selected_profiles(name: str, scale: float = 1.0) -> tuple[Profile, ...]:
+    if scale <= 0:
+        raise ValueError("benchmark scale must be positive")
     available = profiles()
     if name == "all":
-        return available["standard"], available["large"]
-    try:
-        return (available[name],)
-    except KeyError as error:
-        raise ValueError(f"unknown benchmark profile {name!r}") from error
+        selected = available["standard"], available["large"]
+    elif name in available:
+        selected = (available[name],)
+    else:
+        raise ValueError(f"unknown benchmark profile {name!r}")
+    return tuple(scaled_profile(profile, scale) for profile in selected)
+
+
+def scaled_profile(profile: Profile, scale: float) -> Profile:
+    if scale <= 0:
+        raise ValueError("benchmark scale must be positive")
+    if scale == 1:
+        return profile
+    shape = profile.search
+    return Profile(
+        name=profile.name,
+        search=SearchShape(
+            starts=max(1, round(shape.starts * scale)),
+            depth=shape.depth,
+            fanout=shape.fanout,
+        ),
+        topology_nodes=(
+            max(1, round(profile.topology_nodes * scale))
+            if profile.topology_nodes is not None
+            else None
+        ),
+        warmups=profile.warmups,
+        runs=profile.runs,
+        scale=scale,
+    )
 
 
 def cache_root() -> Path:
@@ -103,6 +131,7 @@ def prepare_search(
         "schema_version": 1,
         "kind": "stateful-search",
         "profile": profile.name,
+        "scale": profile.scale,
         "starts": shape.starts,
         "depth": shape.depth,
         "fanout": shape.fanout,
@@ -133,6 +162,7 @@ def prepare_topology(profile: Profile) -> PreparedData | None:
         "schema_version": 1,
         "kind": "topology",
         "profile": profile.name,
+        "scale": profile.scale,
         "nodes": profile.topology_nodes,
         "codec": "lz4",
         "row_group_size": ROW_GROUP_SIZE,

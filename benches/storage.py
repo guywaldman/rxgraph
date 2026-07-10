@@ -12,7 +12,7 @@ from typing import Any
 import rxgraph as rxg
 
 from benches.data import Profile, prepare_search, selected_profiles
-from benches.main import normalize_search, start_nodes, typed_kwargs
+from benches.main import normalize_search, scale_factor, start_nodes, typed_kwargs
 from benches.measure import as_json, measure_cases, measure_one, TimedCase
 
 DIST = Path("dist")
@@ -21,13 +21,14 @@ DIST = Path("dist")
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run rxgraph file-backed benchmarks.")
     parser.add_argument(
-        "--profile", choices=("quick", "standard", "large"), default="standard"
+        "profile", nargs="?", choices=("quick", "standard", "large"), default="standard"
     )
+    parser.add_argument("scale", nargs="?", type=scale_factor, default=1.0)
     args = parser.parse_args()
     DIST.mkdir(exist_ok=True)
-    profile = selected_profiles(args.profile)[0]
+    profile = selected_profiles(args.profile, args.scale)[0]
     report = run(profile)
-    output = DIST / f"bench-storage-{profile.name}.json"
+    output = DIST / f"bench-storage-{profile.name}-x{profile.scale:g}.json"
     output.write_text(json.dumps(report, indent=2))
     print(f"wrote {output}")
 
@@ -78,6 +79,7 @@ def run(profile: Profile) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "profile": profile.name,
+        "scale": profile.scale,
         "cache": {
             "hit": data.cache_hit,
             "path": str(data.manifest_path.parent),
