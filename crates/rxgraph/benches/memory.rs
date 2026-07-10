@@ -10,7 +10,7 @@
 //! It builds a large, sparse graph where only a small subset is reachable from the source,
 //! and reports bytes allocated/RSS.
 
-use std::{alloc::System, hint::black_box, sync::Arc, time::Instant};
+use std::{alloc::System, env, hint::black_box, sync::Arc, time::Instant};
 
 use arrow::{
     array::{ArrayRef, UInt64Array},
@@ -62,6 +62,31 @@ fn tables() -> (RecordBatch, RecordBatch) {
     (nodes, edges)
 }
 
+fn dense_tables(edge_count: u64) -> (RecordBatch, RecordBatch) {
+    let node_count = (edge_count / 5).max(2);
+    let nodes = batch(
+        vec![Field::new("id", DataType::UInt64, false)],
+        vec![Arc::new(UInt64Array::from_iter_values(0..node_count))],
+    );
+    let edges = batch(
+        vec![
+            Field::new("id", DataType::UInt64, false),
+            Field::new("src", DataType::UInt64, false),
+            Field::new("dest", DataType::UInt64, false),
+        ],
+        vec![
+            Arc::new(UInt64Array::from_iter_values(0..edge_count)),
+            Arc::new(UInt64Array::from_iter_values(
+                (0..edge_count).map(|edge| edge % node_count),
+            )),
+            Arc::new(UInt64Array::from_iter_values(
+                (0..edge_count).map(|edge| (edge + 1) % node_count),
+            )),
+        ],
+    );
+    (nodes, edges)
+}
+
 fn mib(bytes: isize) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
@@ -94,6 +119,23 @@ fn measure<T>(label: &str, f: impl FnOnce() -> T) -> T {
 }
 
 fn main() {
+    if let Some(edge_count) = env::var("RXGRAPH_MEMORY_DENSE_EDGES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let graph = measure("construct_dense", || {
+            let (nodes, edges) = dense_tables(edge_count);
+            Graph::new(nodes, edges).unwrap()
+        });
+        eprintln!(
+            "dense topology: nodes={} edges={}",
+            graph.node_count(),
+            graph.edge_count()
+        );
+        black_box(&graph);
+        return;
+    }
+
     eprintln!("memory profile: nodes={NODES} reachable_chain={REACHABLE_CHAIN}\n");
 
     let (nodes, edges) = tables();
