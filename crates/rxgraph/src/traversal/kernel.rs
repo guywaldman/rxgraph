@@ -111,10 +111,16 @@ impl<T: FieldValue> BoundField<T> {
 }
 
 /// A primitive node payload column bound once for zero-lookup hot-path reads.
+///
+/// This is a snapshot of the current payload array. Rebind it after calling
+/// [`Graph::set_payloads`].
 #[derive(Clone)]
 pub struct NodeField<T: FieldValue>(BoundField<T>);
 
 /// A primitive edge payload column bound once for zero-lookup hot-path reads.
+///
+/// This is a snapshot of the current payload array. Rebind it after calling
+/// [`Graph::set_payloads`].
 #[derive(Clone)]
 pub struct EdgeField<T: FieldValue>(BoundField<T>);
 
