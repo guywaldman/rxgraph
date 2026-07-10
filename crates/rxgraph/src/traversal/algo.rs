@@ -577,6 +577,33 @@ mod tests {
                 vec![GraphId::Str("s"), GraphId::Str("c"), GraphId::Str("z")]
             );
         }
+
+        let starts = std::iter::once("c")
+            .chain(["d", "e", "f"].into_iter().cycle().take(1_023))
+            .collect::<Vec<_>>();
+        for threads in [1, 2, 4] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let first = pool
+                .install(|| {
+                    graph.search_first(
+                        TraversalConfigBuilder::new(DslKernel::new(
+                            e::bool_lit(true),
+                            [],
+                            e::dest("kind").eq(e::string_lit("end")),
+                            [],
+                        ))
+                        .with_start_nodes(starts.iter().copied())
+                        .build(),
+                    )
+                })
+                .unwrap()
+                .path
+                .unwrap();
+            assert_eq!(first.nodes, vec![GraphId::Str("c"), GraphId::Str("z")]);
+        }
     }
 
     #[test]

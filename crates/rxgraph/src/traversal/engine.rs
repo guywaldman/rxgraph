@@ -269,6 +269,10 @@ fn search_bfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::
 where
     A: SearchAdapter,
 {
+    if cfg.max_paths == Some(1) {
+        return search_bfs_first(adapter, cfg);
+    }
+
     let (mut arena, frontier, mut stats) = initial_arena(adapter, cfg)?;
     let mut frontier = frontier.into_iter().collect::<Vec<_>>();
     let mut paths = Vec::new();
@@ -313,6 +317,80 @@ where
 
     progress.finish(&stats);
     Ok(SearchOutput { paths, stats })
+}
+
+fn search_bfs_first<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
+where
+    A: SearchAdapter,
+{
+    let (mut arena, frontier, mut stats) = initial_arena(adapter, cfg)?;
+    let mut frontier = frontier.into_iter().collect::<Vec<_>>();
+    let mut progress = Progress::new(cfg.progress);
+    let cache = adapter.make_cache();
+
+    while !frontier.is_empty() {
+        progress.tick(&stats);
+        let frontier_nodes = frontier
+            .iter()
+            .map(|&path| arena[path].node)
+            .collect::<Vec<_>>();
+        adapter.prefetch_outgoing(&frontier_nodes)?;
+        let mut next = Vec::new();
+
+        for &parent in &frontier {
+            if arena[parent].depth >= cfg.max_depth {
+                continue;
+            }
+            let node = arena[parent].node;
+            let edge_count = adapter.out_degree(node)?;
+            next.reserve(edge_count);
+            let visit_counts = visit_counts_arena(&arena, parent, edge_count);
+            let mut found = None;
+            adapter.for_each_outgoing(node, |edge, dest| {
+                let Some(edge) = eval_arena_edge(
+                    adapter,
+                    &arena,
+                    parent,
+                    edge,
+                    dest,
+                    cfg,
+                    &mut stats,
+                    visit_counts.as_ref(),
+                    &cache,
+                )?
+                else {
+                    return Ok(true);
+                };
+                let stop = edge.stop;
+                let child = push_entry(&mut arena, parent, edge);
+                stats.accepted_edges += 1;
+                stats.path_entries += 1;
+                stats.max_depth = stats.max_depth.max(arena[child].depth);
+                if stop {
+                    stats.stopped_paths += 1;
+                    found = Some(adapter.materialize(&arena, child, cfg.intermediate_states)?);
+                    Ok(false)
+                } else {
+                    next.push(child);
+                    Ok(true)
+                }
+            })?;
+            if let Some(path) = found {
+                progress.finish(&stats);
+                return Ok(SearchOutput {
+                    paths: vec![path],
+                    stats,
+                });
+            }
+        }
+        frontier = next;
+    }
+
+    progress.finish(&stats);
+    Ok(SearchOutput {
+        paths: Vec::new(),
+        stats,
+    })
 }
 
 fn search_bfs_parallel<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>

@@ -57,6 +57,14 @@ struct Workload {
 
 impl Workload {
     fn new() -> Self {
+        Self::new_with_skew(false)
+    }
+
+    fn new_skewed() -> Self {
+        Self::new_with_skew(true)
+    }
+
+    fn new_with_skew(skewed: bool) -> Self {
         let cases = env_usize("RXGRAPH_NATIVE_CASES", DEFAULT_CASES);
         let depth = env_usize("RXGRAPH_NATIVE_DEPTH", DEFAULT_DEPTH);
         let fanout = env_usize("RXGRAPH_NATIVE_FANOUT", DEFAULT_FANOUT);
@@ -93,7 +101,16 @@ impl Workload {
                     1,
                     true,
                 );
-                for decoy in 0..fanout {
+                let node_fanout = if skewed {
+                    if case == 0 {
+                        fanout * (cases / 4).max(1)
+                    } else {
+                        (fanout / 4).max(1)
+                    }
+                } else {
+                    fanout
+                };
+                for decoy in 0..node_fanout {
                     push_edge(
                         &mut ids,
                         &mut srcs,
@@ -185,6 +202,7 @@ fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
 
 fn bench_stateful_native(c: &mut Criterion) {
     let workload = Workload::new();
+    let skewed = Workload::new_skewed();
     let mut group = c.benchmark_group("stateful_native");
 
     group.bench_function("paths_dfs_serial", |b| {
@@ -221,6 +239,19 @@ fn bench_stateful_native(c: &mut Criterion) {
                     .search_first_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    group.bench_function("paths_bfs_skewed_parallel", |b| {
+        b.iter(|| {
+            black_box(
+                skewed
+                    .graph
+                    .search_paths_with(
+                        skewed.kernel,
+                        skewed.run(TraversalStrategy::BreadthFirst, true, false),
                     )
                     .unwrap(),
             )
@@ -275,6 +306,25 @@ fn main() {
                     .search_first_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
+                    )
+                    .unwrap(),
+            );
+        });
+        drop(workload);
+
+        let skewed = Workload::new_skewed();
+        eprintln!(
+            "stateful_native skewed: nodes={} edges={}",
+            skewed.graph.node_count(),
+            skewed.graph.edge_count(),
+        );
+        measure_large("paths_bfs_skewed_parallel", || {
+            black_box(
+                skewed
+                    .graph
+                    .search_paths_with(
+                        skewed.kernel,
+                        skewed.run(TraversalStrategy::BreadthFirst, true, false),
                     )
                     .unwrap(),
             );
