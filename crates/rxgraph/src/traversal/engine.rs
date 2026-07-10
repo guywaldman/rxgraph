@@ -565,7 +565,8 @@ where
     }
 
     let found = AtomicUsize::new(seed_paths.len());
-    let results = if seeds.len() < rayon::current_num_threads() {
+    let parallel = seeds.len() >= rayon::current_num_threads();
+    let results = if !parallel {
         seeds
             .into_iter()
             .map(|seed| dfs_seed(adapter, cfg, seed, &found))
@@ -578,7 +579,10 @@ where
     };
 
     let mut paths = seed_paths;
-    for result in results {
+    for mut result in results {
+        if parallel {
+            result.stats.parallel_edges = result.stats.evaluated_edges;
+        }
         merge_stats(&mut stats, result.stats);
         paths.extend(result.paths);
     }
@@ -682,14 +686,14 @@ where
     A::State: Send + Sync + Clone,
     A::Cache: Send,
 {
-    frontier
+    let (edges, mut stats) = frontier
         .par_iter()
         .try_fold(
             || (Vec::new(), SearchStats::default(), adapter.make_cache()),
             |(mut edges, mut stats, cache), &parent| {
                 let local = eval_parent_into(adapter, arena, parent, cfg, &mut edges, &cache)?;
                 merge_stats(&mut stats, local);
-                Ok((edges, stats, cache))
+                Ok::<_, anyhow::Error>((edges, stats, cache))
             },
         )
         .map(|fold| fold.map(|(edges, stats, _cache)| (edges, stats)))
@@ -698,9 +702,11 @@ where
             |(mut left_edges, mut left_stats), (right_edges, right_stats)| {
                 left_edges.extend(right_edges);
                 merge_stats(&mut left_stats, right_stats);
-                Ok((left_edges, left_stats))
+                Ok::<_, anyhow::Error>((left_edges, left_stats))
             },
-        )
+        )?;
+    stats.parallel_edges = stats.evaluated_edges;
+    Ok((edges, stats))
 }
 
 fn eval_parent_into<A>(
@@ -982,6 +988,7 @@ fn merge_stats(into: &mut SearchStats, from: SearchStats) {
     into.start_nodes += from.start_nodes;
     into.path_entries += from.path_entries;
     into.evaluated_edges += from.evaluated_edges;
+    into.parallel_edges += from.parallel_edges;
     into.accepted_edges += from.accepted_edges;
     into.rejected_edges += from.rejected_edges;
     into.skipped_revisits += from.skipped_revisits;

@@ -1,87 +1,30 @@
-use std::{env, hint::black_box, sync::Arc, time::Instant};
+//! Macro benchmark for the Arrow-backed stateful search engine.
+//!
+//! This is deliberately a small executable rather than a Criterion benchmark:
+//! the Python benchmark runner owns profile selection, cached data preparation,
+//! result reporting, and raw-sample persistence for every benchmark family.
 
-use anyhow::Result;
-use arrow::{
-    array::{ArrayRef, BooleanArray, RecordBatch, UInt64Array},
-    datatypes::{DataType, Field, Schema},
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    time::Instant,
 };
-use criterion::Criterion;
+
+use anyhow::{Context, Result, bail};
 use rxgraph::{
-    EdgeCtx, EdgeField, Graph, Kernel, NodeId, RunOptions, Transition, TraversalStrategy,
+    DslExpr as e, DslKernel, EdgeCtx, EdgeField, Graph, GraphId, Kernel, NodeId, RunOptions,
+    Transition, TraversalConfigBuilder, TraversalStrategy, Value,
 };
+use serde::Serialize;
+use serde_json::Value as JsonValue;
 
-const DEFAULT_CASES: usize = 128;
-const DEFAULT_DEPTH: usize = 12;
-const DEFAULT_FANOUT: usize = 64;
-
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SearchState {
     spent: u64,
 }
 
-#[derive(Clone, Copy)]
-struct SearchKernel {
-    target: u64,
-    budget: u64,
-}
-
-#[derive(Clone, Copy)]
-struct TopologyKernel {
-    target: u64,
-    budget: u64,
-    edge_stride: u32,
-}
-
-impl Kernel for TopologyKernel {
-    type State = SearchState;
-
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
-        Ok(SearchState { spent: 0 })
-    }
-
-    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
-        if cx.edge() % self.edge_stride != 0 {
-            return Ok(Transition::Reject);
-        }
-        let state = SearchState {
-            spent: cx.state().spent + 1,
-        };
-        Ok(if state.spent > self.budget {
-            Transition::Reject
-        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
-            Transition::Complete(state)
-        } else {
-            Transition::Continue(state)
-        })
-    }
-}
-
-impl Kernel for SearchKernel {
-    type State = SearchState;
-
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
-        Ok(SearchState { spent: 0 })
-    }
-
-    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
-        if !cx.edge_bool("allowed")?.unwrap_or(false) {
-            return Ok(Transition::Reject);
-        }
-        let state = SearchState {
-            spent: cx.state().spent + cx.edge_u64("cost")?.unwrap_or(0),
-        };
-        Ok(if state.spent > self.budget {
-            Transition::Reject
-        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
-            Transition::Complete(state)
-        } else {
-            Transition::Continue(state)
-        })
-    }
-}
-
 #[derive(Clone)]
-struct BoundSearchKernel {
+struct BoundKernel {
     allowed: EdgeField<bool>,
     cost: EdgeField<u64>,
     target: u64,
@@ -89,34 +32,13 @@ struct BoundSearchKernel {
 }
 
 #[derive(Clone)]
-struct FilteredSearchKernel {
+struct FilteredKernel {
     cost: EdgeField<u64>,
     target: u64,
     budget: u64,
 }
 
-impl Kernel for FilteredSearchKernel {
-    type State = SearchState;
-
-    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
-        Ok(SearchState { spent: 0 })
-    }
-
-    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
-        let state = SearchState {
-            spent: cx.state().spent + cx.edge_field(&self.cost).unwrap_or(0),
-        };
-        Ok(if state.spent > self.budget {
-            Transition::Reject
-        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
-            Transition::Complete(state)
-        } else {
-            Transition::Continue(state)
-        })
-    }
-}
-
-impl Kernel for BoundSearchKernel {
+impl Kernel for BoundKernel {
     type State = SearchState;
 
     fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
@@ -127,615 +49,618 @@ impl Kernel for BoundSearchKernel {
         if !cx.edge_field(&self.allowed).unwrap_or(false) {
             return Ok(Transition::Reject);
         }
-        let state = SearchState {
-            spent: cx.state().spent + cx.edge_field(&self.cost).unwrap_or(0),
-        };
-        Ok(if state.spent > self.budget {
-            Transition::Reject
-        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
-            Transition::Complete(state)
-        } else {
-            Transition::Continue(state)
-        })
+        transition(
+            cx,
+            cx.edge_field(&self.cost).unwrap_or(0),
+            self.target,
+            self.budget,
+        )
     }
+}
+
+impl Kernel for FilteredKernel {
+    type State = SearchState;
+
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
+        Ok(SearchState { spent: 0 })
+    }
+
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
+        transition(
+            cx,
+            cx.edge_field(&self.cost).unwrap_or(0),
+            self.target,
+            self.budget,
+        )
+    }
+}
+
+fn transition(
+    cx: &EdgeCtx<'_, SearchState>,
+    cost: u64,
+    target: u64,
+    budget: u64,
+) -> Result<Transition<SearchState>> {
+    let state = SearchState {
+        spent: cx.state().spent + cost,
+    };
+    Ok(if state.spent > budget {
+        Transition::Reject
+    } else if cx.dest_id() == Some(GraphId::U64(target)) {
+        Transition::Complete(state)
+    } else {
+        Transition::Continue(state)
+    })
 }
 
 struct Workload {
     graph: Graph,
     starts: Vec<rxgraph::OwnedGraphId>,
-    kernel: SearchKernel,
-    bound_kernel: BoundSearchKernel,
-    filtered_kernel: FilteredSearchKernel,
-    topology_kernel: TopologyKernel,
-    cases: usize,
+    bound: BoundKernel,
+    filtered: FilteredKernel,
     depth: usize,
 }
 
 impl Workload {
-    fn new() -> Self {
-        Self::new_with_skew(false)
-    }
-
-    fn new_skewed() -> Self {
-        Self::new_with_skew(true)
-    }
-
-    fn new_with_skew(skewed: bool) -> Self {
-        let cases = env_usize("RXGRAPH_NATIVE_CASES", DEFAULT_CASES);
-        let depth = env_usize("RXGRAPH_NATIVE_DEPTH", DEFAULT_DEPTH);
-        let fanout = env_usize("RXGRAPH_NATIVE_FANOUT", DEFAULT_FANOUT);
-        let decoys = env_usize("RXGRAPH_NATIVE_DECOYS", fanout * 16);
-        let chain_nodes = cases * depth;
-        let target = (chain_nodes + decoys) as u64;
-        let node_count = target as usize + 1;
-        let nodes = batch(
-            vec![Field::new("id", DataType::UInt64, false)],
-            vec![Arc::new(UInt64Array::from_iter_values(
-                0..node_count as u64,
-            ))],
-        );
-
-        let edge_count = cases * depth * (fanout + 1);
-        let mut ids = Vec::with_capacity(edge_count);
-        let mut srcs = Vec::with_capacity(edge_count);
-        let mut dests = Vec::with_capacity(edge_count);
-        let mut costs = Vec::with_capacity(edge_count);
-        let mut allowed = Vec::with_capacity(edge_count);
-
-        for case in 0..cases {
-            for level in 0..depth {
-                let src = (case * depth + level) as u64;
-                let dest = if level + 1 == depth { target } else { src + 1 };
-                push_edge(
-                    &mut ids,
-                    &mut srcs,
-                    &mut dests,
-                    &mut costs,
-                    &mut allowed,
-                    src,
-                    dest,
-                    1,
-                    true,
-                );
-                let node_fanout = if skewed {
-                    if case == 0 {
-                        fanout * (cases / 4).max(1)
-                    } else {
-                        (fanout / 4).max(1)
-                    }
-                } else {
-                    fanout
-                };
-                for decoy in 0..node_fanout {
-                    push_edge(
-                        &mut ids,
-                        &mut srcs,
-                        &mut dests,
-                        &mut costs,
-                        &mut allowed,
-                        src,
-                        (chain_nodes + (case * 131 + level * 67 + decoy) % decoys) as u64,
-                        depth as u64 + 1,
-                        false,
-                    );
-                }
-            }
-        }
-
-        let edges = batch(
-            vec![
-                Field::new("id", DataType::UInt64, false),
-                Field::new("src", DataType::UInt64, false),
-                Field::new("dest", DataType::UInt64, false),
-                Field::new("cost", DataType::UInt64, false),
-                Field::new("allowed", DataType::Boolean, false),
-            ],
-            vec![
-                Arc::new(UInt64Array::from(ids)),
-                Arc::new(UInt64Array::from(srcs)),
-                Arc::new(UInt64Array::from(dests)),
-                Arc::new(UInt64Array::from(costs)),
-                Arc::new(BooleanArray::from(allowed)),
-            ],
-        );
-        let graph = Graph::new(nodes, edges).unwrap();
-        let bound_kernel = BoundSearchKernel {
-            allowed: graph.edge_field("allowed").unwrap(),
-            cost: graph.edge_field("cost").unwrap(),
+    fn load(manifest: &Path) -> Result<Self> {
+        let metadata: JsonValue = serde_json::from_slice(
+            &fs::read(manifest).with_context(|| format!("read {}", manifest.display()))?,
+        )?;
+        let spec = metadata
+            .get("spec")
+            .context("benchmark manifest has no spec")?;
+        let starts = spec_usize(spec, "starts")?;
+        let depth = spec_usize(spec, "depth")?;
+        let graph = Graph::from_parquet(
+            manifest.with_file_name("nodes.parquet"),
+            manifest.with_file_name("edges.parquet"),
+        )?;
+        let target = graph.node_count() as u64 - 1;
+        let bound = BoundKernel {
+            allowed: graph.edge_field("allowed")?,
+            cost: graph.edge_field("cost")?,
             target,
             budget: depth as u64,
         };
-        let filtered_kernel = FilteredSearchKernel {
-            cost: graph.edge_field("cost").unwrap(),
+        let filtered = FilteredKernel {
+            cost: graph.edge_field("cost")?,
             target,
             budget: depth as u64,
         };
-        let starts = (0..cases)
-            .map(|case| ((case * depth) as u64).into())
-            .collect();
-        Self {
+        Ok(Self {
             graph,
-            starts,
-            kernel: SearchKernel {
-                target,
-                budget: depth as u64,
-            },
-            bound_kernel,
-            filtered_kernel,
-            topology_kernel: TopologyKernel {
-                target,
-                budget: depth as u64,
-                edge_stride: (fanout + 1) as u32,
-            },
-            cases,
+            starts: (0..starts)
+                .map(|case| ((case * depth) as u64).into())
+                .collect(),
+            bound,
+            filtered,
             depth,
-        }
+        })
     }
 
     fn run(&self, strategy: TraversalStrategy, parallel: bool, first: bool) -> RunOptions {
         RunOptions {
             start_nodes: self.starts.clone(),
             max_depth: Some(self.depth),
-            max_paths: Some(if first { 1 } else { self.cases }),
+            max_paths: Some(if first { 1 } else { self.starts.len() }),
             strategy,
+            max_visits_per_node: 1,
             parallel,
-            ..RunOptions::default()
+            intermediate_states: false,
+            progress: false,
         }
     }
-}
 
-fn env_usize(name: &str, default: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
-fn selected(name: &str) -> bool {
-    env::var("RXGRAPH_NATIVE_ONLY").is_ok_and(|selected| selected == name)
-        || env::var_os("RXGRAPH_NATIVE_ONLY").is_none()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_edge(
-    ids: &mut Vec<u64>,
-    srcs: &mut Vec<u64>,
-    dests: &mut Vec<u64>,
-    costs: &mut Vec<u64>,
-    allowed: &mut Vec<bool>,
-    src: u64,
-    dest: u64,
-    cost: u64,
-    is_allowed: bool,
-) {
-    ids.push(ids.len() as u64);
-    srcs.push(src);
-    dests.push(dest);
-    costs.push(cost);
-    allowed.push(is_allowed);
-}
-
-fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-}
-
-fn bench_stateful_native(c: &mut Criterion) {
-    let workload = Workload::new();
-    let skewed = Workload::new_skewed();
-    let filtered = workload
-        .graph
-        .filter_edges_by(&workload.bound_kernel.allowed);
-    let mut group = c.benchmark_group("stateful_native");
-
-    group.bench_function("paths_dfs_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.bound_kernel.clone(),
-                        workload.run(TraversalStrategy::DepthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_dfs_named_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.kernel,
-                        workload.run(TraversalStrategy::DepthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_dfs_topology_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.topology_kernel,
-                        workload.run(TraversalStrategy::DepthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_dfs_filtered_serial", |b| {
-        b.iter(|| {
-            black_box(
-                filtered
-                    .search_paths_with(
-                        workload.filtered_kernel.clone(),
-                        workload.run(TraversalStrategy::DepthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.bound_kernel.clone(),
-                        workload.run(TraversalStrategy::BreadthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_topology_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.topology_kernel,
-                        workload.run(TraversalStrategy::BreadthFirst, false, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_topology_parallel", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.topology_kernel,
-                        workload.run(TraversalStrategy::BreadthFirst, true, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_filtered_parallel", |b| {
-        b.iter(|| {
-            black_box(
-                filtered
-                    .search_paths_with(
-                        workload.filtered_kernel.clone(),
-                        workload.run(TraversalStrategy::BreadthFirst, true, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_parallel", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_paths_with(
-                        workload.bound_kernel.clone(),
-                        workload.run(TraversalStrategy::BreadthFirst, true, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("first_bfs_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_first_with(
-                        workload.bound_kernel.clone(),
-                        workload.run(TraversalStrategy::BreadthFirst, false, true),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("first_bfs_topology_serial", |b| {
-        b.iter(|| {
-            black_box(
-                workload
-                    .graph
-                    .search_first_with(
-                        workload.topology_kernel,
-                        workload.run(TraversalStrategy::BreadthFirst, false, true),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("first_bfs_filtered_serial", |b| {
-        b.iter(|| {
-            black_box(
-                filtered
-                    .search_first_with(
-                        workload.filtered_kernel.clone(),
-                        workload.run(TraversalStrategy::BreadthFirst, false, true),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-    group.bench_function("paths_bfs_skewed_parallel", |b| {
-        b.iter(|| {
-            black_box(
-                skewed
-                    .graph
-                    .search_paths_with(
-                        skewed.bound_kernel.clone(),
-                        skewed.run(TraversalStrategy::BreadthFirst, true, false),
-                    )
-                    .unwrap(),
-            )
-        })
-    });
-
-    group.finish();
-}
-
-fn measure_large<T>(label: &str, run: impl FnOnce() -> T) -> T {
-    let started = Instant::now();
-    let value = run();
-    eprintln!("stateful_native/{label} {:?}", started.elapsed());
-    value
-}
-
-fn main() {
-    if env::var_os("RXGRAPH_NATIVE_LARGE").is_some() {
-        let workload = Workload::new();
-        eprintln!(
-            "stateful_native large: nodes={} edges={} cases={} depth={}",
-            workload.graph.node_count(),
-            workload.graph.edge_count(),
-            workload.cases,
-            workload.depth,
+    fn dsl_config(
+        &self,
+        strategy: TraversalStrategy,
+        parallel: bool,
+        first: bool,
+    ) -> rxgraph::TraversalConfig {
+        let kernel = DslKernel::new(
+            e::edge("allowed").and(
+                e::state("spent")
+                    .plus(e::edge("cost"))
+                    .le(e::uint_lit(self.depth as u64)),
+            ),
+            [("spent".to_owned(), e::state("spent").plus(e::edge("cost")))],
+            e::dest_id().eq(e::uint_lit(self.graph.node_count() as u64 - 1)),
+            [("spent".to_owned(), Value::U64(0))],
         );
-        let wants_filtered = [
-            "filter_build",
-            "paths_dfs_filtered_serial",
-            "paths_bfs_filtered_parallel",
-            "first_bfs_filtered_serial",
-            "paths_dfs_filter_once",
-        ]
-        .into_iter()
-        .any(selected);
-        let filtered = wants_filtered.then(|| {
-            if selected("filter_build") {
-                measure_large("filter_build", || {
-                    workload
-                        .graph
-                        .filter_edges_by(&workload.bound_kernel.allowed)
-                })
-            } else {
-                workload
-                    .graph
-                    .filter_edges_by(&workload.bound_kernel.allowed)
-            }
-        });
-        if selected("paths_dfs_serial") {
-            measure_large("paths_dfs_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.bound_kernel.clone(),
-                            workload.run(TraversalStrategy::DepthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_dfs_named_serial") {
-            measure_large("paths_dfs_named_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.kernel,
-                            workload.run(TraversalStrategy::DepthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_dfs_topology_serial") {
-            measure_large("paths_dfs_topology_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.topology_kernel,
-                            workload.run(TraversalStrategy::DepthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_dfs_filtered_serial") {
-            measure_large("paths_dfs_filtered_serial", || {
-                black_box(
-                    filtered
-                        .as_ref()
-                        .unwrap()
-                        .search_paths_with(
-                            workload.filtered_kernel.clone(),
-                            workload.run(TraversalStrategy::DepthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_dfs_filter_once") {
-            measure_large("paths_dfs_filter_once", || {
-                let filtered = workload
-                    .graph
-                    .filter_edges_by(&workload.bound_kernel.allowed);
-                black_box(
-                    filtered
-                        .search_paths_with(
-                            workload.filtered_kernel.clone(),
-                            workload.run(TraversalStrategy::DepthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_bfs_serial") {
-            measure_large("paths_bfs_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.bound_kernel.clone(),
-                            workload.run(TraversalStrategy::BreadthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_bfs_topology_serial") {
-            measure_large("paths_bfs_topology_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.topology_kernel,
-                            workload.run(TraversalStrategy::BreadthFirst, false, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_bfs_parallel") {
-            measure_large("paths_bfs_parallel", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.bound_kernel.clone(),
-                            workload.run(TraversalStrategy::BreadthFirst, true, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_bfs_topology_parallel") {
-            measure_large("paths_bfs_topology_parallel", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_paths_with(
-                            workload.topology_kernel,
-                            workload.run(TraversalStrategy::BreadthFirst, true, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("paths_bfs_filtered_parallel") {
-            measure_large("paths_bfs_filtered_parallel", || {
-                black_box(
-                    filtered
-                        .as_ref()
-                        .unwrap()
-                        .search_paths_with(
-                            workload.filtered_kernel.clone(),
-                            workload.run(TraversalStrategy::BreadthFirst, true, false),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("first_bfs_serial") {
-            measure_large("first_bfs_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_first_with(
-                            workload.bound_kernel.clone(),
-                            workload.run(TraversalStrategy::BreadthFirst, false, true),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("first_bfs_topology_serial") {
-            measure_large("first_bfs_topology_serial", || {
-                black_box(
-                    workload
-                        .graph
-                        .search_first_with(
-                            workload.topology_kernel,
-                            workload.run(TraversalStrategy::BreadthFirst, false, true),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        if selected("first_bfs_filtered_serial") {
-            measure_large("first_bfs_filtered_serial", || {
-                black_box(
-                    filtered
-                        .as_ref()
-                        .unwrap()
-                        .search_first_with(
-                            workload.filtered_kernel.clone(),
-                            workload.run(TraversalStrategy::BreadthFirst, false, true),
-                        )
-                        .unwrap(),
-                );
-            });
-        }
-        drop(filtered);
-        drop(workload);
+        TraversalConfigBuilder::new(kernel)
+            .with_start_nodes(self.starts.clone())
+            .with_max_depth(self.depth)
+            .with_max_paths(if first { 1 } else { self.starts.len() })
+            .with_max_visits_per_node(1)
+            .with_strategy(strategy)
+            .with_parallelism(parallel)
+            .build()
+    }
+}
 
-        if selected("paths_bfs_skewed_parallel") {
-            let skewed = Workload::new_skewed();
-            eprintln!(
-                "stateful_native skewed: nodes={} edges={}",
-                skewed.graph.node_count(),
-                skewed.graph.edge_count(),
-            );
-            measure_large("paths_bfs_skewed_parallel", || {
-                black_box(
-                    skewed
-                        .graph
-                        .search_paths_with(
-                            skewed.bound_kernel.clone(),
-                            skewed.run(TraversalStrategy::BreadthFirst, true, false),
-                        )
-                        .unwrap(),
-                );
-            });
+fn spec_usize(spec: &JsonValue, field: &str) -> Result<usize> {
+    spec.get(field)
+        .and_then(JsonValue::as_u64)
+        .map(|value| value as usize)
+        .with_context(|| format!("benchmark manifest spec.{field} is missing"))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Outcome {
+    paths: Vec<Vec<u64>>,
+    spent: Vec<u64>,
+    evaluated_edges: usize,
+    parallel_edges: usize,
+    accepted_edges: usize,
+    rejected_edges: usize,
+    stopped_paths: usize,
+}
+
+fn ids(nodes: &[GraphId<'_>]) -> Result<Vec<u64>> {
+    nodes
+        .iter()
+        .map(|id| match id {
+            GraphId::U64(id) => Ok(*id),
+            GraphId::Str(_) => bail!("benchmark requires UInt64 node ids"),
+        })
+        .collect()
+}
+
+fn native_outcome(result: rxgraph::SearchResult<'_, SearchState>) -> Result<Outcome> {
+    let mut paths = Vec::with_capacity(result.paths.len());
+    let mut spent = Vec::with_capacity(result.paths.len());
+    for path in result.paths {
+        paths.push(ids(&path.nodes)?);
+        spent.push(path.state.spent);
+    }
+    paths.sort_unstable();
+    spent.sort_unstable();
+    Ok(Outcome {
+        paths,
+        spent,
+        evaluated_edges: result.stats.evaluated_edges,
+        parallel_edges: result.stats.parallel_edges,
+        accepted_edges: result.stats.accepted_edges,
+        rejected_edges: result.stats.rejected_edges,
+        stopped_paths: result.stats.stopped_paths,
+    })
+}
+
+fn dsl_outcome(result: rxgraph::SearchResult<'_>) -> Result<Outcome> {
+    let mut paths = Vec::with_capacity(result.paths.len());
+    let mut spent = Vec::with_capacity(result.paths.len());
+    for path in result.paths {
+        paths.push(ids(&path.nodes)?);
+        let value = path
+            .state
+            .iter()
+            .find_map(|(name, value)| (name == "spent").then_some(value))
+            .context("DSL result is missing spent state")?;
+        match value {
+            Value::U64(value) => spent.push(*value),
+            value => bail!("DSL spent state has unexpected value {value:?}"),
         }
-        return;
+    }
+    paths.sort_unstable();
+    spent.sort_unstable();
+    Ok(Outcome {
+        paths,
+        spent,
+        evaluated_edges: result.stats.evaluated_edges,
+        parallel_edges: result.stats.parallel_edges,
+        accepted_edges: result.stats.accepted_edges,
+        rejected_edges: result.stats.rejected_edges,
+        stopped_paths: result.stats.stopped_paths,
+    })
+}
+
+fn native_first(result: rxgraph::FirstResult<'_, SearchState>) -> Result<Outcome> {
+    let mut paths = Vec::new();
+    let mut spent = Vec::new();
+    if let Some(path) = result.path {
+        paths.push(ids(&path.nodes)?);
+        spent.push(path.state.spent);
+    }
+    Ok(Outcome {
+        paths,
+        spent,
+        evaluated_edges: result.stats.evaluated_edges,
+        parallel_edges: result.stats.parallel_edges,
+        accepted_edges: result.stats.accepted_edges,
+        rejected_edges: result.stats.rejected_edges,
+        stopped_paths: result.stats.stopped_paths,
+    })
+}
+
+fn dsl_first(result: rxgraph::FirstResult<'_>) -> Result<Outcome> {
+    let mut paths = Vec::new();
+    let mut spent = Vec::new();
+    if let Some(path) = result.path {
+        paths.push(ids(&path.nodes)?);
+        let value = path
+            .state
+            .iter()
+            .find_map(|(name, value)| (name == "spent").then_some(value))
+            .context("DSL first result is missing spent state")?;
+        match value {
+            Value::U64(value) => spent.push(*value),
+            value => bail!("DSL spent state has unexpected value {value:?}"),
+        }
+    }
+    Ok(Outcome {
+        paths,
+        spent,
+        evaluated_edges: result.stats.evaluated_edges,
+        parallel_edges: result.stats.parallel_edges,
+        accepted_edges: result.stats.accepted_edges,
+        rejected_edges: result.stats.rejected_edges,
+        stopped_paths: result.stats.stopped_paths,
+    })
+}
+
+#[derive(Serialize)]
+struct CaseReport {
+    name: String,
+    engine: String,
+    operation: String,
+    execution: String,
+    samples_seconds: Vec<f64>,
+    result_paths: usize,
+    evaluated_edges: usize,
+    parallel_edges: usize,
+}
+
+#[derive(Serialize)]
+struct CoreReport {
+    schema_version: u32,
+    graph: GraphReport,
+    rayon_threads: usize,
+    cases: Vec<CaseReport>,
+}
+
+#[derive(Serialize)]
+struct GraphReport {
+    nodes: usize,
+    edges: usize,
+}
+
+struct Case<'a> {
+    name: &'a str,
+    engine: &'a str,
+    operation: &'a str,
+    parallel: bool,
+    run: Box<dyn Fn() -> Result<Outcome> + 'a>,
+}
+
+fn checked_case(
+    case: Case<'_>,
+    expected: &Outcome,
+    warmups: usize,
+    runs: usize,
+) -> Result<CaseReport> {
+    let preflight = (case.run)()?;
+    validate_outcome(case.name, &preflight)?;
+    if preflight.paths != expected.paths || preflight.spent != expected.spent {
+        bail!("{} returned different paths or final states", case.name);
+    }
+    if case.parallel && preflight.parallel_edges == 0 {
+        bail!("{} silently fell back to serial execution", case.name);
+    }
+    if !case.parallel && preflight.parallel_edges != 0 {
+        bail!("{} reported parallel work in serial execution", case.name);
+    }
+    for _ in 0..warmups {
+        let outcome = (case.run)()?;
+        validate_outcome(case.name, &outcome)?;
+        if outcome.paths != expected.paths || outcome.spent != expected.spent {
+            bail!("{} changed result during warmup", case.name);
+        }
+    }
+    let mut samples_seconds = Vec::with_capacity(runs);
+    let mut last = preflight;
+    for _ in 0..runs {
+        let started = Instant::now();
+        let outcome = (case.run)()?;
+        samples_seconds.push(started.elapsed().as_secs_f64());
+        validate_outcome(case.name, &outcome)?;
+        if outcome.paths != expected.paths || outcome.spent != expected.spent {
+            bail!("{} changed result while measuring", case.name);
+        }
+        last = outcome;
+    }
+    Ok(CaseReport {
+        name: case.name.to_owned(),
+        engine: case.engine.to_owned(),
+        operation: case.operation.to_owned(),
+        execution: if case.parallel { "parallel" } else { "serial" }.to_owned(),
+        samples_seconds,
+        result_paths: last.paths.len(),
+        evaluated_edges: last.evaluated_edges,
+        parallel_edges: last.parallel_edges,
+    })
+}
+
+fn validate_outcome(name: &str, outcome: &Outcome) -> Result<()> {
+    if outcome.accepted_edges + outcome.rejected_edges != outcome.evaluated_edges {
+        bail!("{name} reported inconsistent evaluated-edge counters");
+    }
+    if outcome.parallel_edges > outcome.evaluated_edges {
+        bail!("{name} reported more parallel edges than evaluated edges");
+    }
+    if outcome.stopped_paths != outcome.paths.len() {
+        bail!("{name} reported inconsistent stopped-path counters");
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse()?;
+    if rayon::current_num_threads() < 2 {
+        bail!("core benchmark requires at least two Rayon workers");
+    }
+    let workload = Workload::load(&args.manifest)?;
+    let metadata: JsonValue = serde_json::from_slice(&fs::read(&args.manifest)?)?;
+    let spec = metadata
+        .get("spec")
+        .context("benchmark manifest has no spec")?;
+    let warmups = spec_usize(spec, "warmups")?;
+    let runs = spec_usize(spec, "runs")?;
+    // Quick is a setup/correctness smoke profile. Its 128-start frontier is
+    // deliberately below the engine's parallel threshold, so do not publish
+    // misleading rows that requested Rayon but ran serially.
+    let run_parallel = spec.get("profile").and_then(JsonValue::as_str) != Some("quick");
+    let filtered = workload.graph.filter_edges_by(&workload.bound.allowed);
+
+    let expected = native_outcome(workload.graph.search_paths_with(
+        workload.bound.clone(),
+        workload.run(TraversalStrategy::DepthFirst, false, false),
+    )?)?;
+    if expected.paths.len() != workload.starts.len() {
+        bail!(
+            "preflight returned {} paths, expected {}",
+            expected.paths.len(),
+            workload.starts.len()
+        );
+    }
+    let expected_first = native_first(workload.graph.search_first_with(
+        workload.bound.clone(),
+        workload.run(TraversalStrategy::BreadthFirst, false, true),
+    )?)?;
+
+    let mut cases = Vec::new();
+    macro_rules! add {
+        ($name:literal, $engine:literal, $operation:literal, $parallel:expr, $expected:expr, $run:expr) => {
+            if args.matches($name) {
+                cases.push(checked_case(
+                    Case {
+                        name: $name,
+                        engine: $engine,
+                        operation: $operation,
+                        parallel: $parallel,
+                        run: Box::new($run),
+                    },
+                    $expected,
+                    warmups,
+                    runs,
+                )?);
+            }
+        };
     }
 
-    let mut criterion = Criterion::default().configure_from_args();
-    bench_stateful_native(&mut criterion);
-    criterion.final_summary();
+    for (label, strategy) in [
+        ("dfs", TraversalStrategy::DepthFirst),
+        ("bfs", TraversalStrategy::BreadthFirst),
+    ] {
+        for (execution, parallel) in [("serial", false), ("parallel", true)] {
+            if parallel && !run_parallel {
+                continue;
+            }
+            let dsl_name = format!("dsl/{label}/{execution}");
+            let bound_name = format!("native-bound/{label}/{execution}");
+            let filtered_name = format!("native-filtered/{label}/{execution}");
+            if args.matches(&dsl_name) {
+                cases.push(checked_case(
+                    Case {
+                        name: &dsl_name,
+                        engine: "dsl",
+                        operation: label,
+                        parallel,
+                        run: Box::new(|| {
+                            dsl_outcome(
+                                workload
+                                    .graph
+                                    .search(workload.dsl_config(strategy, parallel, false))?,
+                            )
+                        }),
+                    },
+                    &expected,
+                    warmups,
+                    runs,
+                )?);
+            }
+            if args.matches(&bound_name) {
+                cases.push(checked_case(
+                    Case {
+                        name: &bound_name,
+                        engine: "native-bound",
+                        operation: label,
+                        parallel,
+                        run: Box::new(|| {
+                            native_outcome(workload.graph.search_paths_with(
+                                workload.bound.clone(),
+                                workload.run(strategy, parallel, false),
+                            )?)
+                        }),
+                    },
+                    &expected,
+                    warmups,
+                    runs,
+                )?);
+            }
+            if args.matches(&filtered_name) {
+                cases.push(checked_case(
+                    Case {
+                        name: &filtered_name,
+                        engine: "native-filtered",
+                        operation: label,
+                        parallel,
+                        run: Box::new(|| {
+                            native_outcome(filtered.search_paths_with(
+                                workload.filtered.clone(),
+                                workload.run(strategy, parallel, false),
+                            )?)
+                        }),
+                    },
+                    &expected,
+                    warmups,
+                    runs,
+                )?);
+            }
+        }
+    }
+    add!(
+        "dsl/search_first/serial",
+        "dsl",
+        "search_first",
+        false,
+        &expected_first,
+        || dsl_first(workload.graph.search_first(workload.dsl_config(
+            TraversalStrategy::BreadthFirst,
+            false,
+            true
+        ))?)
+    );
+    add!(
+        "native-bound/search_first/serial",
+        "native-bound",
+        "search_first",
+        false,
+        &expected_first,
+        || native_first(workload.graph.search_first_with(
+            workload.bound.clone(),
+            workload.run(TraversalStrategy::BreadthFirst, false, true)
+        )?)
+    );
+    add!(
+        "native-filtered/search_first/serial",
+        "native-filtered",
+        "search_first",
+        false,
+        &expected_first,
+        || native_first(filtered.search_first_with(
+            workload.filtered.clone(),
+            workload.run(TraversalStrategy::BreadthFirst, false, true)
+        )?)
+    );
+
+    if args.matches("native-filtered/build") {
+        let samples_seconds = measure(warmups, runs, || {
+            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
+            Ok(view.edge_count())
+        })?;
+        cases.push(CaseReport {
+            name: "native-filtered/build".to_owned(),
+            engine: "native-filtered".to_owned(),
+            operation: "build".to_owned(),
+            execution: "serial".to_owned(),
+            samples_seconds,
+            result_paths: filtered.edge_count(),
+            evaluated_edges: 0,
+            parallel_edges: 0,
+        });
+    }
+    if args.matches("native-filtered/one-shot-bfs/serial") {
+        let one_shot = {
+            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
+            native_outcome(view.search_paths_with(
+                workload.filtered.clone(),
+                workload.run(TraversalStrategy::BreadthFirst, false, false),
+            )?)?
+        };
+        validate_outcome("native-filtered/one-shot-bfs/serial", &one_shot)?;
+        if one_shot.paths != expected.paths || one_shot.spent != expected.spent {
+            bail!("native-filtered/one-shot-bfs/serial returned different paths or final states");
+        }
+        let samples_seconds = measure(warmups, runs, || {
+            let view = workload.graph.filter_edges_by(&workload.bound.allowed);
+            native_outcome(view.search_paths_with(
+                workload.filtered.clone(),
+                workload.run(TraversalStrategy::BreadthFirst, false, false),
+            )?)
+        })?;
+        cases.push(CaseReport {
+            name: "native-filtered/one-shot-bfs/serial".to_owned(),
+            engine: "native-filtered".to_owned(),
+            operation: "one-shot-bfs".to_owned(),
+            execution: "serial".to_owned(),
+            samples_seconds,
+            result_paths: expected.paths.len(),
+            evaluated_edges: 0,
+            parallel_edges: 0,
+        });
+    }
+
+    if cases.is_empty() {
+        bail!("filter did not select any core benchmark case");
+    }
+    let report = CoreReport {
+        schema_version: 1,
+        graph: GraphReport {
+            nodes: workload.graph.node_count(),
+            edges: workload.graph.edge_count(),
+        },
+        rayon_threads: rayon::current_num_threads(),
+        cases,
+    };
+    fs::write(&args.output, serde_json::to_vec_pretty(&report)?)
+        .with_context(|| format!("write {}", args.output.display()))?;
+    Ok(())
+}
+
+fn measure<T>(warmups: usize, runs: usize, mut run: impl FnMut() -> Result<T>) -> Result<Vec<f64>> {
+    for _ in 0..warmups {
+        run()?;
+    }
+    let mut samples = Vec::with_capacity(runs);
+    for _ in 0..runs {
+        let started = Instant::now();
+        run()?;
+        samples.push(started.elapsed().as_secs_f64());
+    }
+    Ok(samples)
+}
+
+struct Args {
+    manifest: PathBuf,
+    output: PathBuf,
+    filter: Option<String>,
+}
+
+impl Args {
+    fn parse() -> Result<Self> {
+        let mut values = env::args().skip(1);
+        let mut manifest = None;
+        let mut output = None;
+        let mut filter = None;
+        while let Some(arg) = values.next() {
+            match arg.as_str() {
+                "--manifest" => manifest = values.next().map(PathBuf::from),
+                "--output" => output = values.next().map(PathBuf::from),
+                "--filter" => filter = values.next(),
+                "--bench" => {}
+                _ => bail!("unknown argument {arg}"),
+            }
+        }
+        Ok(Self {
+            manifest: manifest.context("missing --manifest")?,
+            output: output.context("missing --output")?,
+            filter,
+        })
+    }
+
+    fn matches(&self, name: &str) -> bool {
+        self.filter
+            .as_ref()
+            .is_none_or(|filter| name.contains(filter))
+    }
 }

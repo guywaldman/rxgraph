@@ -67,8 +67,14 @@ precommit: setup
 install-hooks: setup
     {{prek}} install
 
-bench *args: build-maturin
-    {{python}} -m benches.main --cache {{args}}
+bench profile="all": build-maturin
+    {{python}} -m benches.main --profile {{profile}}
+
+bench-storage profile="standard": build-maturin
+    {{python}} -m benches.storage --profile {{profile}}
+
+bench-clean:
+    {{python}} -m benches.data --clear
 
 bench-memory-rust *args: build-maturin
     cargo bench -p rxgraph --bench memory

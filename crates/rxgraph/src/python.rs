@@ -546,6 +546,8 @@ struct PySearchStats {
     #[pyo3(get)]
     evaluated_edges: usize,
     #[pyo3(get)]
+    parallel_edges: usize,
+    #[pyo3(get)]
     accepted_edges: usize,
     #[pyo3(get)]
     rejected_edges: usize,
@@ -575,6 +577,7 @@ impl From<SearchStats> for PySearchStats {
             start_nodes: stats.start_nodes,
             path_entries: stats.path_entries,
             evaluated_edges: stats.evaluated_edges,
+            parallel_edges: stats.parallel_edges,
             accepted_edges: stats.accepted_edges,
             rejected_edges: stats.rejected_edges,
             skipped_revisits: stats.skipped_revisits,

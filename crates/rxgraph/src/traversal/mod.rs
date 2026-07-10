@@ -151,6 +151,11 @@ pub struct SearchStats {
     pub path_entries: usize,
     /// Candidate edges evaluated by the DSL kernel.
     pub evaluated_edges: usize,
+    /// Candidate edges evaluated in Rayon-backed parallel work.
+    ///
+    /// This is zero for serial traversal and for parallel requests that do not
+    /// cross the engine's parallel-work threshold.
+    pub parallel_edges: usize,
     /// Evaluated edges accepted by `visit`.
     pub accepted_edges: usize,
     /// Evaluated edges rejected by `visit`.

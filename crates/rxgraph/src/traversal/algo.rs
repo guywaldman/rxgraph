@@ -402,7 +402,13 @@ impl<K, P, O> GraphSearchAdapter<'_, '_, '_, K, P, O> {
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::record_batch;
+    use std::sync::Arc;
+
+    use arrow::{
+        array::{UInt64Array, record_batch},
+        datatypes::{DataType, Field, Schema},
+        record_batch::RecordBatch,
+    };
 
     use super::*;
     use crate::{
@@ -487,6 +493,36 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    fn parallel_star_graph(starts: u64) -> Graph {
+        let target = starts;
+        let nodes = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                ID_COL,
+                DataType::UInt64,
+                false,
+            )])),
+            vec![Arc::new(UInt64Array::from_iter_values(0..=target))],
+        )
+        .unwrap();
+        let edges = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(ID_COL, DataType::UInt64, false),
+                Field::new(EDGE_SRC_COL, DataType::UInt64, false),
+                Field::new(EDGE_DEST_COL, DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from_iter_values(0..starts)),
+                Arc::new(UInt64Array::from_iter_values(0..starts)),
+                Arc::new(UInt64Array::from_iter_values(std::iter::repeat_n(
+                    target,
+                    starts as usize,
+                ))),
+            ],
+        )
+        .unwrap();
+        Graph::new(nodes, edges).unwrap()
     }
 
     fn traversal(visit: e, stop: e) -> TraversalConfig {
@@ -873,6 +909,56 @@ mod tests {
             parallel.stats.evaluated_edges
         );
         assert_eq!(parallel.stats.stopped_paths, parallel.paths.len());
+    }
+
+    #[test]
+    fn parallel_edge_stats_only_count_actual_rayon_work() {
+        if rayon::current_num_threads() < 2 {
+            return;
+        }
+        let starts = 512_u64;
+        let graph = parallel_star_graph(starts);
+        let kernel = || {
+            DslKernel::new(
+                e::bool_lit(true),
+                [],
+                e::dest_id().eq(e::uint_lit(starts)),
+                [],
+            )
+        };
+        let start_nodes = (0..starts).collect::<Vec<_>>();
+
+        for strategy in [
+            TraversalStrategy::BreadthFirst,
+            TraversalStrategy::DepthFirst,
+        ] {
+            let serial = graph
+                .search(
+                    TraversalConfigBuilder::new(kernel())
+                        .with_start_nodes(start_nodes.clone())
+                        .with_strategy(strategy)
+                        .with_parallelism(false)
+                        .build(),
+                )
+                .unwrap();
+            let parallel = graph
+                .search(
+                    TraversalConfigBuilder::new(kernel())
+                        .with_start_nodes(start_nodes.clone())
+                        .with_strategy(strategy)
+                        .with_parallelism(true)
+                        .build(),
+                )
+                .unwrap();
+
+            assert_eq!(serial.stats.parallel_edges, 0);
+            assert!(parallel.stats.parallel_edges > 0);
+            assert_eq!(
+                parallel.stats.parallel_edges,
+                parallel.stats.evaluated_edges
+            );
+            assert_eq!(path_set(&parallel), path_set(&serial));
+        }
     }
 
     #[test]

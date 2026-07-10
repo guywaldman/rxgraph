@@ -1,170 +1,173 @@
-from collections import defaultdict, deque
+import json
 
-from benches.main import (
-    Result,
-    Scale,
-    TRAVERSAL_STRATEGIES,
-    best_by_bench,
-    fmt_count,
-    plain_speedup,
-    simple_graphs,
-    simple_cases,
-    simple_data,
-    travel_cases,
-    travel_data,
-    travel_graphs,
-    traversal_max_paths,
-    weighted_budget_search_kwargs,
-)
+import polars as pl
+import pytest
+import rxgraph as rxg
+
+from benches.data import Profile, SearchShape, cache_root, prepare_search, profiles
+from benches.main import report_payload
+from benches.measure import Measurement, TimedCase, as_json, measure_cases
 
 
-def test_algorithm_cases_match_networkx_and_igraph() -> None:
-    data = simple_data(64, 4)
-    cases = simple_cases(data)
+def test_profile_dimensions_are_exact() -> None:
+    available = profiles()
+    quick = available["quick"]
+    standard = available["standard"]
+    large = available["large"]
 
-    by_name = defaultdict(dict)
-    for case in cases:
-        by_name[case.alg][case.lib] = case.norm(case.run())
-
-    for name, results in by_name.items():
-        assert "rxgraph-df" in results
-        assert "rxgraph-df-string-ids" in results
-        assert "rxgraph-python" in results
-        assert "networkx" in results
-        assert "igraph" in results
-        assert results["rxgraph-python"] == results["rxgraph-df"]
-        for library, result in results.items():
-            assert result == results["rxgraph-df"], f"{name} mismatch for {library}"
-    assert len(by_name["weak_components"]["rxgraph-df"]) > 1
+    assert (quick.search.starts, quick.search.depth, quick.search.fanout) == (
+        128,
+        12,
+        16,
+    )
+    assert quick.search.edge_count == 26_112
+    assert standard.search.edge_count == 3_194_880
+    assert large.search.edge_count == 33_816_576
+    assert standard.topology_nodes == 100_000
+    assert large.topology_nodes is None
 
 
-def test_traversal_matches_reference_libraries() -> None:
-    data = travel_data(96, 8)
-    cases = travel_cases(data, max_paths=8)
-    by_alg = defaultdict(dict)
-    for case in cases:
-        by_alg[case.alg][case.lib] = case.run()
+def test_search_cache_hits_and_generated_rows_are_deterministic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RXGRAPH_BENCH_CACHE", str(tmp_path / "bench"))
+    quick = profiles()["quick"]
 
-    for alg, strategy in TRAVERSAL_STRATEGIES:
-        by_lib = by_alg[alg]
-        for library in [
-            "rxgraph-df",
-            "rxgraph-df-string-ids",
-            "rxgraph-python",
-            "networkx",
-            "igraph",
-        ]:
-            assert library in by_lib
+    cold = prepare_search(quick)
+    warm = prepare_search(quick)
 
-        reference = sorted(reference_travel_paths(data, max_paths=8, strategy=strategy))
-        assert normalize_rx_paths(by_lib["rxgraph-df"]) == reference
-        assert normalize_rx_paths(by_lib["rxgraph-df-string-ids"]) == reference
-        assert normalize_rx_paths(by_lib["rxgraph-python"]) == reference
-        assert normalize_reference_paths(by_lib["networkx"]) == reference
-        assert normalize_reference_paths(by_lib["igraph"]) == reference
+    assert not cold.cache_hit
+    assert warm.cache_hit
+    manifest = json.loads(warm.manifest_path.read_text())
+    assert manifest["rows"] == {
+        "nodes": quick.search.node_count,
+        "edges": quick.search.edge_count,
+    }
 
 
-def test_traversal_includes_rust_kernel_case_matching_budget_dsl() -> None:
-    data = travel_data(96, 8)
-    graphs = travel_graphs(data)
-    cases = travel_cases(data, max_paths=8, graphs=graphs)
-    by_alg_lib = {(case.alg, case.lib): case for case in cases}
+def test_cache_invalidates_parameters_schema_and_partial_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RXGRAPH_BENCH_CACHE", str(tmp_path / "bench"))
+    quick = profiles()["quick"]
+    first = prepare_search(quick)
+    changed = Profile(
+        name="quick-variant",
+        search=SearchShape(
+            starts=quick.search.starts, depth=quick.search.depth, fanout=17
+        ),
+        topology_nodes=quick.topology_nodes,
+        warmups=quick.warmups,
+        runs=quick.runs,
+    )
+    assert prepare_search(changed).manifest_path != first.manifest_path
 
-    for alg, strategy in TRAVERSAL_STRATEGIES:
-        rust_case = by_alg_lib[(alg, "rxgraph-native-inmemory")]
-        dsl_paths = (
-            graphs["rxgraph-df"]
-            .graph.search(
-                **weighted_budget_search_kwargs(data.target, [0], 8, strategy)
-            )
-            .paths
-        )
+    payload = json.loads(first.manifest_path.read_text())
+    payload["spec"]["schema_version"] = 999
+    first.manifest_path.write_text(json.dumps(payload))
+    assert not prepare_search(quick).cache_hit
 
-        assert rust_case.alg == alg
-        assert normalize_rx_paths(rust_case.run()) == normalize_rx_paths(dsl_paths)
-        assert normalize_rx_paths(dsl_paths)
-
-
-def test_traversal_max_paths_scale_with_graph_size() -> None:
-    args = type("Args", (), {"max_paths": 50, "mid_nodes": 100_000})()
-
-    assert traversal_max_paths(Scale("low", 10_000, 1), args) == 5
-    assert traversal_max_paths(Scale("mid", 100_000, 1), args) == 50
-    assert traversal_max_paths(Scale("high", 1_000_000, 1), args) == 500
-
-
-def test_travel_data_contains_requested_paths() -> None:
-    data = travel_data(1_000, 25)
-
-    assert len(reference_travel_paths(data, max_paths=25)) == 25
+    recovered = prepare_search(quick)
+    recovered.edge_path.unlink()
+    repaired = prepare_search(quick)
+    assert not repaired.cache_hit
+    assert repaired.edge_path.is_file()
 
 
-def test_benchmark_report_helpers_are_human_readable() -> None:
-    assert set(simple_graphs(simple_data(4, 1))) >= {"rxgraph-df", "rxgraph-python"}
-    assert fmt_count(5_000) == "5K"
-    assert fmt_count(12_000) == "12K"
-    assert plain_speedup(result("networkx", 1.04), 1.0) == "same"
-    assert plain_speedup(result("rxgraph-python", 1.04), 1.0) == "same"
-    assert plain_speedup(result("rxgraph-df", 1.04), 1.0) == "baseline"
-    assert plain_speedup(result("networkx", 2.0), 1.0) == "2.0x slower"
-    assert plain_speedup(result("networkx", 0.5), 1.0) == "2.0x faster"
-    assert best_by_bench(
-        [result("rxgraph-df", 1.0), result("rxgraph-python", 1.0)]
-    ) == {"bfs/low": "rxgraph-df"}
-    assert best_by_bench(
-        [result("rxgraph-df", 1.0), result("rxgraph-python", 0.96)]
-    ) == {"bfs/low": "rxgraph-python"}
-    assert best_by_bench(
-        [
-            result("rxgraph-df", 1.0),
-            result("igraph", 0.96),
-            result("rxgraph-python", 0.98),
-        ]
-    ) == {"bfs/low": "igraph"}
-    assert best_by_bench(
-        [result("rxgraph-df", 1.0), result("rxgraph-python", 0.90)]
-    ) == {"bfs/low": "rxgraph-python"}
+def test_default_cache_root_is_relative_to_the_current_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.delenv("RXGRAPH_BENCH_CACHE", raising=False)
+    monkeypatch.chdir(tmp_path)
+
+    assert cache_root() == tmp_path / ".cache" / "bench"
 
 
-def result(library: str, median: float) -> Result:
-    case = next(c for c in simple_cases(simple_data(4, 1)) if c.lib == "rxgraph-df")
-    return Result(
-        case=case.__class__("bfs", library, case.run),
-        scale=Scale("low", 4, 1),
-        data=simple_data(4, 1),
-        times=[median],
-        size=1,
+def test_cache_rejects_schema_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setenv("RXGRAPH_BENCH_CACHE", str(tmp_path / "bench"))
+    prepared = prepare_search(profiles()["quick"])
+    pl.DataFrame({"id": [0], "bad": [1]}).write_parquet(prepared.edge_path)
+
+    repaired = prepare_search(profiles()["quick"])
+
+    assert not repaired.cache_hit
+    assert pl.read_parquet_schema(repaired.edge_path)["allowed"] == pl.Boolean
+
+
+def test_measurement_rejects_silent_parallel_fallback() -> None:
+    case = TimedCase(
+        "parallel",
+        lambda: ("ok", 4, 0),
+        lambda value: value[0],
+        execution="parallel",
+        stats=lambda value: (value[1], value[2]),
     )
 
-
-def reference_travel_paths(
-    data, max_paths: int, strategy: str = "bfs"
-) -> list[tuple[int, ...]]:
-    edges = defaultdict(list)
-    for row in data.edges.to_dicts():
-        edges[row["src"]].append(row)
-
-    frontier, paths = deque([(0, (0,), 0)]), []
-    while frontier and len(paths) < max_paths:
-        node, path, spent = frontier.popleft() if strategy == "bfs" else frontier.pop()
-        for edge in edges[node]:
-            dst = edge["dest"]
-            next_spent = spent + edge["price"]
-            if dst in path or next_spent > 950:
-                continue
-            next_path = (*path, dst)
-            if dst == data.target:
-                paths.append(next_path)
-            else:
-                frontier.append((dst, next_path, next_spent))
-            if len(paths) >= max_paths:
-                break
-    return paths
+    with pytest.raises(RuntimeError, match="silently fell back"):
+        measure_cases([case], warmups=0, runs=1)
 
 
-def normalize_rx_paths(paths) -> list[tuple[int, ...]]:
-    return sorted(tuple(int(node) for node in path.nodes) for path in paths)
+def test_measurement_json_schema_has_fixed_baseline_speedup() -> None:
+    payload = as_json(
+        Measurement("rxgraph-arrow-u64", [1.0, 2.0, 3.0], result_size=42),
+        baseline_seconds=2.0,
+    )
+
+    assert set(payload) == {
+        "name",
+        "samples_seconds",
+        "median_seconds",
+        "p90_seconds",
+        "result_size",
+        "evaluated_edges",
+        "parallel_edges",
+        "execution",
+        "baseline_speedup",
+    }
+    assert payload["baseline_speedup"] == 1.0
 
 
-def normalize_reference_paths(paths) -> list[tuple[int, ...]]:
-    return sorted(tuple(int(node) for node in path) for path in paths)
+def test_benchmark_report_json_schema_is_versioned() -> None:
+    assert report_payload([{"profile": "quick"}]) == {
+        "schema_version": 1,
+        "profiles": [{"profile": "quick"}],
+    }
+
+
+def test_python_parallel_edge_stats_reflect_actual_execution() -> None:
+    if rxg.rayon_thread_count() < 2:
+        pytest.skip("single Rayon worker")
+    starts = 512
+    target = starts
+    graph = rxg.Graph(
+        pl.DataFrame({"id": list(range(starts + 1))}, schema={"id": pl.UInt64}),
+        pl.DataFrame(
+            {
+                "id": list(range(starts)),
+                "src": list(range(starts)),
+                "dest": [target] * starts,
+                "allowed": [True] * starts,
+            },
+            schema={
+                "id": pl.UInt64,
+                "src": pl.UInt64,
+                "dest": pl.UInt64,
+                "allowed": pl.Boolean,
+            },
+        ),
+    )
+    kwargs = {
+        "start_nodes": list(range(starts)),
+        "visit": rxg.col("edge.allowed"),
+        "stop": rxg.col("dest.id") == target,
+        "max_paths": starts,
+        "strategy": "bfs",
+    }
+
+    serial = graph.search(**kwargs, parallel=False)
+    parallel = graph.search(**kwargs, parallel=True)
+
+    assert serial.stats.parallel_edges == 0
+    assert parallel.stats.parallel_edges == parallel.stats.evaluated_edges > 0
