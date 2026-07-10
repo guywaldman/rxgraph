@@ -202,6 +202,11 @@ where
         Ok(())
     }
 
+    fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)> {
+        let (edges, dests) = self.graph.repo.outgoing_slice(node);
+        Ok((edges[index], dests[index]))
+    }
+
     fn make_cache(&self) -> Self::Cache {
         PayloadCache::new()
     }

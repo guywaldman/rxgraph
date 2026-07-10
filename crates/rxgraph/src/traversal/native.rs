@@ -424,6 +424,15 @@ where
         Ok(())
     }
 
+    fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)> {
+        let edge = self
+            .store
+            .outgoing(node)?
+            .get(index)
+            .with_context(|| format!("outgoing edge {index} for node {node} is missing"))?;
+        Ok((edge.edge, edge.dest))
+    }
+
     fn make_cache(&self) -> Self::Cache {}
 
     fn eval_edge(

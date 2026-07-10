@@ -192,7 +192,7 @@ fn bench_stateful_native(c: &mut Criterion) {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_paths_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::DepthFirst, false, false),
                     )
@@ -205,7 +205,7 @@ fn bench_stateful_native(c: &mut Criterion) {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_paths_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, true, false),
                     )
@@ -218,7 +218,7 @@ fn bench_stateful_native(c: &mut Criterion) {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_first_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
                     )
@@ -250,7 +250,7 @@ fn main() {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_paths_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::DepthFirst, false, false),
                     )
@@ -261,7 +261,7 @@ fn main() {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_paths_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, true, false),
                     )
@@ -272,7 +272,7 @@ fn main() {
             black_box(
                 workload
                     .graph
-                    .search_with(
+                    .search_first_with(
                         workload.kernel,
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
                     )

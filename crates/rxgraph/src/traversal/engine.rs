@@ -39,6 +39,7 @@ pub(crate) trait SearchAdapter {
     fn for_each_outgoing<F>(&self, node: NodeId, visit: F) -> Result<()>
     where
         F: FnMut(EdgeId, NodeId) -> Result<bool>;
+    fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)>;
     fn make_cache(&self) -> Self::Cache;
     fn eval_edge(
         &self,
@@ -95,6 +96,11 @@ struct DfsSeed<S> {
     task: usize,
 }
 
+struct DfsFrame {
+    next_edge: usize,
+    edge_count: usize,
+}
+
 struct EdgeEval<S> {
     edge: EdgeId,
     dest: NodeId,
@@ -149,38 +155,77 @@ where
         return search_bfs_serial(adapter, cfg);
     }
 
-    let (mut arena, mut frontier, mut stats) = initial_arena(adapter, cfg)?;
+    search_dfs_serial(adapter, cfg)
+}
+
+fn search_dfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
+where
+    A: SearchAdapter,
+{
+    let mut stats = SearchStats::default();
     let mut paths = Vec::new();
     let mut progress = Progress::new(cfg.progress);
     let cache = adapter.make_cache();
 
-    while let Some(parent) = pop(&mut frontier, cfg.strategy) {
-        progress.tick(&stats);
-        if arena[parent].depth >= cfg.max_depth {
-            continue;
-        }
+    for external in &cfg.start_nodes {
+        let node = adapter
+            .resolve_node(external.as_ref())?
+            .with_context(|| format!("unknown start node {external}"))?;
+        let mut arena = vec![PathEntry {
+            node,
+            incoming_edge: None,
+            parent: None,
+            depth: 0,
+            state: adapter.initial_state(node)?,
+        }];
+        let mut frames = vec![DfsFrame {
+            next_edge: 0,
+            edge_count: if cfg.max_depth == 0 {
+                0
+            } else {
+                adapter.out_degree(node)?
+            },
+        }];
+        let mut visits = HashMap::from([(node, 1usize)]);
+        stats.start_nodes += 1;
+        stats.path_entries += 1;
 
-        let parent_node = arena[parent].node;
-        let edge_count = adapter.out_degree(parent_node)?;
-        let visit_counts = visit_counts_arena(&arena, parent, edge_count);
-        adapter.for_each_outgoing(parent_node, |edge, dest| {
-            let Some(edge) = eval_arena_edge(
-                adapter,
-                &arena,
-                parent,
-                edge,
-                dest,
-                cfg,
-                &mut stats,
-                visit_counts.as_ref(),
-                &cache,
-            )?
+        while !frames.is_empty() {
+            progress.tick(&stats);
+            let path = arena.len() - 1;
+            let frame = frames.last_mut().expect("frame exists");
+            if frame.next_edge >= frame.edge_count {
+                frames.pop();
+                let entry = arena.pop().expect("frame has path entry");
+                decrement_visit(&mut visits, entry.node);
+                continue;
+            }
+
+            let (edge, dest) = adapter.outgoing_at(arena[path].node, frame.next_edge)?;
+            frame.next_edge += 1;
+            if visits.get(&dest).copied().unwrap_or(0) >= cfg.max_visits_per_node {
+                stats.skipped_revisits += 1;
+                continue;
+            }
+
+            stats.evaluated_edges += 1;
+            let Some((state, stop)) =
+                adapter.eval_edge(arena[path].node, edge, dest, &arena[path].state, &cache)?
             else {
-                return Ok(true);
+                stats.rejected_edges += 1;
+                continue;
             };
-            let stop = edge.stop;
-            let child = push_entry(&mut arena, parent, edge);
 
+            let child = push_entry(
+                &mut arena,
+                path,
+                EdgeEval {
+                    edge,
+                    dest,
+                    state,
+                    stop,
+                },
+            );
             stats.accepted_edges += 1;
             stats.path_entries += 1;
             stats.max_depth = stats.max_depth.max(arena[child].depth);
@@ -188,22 +233,36 @@ where
             if stop {
                 paths.push(adapter.materialize(&arena, child, cfg.intermediate_states)?);
                 stats.stopped_paths += 1;
+                arena.pop();
                 if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
-                    return Ok(false);
+                    progress.finish(&stats);
+                    return Ok(SearchOutput { paths, stats });
                 }
-            } else {
-                frontier.push_back(child);
+                continue;
             }
-            Ok(true)
-        })?;
-        if cfg.max_paths.is_some_and(|max| paths.len() >= max) {
-            progress.finish(&stats);
-            return Ok(SearchOutput { paths, stats });
+
+            *visits.entry(dest).or_insert(0) += 1;
+            frames.push(DfsFrame {
+                next_edge: 0,
+                edge_count: if arena[child].depth >= cfg.max_depth {
+                    0
+                } else {
+                    adapter.out_degree(dest)?
+                },
+            });
         }
     }
 
     progress.finish(&stats);
     Ok(SearchOutput { paths, stats })
+}
+
+fn decrement_visit(visits: &mut VisitCounts, node: NodeId) {
+    let count = visits.get_mut(&node).expect("active path node is counted");
+    *count -= 1;
+    if *count == 0 {
+        visits.remove(&node);
+    }
 }
 
 fn search_bfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
@@ -781,13 +840,6 @@ fn can_visit_arena<S>(
             Some(parent) => path = parent,
             None => return true,
         }
-    }
-}
-
-fn pop(frontier: &mut VecDeque<usize>, strategy: TraversalStrategy) -> Option<usize> {
-    match strategy {
-        TraversalStrategy::BreadthFirst => frontier.pop_front(),
-        TraversalStrategy::DepthFirst => frontier.pop_back(),
     }
 }
 
