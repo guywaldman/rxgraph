@@ -117,13 +117,8 @@ pub(crate) struct Repo {
     pub nodes: RecordBatch,
     pub edges: RecordBatch,
 
-    /// Reverse adjacency (incoming edges).
-    /// Used for optimization - only some searches require it and it's built lazily on first use
-    /// to keep construction memory and time low (and proportional) foraward only workloads
-    /// (like BFS, as opposed to WCC or degrees).
+    /// Reverse adjacency, built lazily from the forward CSR.
     incoming: OnceLock<IncomingCsr>,
-    /// Endpoints retained to build the reverse CSR lazily without re-reading Arrow columns.
-    edge_endpoints: Vec<(NodeId, NodeId)>,
 
     /// Degree vectors, only used when whole-graph degree query and cached after.
     /// Search-only workloads never touch these, so construction stays cheap;
@@ -345,7 +340,7 @@ impl Repo {
     /// Returns the reverse-adjacency CSR, building it on first use.
     fn incoming(&self) -> &IncomingCsr {
         self.incoming
-            .get_or_init(|| build_incoming_csr(self.node_count, &self.edge_endpoints))
+            .get_or_init(|| build_incoming_csr(self.node_count, &self.csr_offsets, &self.csr_dests))
     }
 
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
@@ -390,17 +385,17 @@ impl Repo {
             edge_ids,
             dests: csr_dests,
         } = build_csr(node_count, &edge_endpoints).context("failed to construct CSR")?;
+        let edge_count = edge_endpoints.len();
 
         Ok(Self {
             nodes: strip_topology_columns(nodes, NODE_TOPOLOGY_COLS)?,
             edges: strip_topology_columns(edges, EDGE_TOPOLOGY_COLS)?,
             node_count,
-            edge_count: edge_endpoints.len(),
+            edge_count,
             csr_offsets,
             csr_dests,
             edge_ids,
             incoming: OnceLock::new(),
-            edge_endpoints,
             identity,
             out_degrees: OnceLock::new(),
             in_degrees: OnceLock::new(),
@@ -437,29 +432,29 @@ fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
         .collect()
 }
 
-fn build_incoming_csr(node_count: usize, edge_endpoints: &[(NodeId, NodeId)]) -> IncomingCsr {
-    if edge_endpoints.len() > Offset::MAX as usize {
-        panic!(
-            "too many edges for u32 CSR offsets ({} > {})",
-            edge_endpoints.len(),
-            Offset::MAX
-        );
-    }
-
+fn build_incoming_csr(
+    node_count: usize,
+    csr_offsets: &[Offset],
+    csr_dests: &[NodeId],
+) -> IncomingCsr {
     let mut offsets = vec![0 as Offset; node_count + 1];
-    for &(_, dest) in edge_endpoints {
+    for &dest in csr_dests {
         offsets[dest as usize + 1] += 1;
     }
     for i in 1..offsets.len() {
         offsets[i] += offsets[i - 1];
     }
 
-    let mut srcs = vec![0; edge_endpoints.len()];
+    let mut srcs = vec![0; csr_dests.len()];
     let mut cursor = offsets.clone();
-    for &(src, dest) in edge_endpoints {
-        let pos = cursor[dest as usize] as usize;
-        srcs[pos] = src;
-        cursor[dest as usize] += 1;
+    for src in 0..node_count as NodeId {
+        let start = csr_offsets[src as usize] as usize;
+        let end = csr_offsets[src as usize + 1] as usize;
+        for &dest in &csr_dests[start..end] {
+            let pos = cursor[dest as usize] as usize;
+            srcs[pos] = src;
+            cursor[dest as usize] += 1;
+        }
     }
     IncomingCsr { offsets, srcs }
 }
