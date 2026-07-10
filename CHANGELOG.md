@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/guywaldman/rxgraph/compare/v0.10.0...v0.11.0) (2026-07-10)
+
+
+### Features
+
+* optimize stateful traversal ([#34](https://github.com/guywaldman/rxgraph/issues/34)) ([7a67acf](https://github.com/guywaldman/rxgraph/commit/7a67acf243450b202b65bc601f530087230ded13))
+
 ## [0.10.0](https://github.com/guywaldman/rxgraph/compare/v0.9.0...v0.10.0) (2026-06-23)
 
 
