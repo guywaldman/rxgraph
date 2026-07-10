@@ -341,6 +341,19 @@ fn bench_stateful_native(c: &mut Criterion) {
             )
         })
     });
+    group.bench_function("paths_bfs_topology_serial", |b| {
+        b.iter(|| {
+            black_box(
+                workload
+                    .graph
+                    .search_paths_with(
+                        workload.topology_kernel,
+                        workload.run(TraversalStrategy::BreadthFirst, false, false),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
     group.bench_function("paths_bfs_topology_parallel", |b| {
         b.iter(|| {
             black_box(
@@ -374,6 +387,19 @@ fn bench_stateful_native(c: &mut Criterion) {
                     .graph
                     .search_first_with(
                         workload.bound_kernel.clone(),
+                        workload.run(TraversalStrategy::BreadthFirst, false, true),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    group.bench_function("first_bfs_topology_serial", |b| {
+        b.iter(|| {
+            black_box(
+                workload
+                    .graph
+                    .search_first_with(
+                        workload.topology_kernel,
                         workload.run(TraversalStrategy::BreadthFirst, false, true),
                     )
                     .unwrap(),
@@ -465,6 +491,19 @@ fn main() {
                 );
             });
         }
+        if selected("paths_bfs_topology_serial") {
+            measure_large("paths_bfs_topology_serial", || {
+                black_box(
+                    workload
+                        .graph
+                        .search_paths_with(
+                            workload.topology_kernel,
+                            workload.run(TraversalStrategy::BreadthFirst, false, false),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
         if selected("paths_bfs_parallel") {
             measure_large("paths_bfs_parallel", || {
                 black_box(
@@ -498,6 +537,19 @@ fn main() {
                         .graph
                         .search_first_with(
                             workload.bound_kernel.clone(),
+                            workload.run(TraversalStrategy::BreadthFirst, false, true),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
+        if selected("first_bfs_topology_serial") {
+            measure_large("first_bfs_topology_serial", || {
+                black_box(
+                    workload
+                        .graph
+                        .search_first_with(
+                            workload.topology_kernel,
                             workload.run(TraversalStrategy::BreadthFirst, false, true),
                         )
                         .unwrap(),

@@ -67,6 +67,44 @@ pub(crate) struct PathEntry<S> {
     pub(crate) parent: Option<usize>,
     pub(crate) depth: usize,
     pub(crate) state: S,
+    visits: VisitFingerprint,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VisitFingerprint([u64; 4]);
+
+impl VisitFingerprint {
+    fn for_node(node: NodeId) -> Self {
+        let mut fingerprint = Self([0; 4]);
+        fingerprint.insert(node);
+        fingerprint
+    }
+
+    #[inline]
+    fn might_contain(&self, node: NodeId) -> bool {
+        let [first, second] = visit_hashes(node);
+        self.contains_bit(first) && self.contains_bit(second)
+    }
+
+    #[inline]
+    fn insert(&mut self, node: NodeId) {
+        for bit in visit_hashes(node) {
+            self.0[bit / 64] |= 1 << (bit % 64);
+        }
+    }
+
+    #[inline]
+    fn contains_bit(&self, bit: usize) -> bool {
+        self.0[bit / 64] & (1 << (bit % 64)) != 0
+    }
+}
+
+#[inline]
+fn visit_hashes(node: NodeId) -> [usize; 2] {
+    [
+        (node & 0xff) as usize,
+        (node.wrapping_mul(0x9e37_79b1) >> 24) as usize,
+    ]
 }
 
 #[derive(Debug, Clone)]
@@ -244,6 +282,7 @@ where
             parent: None,
             depth: 0,
             state: adapter.initial_state(node)?,
+            visits: VisitFingerprint::for_node(node),
         }];
         let mut frames = vec![DfsFrame {
             next_edge: 0,
@@ -403,20 +442,10 @@ where
             let node = arena[parent].node;
             let edge_count = adapter.out_degree(node)?;
             next.reserve(edge_count);
-            let visit_counts = visit_counts_arena(&arena, parent, edge_count);
             let mut found = None;
             adapter.for_each_outgoing(node, |edge, dest| {
-                let Some(edge) = eval_arena_edge(
-                    adapter,
-                    &arena,
-                    parent,
-                    edge,
-                    dest,
-                    cfg,
-                    &mut stats,
-                    visit_counts.as_ref(),
-                    &cache,
-                )?
+                let Some(edge) =
+                    eval_arena_edge(adapter, &arena, parent, edge, dest, cfg, &mut stats, &cache)?
                 else {
                     return Ok(true);
                 };
@@ -579,6 +608,7 @@ where
             parent: None,
             depth: 0,
             state: adapter.initial_state(node)?,
+            visits: VisitFingerprint::for_node(node),
         });
         stats.start_nodes += 1;
         stats.path_entries += 1;
@@ -608,6 +638,7 @@ where
                 parent: None,
                 depth: 0,
                 state: adapter.initial_state(node)?,
+                visits: VisitFingerprint::for_node(node),
             }],
             task: 0,
         });
@@ -689,19 +720,10 @@ where
         let node = arena[parent].node;
         let edge_count = adapter.out_degree(node)?;
         out.reserve(edge_count);
-        let visit_counts = visit_counts_arena(arena, parent, edge_count);
         adapter.for_each_outgoing(node, |edge, dest| {
-            if let Some(edge) = eval_arena_edge(
-                adapter,
-                arena,
-                parent,
-                edge,
-                dest,
-                cfg,
-                &mut stats,
-                visit_counts.as_ref(),
-                cache,
-            )? {
+            if let Some(edge) =
+                eval_arena_edge(adapter, arena, parent, edge, dest, cfg, &mut stats, cache)?
+            {
                 out.push((parent, edge));
             }
             Ok(true)
@@ -720,13 +742,12 @@ fn eval_arena_edge<A>(
     dest: NodeId,
     cfg: &RunConfig,
     stats: &mut SearchStats,
-    visit_counts: Option<&VisitCounts>,
     cache: &A::Cache,
 ) -> Result<Option<EdgeEval<A::State>>>
 where
     A: SearchAdapter,
 {
-    if !can_visit_arena(arena, parent, dest, cfg.max_visits_per_node, visit_counts) {
+    if !can_visit_arena(arena, parent, dest, cfg.max_visits_per_node) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
@@ -749,12 +770,15 @@ where
 
 fn push_entry<S>(arena: &mut Vec<PathEntry<S>>, parent: usize, edge: EdgeEval<S>) -> usize {
     let child = arena.len();
+    let mut visits = arena[parent].visits;
+    visits.insert(edge.dest);
     arena.push(PathEntry {
         node: edge.dest,
         incoming_edge: Some(edge.edge),
         parent: Some(parent),
         depth: arena[parent].depth + 1,
         state: edge.state,
+        visits,
     });
     child
 }
@@ -860,15 +884,8 @@ where
     let node = arena[task].node;
     let edge_count = adapter.out_degree(node)?;
     let mut children = Vec::with_capacity(edge_count);
-    let visit_counts = visit_counts_arena(arena, task, edge_count);
     adapter.for_each_outgoing(node, |edge, dest| {
-        if !can_visit_arena(
-            arena,
-            task,
-            dest,
-            cfg.max_visits_per_node,
-            visit_counts.as_ref(),
-        ) {
+        if !can_visit_arena(arena, task, dest, cfg.max_visits_per_node) {
             stats.skipped_revisits += 1;
             return Ok(true);
         }
@@ -921,6 +938,7 @@ fn standalone_seed<S: Clone>(arena: &[PathEntry<S>], mut path: usize) -> DfsSeed
             parent,
             depth: task.depth,
             state: task.state.clone(),
+            visits: task.visits,
         });
     }
 
@@ -935,34 +953,14 @@ fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
         && cfg.start_nodes.len() >= rayon::current_num_threads()
 }
 
-fn visit_counts_arena<S>(
-    arena: &[PathEntry<S>],
-    mut path: usize,
-    edge_count: usize,
-) -> Option<VisitCounts> {
-    if edge_count <= 1 {
-        return None;
-    }
-
-    let mut counts = HashMap::with_capacity(arena[path].depth + 1);
-    loop {
-        *counts.entry(arena[path].node).or_insert(0) += 1;
-        match arena[path].parent {
-            Some(parent) => path = parent,
-            None => return Some(counts),
-        }
-    }
-}
-
 fn can_visit_arena<S>(
     arena: &[PathEntry<S>],
     mut path: usize,
     node: NodeId,
     max_visits: usize,
-    visit_counts: Option<&VisitCounts>,
 ) -> bool {
-    if let Some(visit_counts) = visit_counts {
-        return visit_counts.get(&node).copied().unwrap_or(0) < max_visits;
+    if !arena[path].visits.might_contain(node) {
+        return true;
     }
 
     let mut visits = 0usize;
