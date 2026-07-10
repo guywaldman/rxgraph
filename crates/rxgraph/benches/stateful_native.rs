@@ -88,6 +88,34 @@ struct BoundSearchKernel {
     budget: u64,
 }
 
+#[derive(Clone)]
+struct FilteredSearchKernel {
+    cost: EdgeField<u64>,
+    target: u64,
+    budget: u64,
+}
+
+impl Kernel for FilteredSearchKernel {
+    type State = SearchState;
+
+    fn initial_state(&self, _graph: &Graph, _start: NodeId) -> Result<Self::State> {
+        Ok(SearchState { spent: 0 })
+    }
+
+    fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>> {
+        let state = SearchState {
+            spent: cx.state().spent + cx.edge_field(&self.cost).unwrap_or(0),
+        };
+        Ok(if state.spent > self.budget {
+            Transition::Reject
+        } else if cx.dest_id() == Some(rxgraph::GraphId::U64(self.target)) {
+            Transition::Complete(state)
+        } else {
+            Transition::Continue(state)
+        })
+    }
+}
+
 impl Kernel for BoundSearchKernel {
     type State = SearchState;
 
@@ -117,6 +145,7 @@ struct Workload {
     starts: Vec<rxgraph::OwnedGraphId>,
     kernel: SearchKernel,
     bound_kernel: BoundSearchKernel,
+    filtered_kernel: FilteredSearchKernel,
     topology_kernel: TopologyKernel,
     cases: usize,
     depth: usize,
@@ -216,6 +245,11 @@ impl Workload {
             target,
             budget: depth as u64,
         };
+        let filtered_kernel = FilteredSearchKernel {
+            cost: graph.edge_field("cost").unwrap(),
+            target,
+            budget: depth as u64,
+        };
         let starts = (0..cases)
             .map(|case| ((case * depth) as u64).into())
             .collect();
@@ -227,6 +261,7 @@ impl Workload {
                 budget: depth as u64,
             },
             bound_kernel,
+            filtered_kernel,
             topology_kernel: TopologyKernel {
                 target,
                 budget: depth as u64,
@@ -287,6 +322,9 @@ fn batch(fields: Vec<Field>, columns: Vec<ArrayRef>) -> RecordBatch {
 fn bench_stateful_native(c: &mut Criterion) {
     let workload = Workload::new();
     let skewed = Workload::new_skewed();
+    let filtered = workload
+        .graph
+        .filter_edges_by(&workload.bound_kernel.allowed);
     let mut group = c.benchmark_group("stateful_native");
 
     group.bench_function("paths_dfs_serial", |b| {
@@ -322,6 +360,18 @@ fn bench_stateful_native(c: &mut Criterion) {
                     .graph
                     .search_paths_with(
                         workload.topology_kernel,
+                        workload.run(TraversalStrategy::DepthFirst, false, false),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
+    group.bench_function("paths_dfs_filtered_serial", |b| {
+        b.iter(|| {
+            black_box(
+                filtered
+                    .search_paths_with(
+                        workload.filtered_kernel.clone(),
                         workload.run(TraversalStrategy::DepthFirst, false, false),
                     )
                     .unwrap(),
@@ -367,6 +417,18 @@ fn bench_stateful_native(c: &mut Criterion) {
             )
         })
     });
+    group.bench_function("paths_bfs_filtered_parallel", |b| {
+        b.iter(|| {
+            black_box(
+                filtered
+                    .search_paths_with(
+                        workload.filtered_kernel.clone(),
+                        workload.run(TraversalStrategy::BreadthFirst, true, false),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
     group.bench_function("paths_bfs_parallel", |b| {
         b.iter(|| {
             black_box(
@@ -406,6 +468,18 @@ fn bench_stateful_native(c: &mut Criterion) {
             )
         })
     });
+    group.bench_function("first_bfs_filtered_serial", |b| {
+        b.iter(|| {
+            black_box(
+                filtered
+                    .search_first_with(
+                        workload.filtered_kernel.clone(),
+                        workload.run(TraversalStrategy::BreadthFirst, false, true),
+                    )
+                    .unwrap(),
+            )
+        })
+    });
     group.bench_function("paths_bfs_skewed_parallel", |b| {
         b.iter(|| {
             black_box(
@@ -423,10 +497,11 @@ fn bench_stateful_native(c: &mut Criterion) {
     group.finish();
 }
 
-fn measure_large(label: &str, run: impl FnOnce()) {
+fn measure_large<T>(label: &str, run: impl FnOnce() -> T) -> T {
     let started = Instant::now();
-    run();
+    let value = run();
     eprintln!("stateful_native/{label} {:?}", started.elapsed());
+    value
 }
 
 fn main() {
@@ -439,6 +514,28 @@ fn main() {
             workload.cases,
             workload.depth,
         );
+        let wants_filtered = [
+            "filter_build",
+            "paths_dfs_filtered_serial",
+            "paths_bfs_filtered_parallel",
+            "first_bfs_filtered_serial",
+            "paths_dfs_filter_once",
+        ]
+        .into_iter()
+        .any(selected);
+        let filtered = wants_filtered.then(|| {
+            if selected("filter_build") {
+                measure_large("filter_build", || {
+                    workload
+                        .graph
+                        .filter_edges_by(&workload.bound_kernel.allowed)
+                })
+            } else {
+                workload
+                    .graph
+                    .filter_edges_by(&workload.bound_kernel.allowed)
+            }
+        });
         if selected("paths_dfs_serial") {
             measure_large("paths_dfs_serial", || {
                 black_box(
@@ -472,6 +569,35 @@ fn main() {
                         .graph
                         .search_paths_with(
                             workload.topology_kernel,
+                            workload.run(TraversalStrategy::DepthFirst, false, false),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
+        if selected("paths_dfs_filtered_serial") {
+            measure_large("paths_dfs_filtered_serial", || {
+                black_box(
+                    filtered
+                        .as_ref()
+                        .unwrap()
+                        .search_paths_with(
+                            workload.filtered_kernel.clone(),
+                            workload.run(TraversalStrategy::DepthFirst, false, false),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
+        if selected("paths_dfs_filter_once") {
+            measure_large("paths_dfs_filter_once", || {
+                let filtered = workload
+                    .graph
+                    .filter_edges_by(&workload.bound_kernel.allowed);
+                black_box(
+                    filtered
+                        .search_paths_with(
+                            workload.filtered_kernel.clone(),
                             workload.run(TraversalStrategy::DepthFirst, false, false),
                         )
                         .unwrap(),
@@ -530,6 +656,20 @@ fn main() {
                 );
             });
         }
+        if selected("paths_bfs_filtered_parallel") {
+            measure_large("paths_bfs_filtered_parallel", || {
+                black_box(
+                    filtered
+                        .as_ref()
+                        .unwrap()
+                        .search_paths_with(
+                            workload.filtered_kernel.clone(),
+                            workload.run(TraversalStrategy::BreadthFirst, true, false),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
         if selected("first_bfs_serial") {
             measure_large("first_bfs_serial", || {
                 black_box(
@@ -556,6 +696,21 @@ fn main() {
                 );
             });
         }
+        if selected("first_bfs_filtered_serial") {
+            measure_large("first_bfs_filtered_serial", || {
+                black_box(
+                    filtered
+                        .as_ref()
+                        .unwrap()
+                        .search_first_with(
+                            workload.filtered_kernel.clone(),
+                            workload.run(TraversalStrategy::BreadthFirst, false, true),
+                        )
+                        .unwrap(),
+                );
+            });
+        }
+        drop(filtered);
         drop(workload);
 
         if selected("paths_bfs_skewed_parallel") {

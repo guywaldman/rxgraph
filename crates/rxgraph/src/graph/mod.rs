@@ -3,6 +3,7 @@ mod csr;
 mod graph;
 mod repo;
 
+pub(crate) use csr::Offset;
 pub use graph::*;
 #[cfg(test)]
 pub(crate) use repo::Repo;
