@@ -185,6 +185,10 @@ where
         self.kernel.initial_state(self.graph, node)
     }
 
+    fn dense_node_count(&self) -> Option<usize> {
+        Some(self.graph.node_count())
+    }
+
     fn out_degree(&self, node: NodeId) -> Result<usize> {
         Ok(self.graph.repo.out_degree(node))
     }

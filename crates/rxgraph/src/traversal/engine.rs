@@ -32,6 +32,9 @@ pub(crate) trait SearchAdapter {
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>>;
     fn initial_state(&self, node: NodeId) -> Result<Self::State>;
+    fn dense_node_count(&self) -> Option<usize> {
+        None
+    }
     fn prefetch_outgoing(&self, _nodes: &[NodeId]) -> Result<()> {
         Ok(())
     }
@@ -101,6 +104,54 @@ struct DfsFrame {
     edge_count: usize,
 }
 
+trait ActiveVisits {
+    fn count(&self, node: NodeId) -> usize;
+    fn increment(&mut self, node: NodeId);
+    fn decrement(&mut self, node: NodeId);
+}
+
+struct DenseVisits(Vec<usize>);
+
+impl ActiveVisits for DenseVisits {
+    #[inline]
+    fn count(&self, node: NodeId) -> usize {
+        self.0[node as usize]
+    }
+
+    #[inline]
+    fn increment(&mut self, node: NodeId) {
+        self.0[node as usize] += 1;
+    }
+
+    #[inline]
+    fn decrement(&mut self, node: NodeId) {
+        self.0[node as usize] -= 1;
+    }
+}
+
+struct SparseVisits(VisitCounts);
+
+impl ActiveVisits for SparseVisits {
+    #[inline]
+    fn count(&self, node: NodeId) -> usize {
+        self.0.get(&node).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn increment(&mut self, node: NodeId) {
+        *self.0.entry(node).or_insert(0) += 1;
+    }
+
+    #[inline]
+    fn decrement(&mut self, node: NodeId) {
+        let count = self.0.get_mut(&node).expect("active path node is counted");
+        *count -= 1;
+        if *count == 0 {
+            self.0.remove(&node);
+        }
+    }
+}
+
 struct EdgeEval<S> {
     edge: EdgeId,
     dest: NodeId,
@@ -162,6 +213,22 @@ fn search_dfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::
 where
     A: SearchAdapter,
 {
+    if let Some(node_count) = adapter.dense_node_count() {
+        search_dfs_serial_with_visits(adapter, cfg, DenseVisits(vec![0; node_count]))
+    } else {
+        search_dfs_serial_with_visits(adapter, cfg, SparseVisits(HashMap::new()))
+    }
+}
+
+fn search_dfs_serial_with_visits<A, V>(
+    adapter: &A,
+    cfg: &RunConfig,
+    mut visits: V,
+) -> Result<SearchOutput<A::Path>>
+where
+    A: SearchAdapter,
+    V: ActiveVisits,
+{
     let mut stats = SearchStats::default();
     let mut paths = Vec::new();
     let mut progress = Progress::new(cfg.progress);
@@ -186,7 +253,7 @@ where
                 adapter.out_degree(node)?
             },
         }];
-        let mut visits = HashMap::from([(node, 1usize)]);
+        visits.increment(node);
         stats.start_nodes += 1;
         stats.path_entries += 1;
 
@@ -197,13 +264,13 @@ where
             if frame.next_edge >= frame.edge_count {
                 frames.pop();
                 let entry = arena.pop().expect("frame has path entry");
-                decrement_visit(&mut visits, entry.node);
+                visits.decrement(entry.node);
                 continue;
             }
 
             let (edge, dest) = adapter.outgoing_at(arena[path].node, frame.next_edge)?;
             frame.next_edge += 1;
-            if visits.get(&dest).copied().unwrap_or(0) >= cfg.max_visits_per_node {
+            if visits.count(dest) >= cfg.max_visits_per_node {
                 stats.skipped_revisits += 1;
                 continue;
             }
@@ -241,7 +308,7 @@ where
                 continue;
             }
 
-            *visits.entry(dest).or_insert(0) += 1;
+            visits.increment(dest);
             frames.push(DfsFrame {
                 next_edge: 0,
                 edge_count: if arena[child].depth >= cfg.max_depth {
@@ -255,14 +322,6 @@ where
 
     progress.finish(&stats);
     Ok(SearchOutput { paths, stats })
-}
-
-fn decrement_visit(visits: &mut VisitCounts, node: NodeId) {
-    let count = visits.get_mut(&node).expect("active path node is counted");
-    *count -= 1;
-    if *count == 0 {
-        visits.remove(&node);
-    }
 }
 
 fn search_bfs_serial<A>(adapter: &A, cfg: &RunConfig) -> Result<SearchOutput<A::Path>>
