@@ -205,6 +205,43 @@ rxgraph::typed_plugin! {
 See [`examples/rust-kernel-plugin/`](examples/rust-kernel-plugin/README.md) for
 the full guide, including the typed payload shape and the maturin build.
 
+## Streaming native searches
+
+Use `search_batches` with a named native kernel to pull results incrementally:
+
+```python
+with graph.search_batches(
+    start_nodes=["a"],
+    kernel="hop_budget",
+    params={"max_hops": 3, "profile_col": "profile", "policy_col": "policy"},
+    batch_size=1024,
+) as stream:
+    for paths in stream:
+        for path in paths:
+            print(path.nodes, path.state)
+    print(stream.stats)
+```
+
+The example assumes `graph` comes from a plugin registering `hop_budget`.
+Batches contain at most `batch_size` paths and may be smaller. No traversal runs
+between pulls. Typed decoding and lazy file setup happen on the first pull.
+Closing releases the session's graph references and lazy caches; paths already
+returned remain usable. Shared eager decode caches stay available for later searches.
+Use the context manager when breaking early. `stats` is cumulative and remains
+readable after close.
+
+Serial DFS/BFS ordering and the global `max_paths` limit are preserved. Parallel
+ordering is unspecified. Typed eager and lazy Parquet stores currently execute
+serially, as they do with `search`. DSL streaming is deferred. Custom native
+runners must implement the optional streaming capability; standard plugin wrappers
+provide it automatically when rebuilt against this version.
+
+Streaming bounds retained output, not BFS frontier size or payload-cache memory.
+A graph's payload tables cannot be replaced while a stream retains them.
+`batch_size=1` favors latency; the default is 1024 to amortize Python overhead.
+Performance results and the explicit acceptance gates are documented in
+[`benches/NATIVE_PERFORMANCE.md`](benches/NATIVE_PERFORMANCE.md).
+
 ## Architecture
 
 The Python package is backed by a Rust core. Internally, `rxgraph` stores node

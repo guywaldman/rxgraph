@@ -62,6 +62,16 @@ def _assert_hop_budget_search(rxg) -> None:
             max_paths=10,
             parallel=False,
         )
+        with graph.search_batches(
+            start_nodes=["a"],
+            kernel="hop_budget",
+            params={"max_hops": 10, "profile_col": "profile", "policy_col": "policy"},
+            max_paths=10,
+            parallel=False,
+            batch_size=1,
+        ) as stream:
+            streamed = [path for batch in stream for path in batch]
+        assert streamed == result.paths
 
     assert result.paths[0].nodes == ["a", "b", "c"]
     assert result.paths[0].edges == ["ab", "bc"]

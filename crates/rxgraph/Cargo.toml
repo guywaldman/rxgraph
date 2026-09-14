@@ -1,4 +1,5 @@
 [package]
+autobenches = false
 name = "rxgraph"
 version = "0.11.0"
 edition.workspace = true
@@ -60,4 +61,16 @@ harness = false
 
 [[bench]]
 name = "memory"
+harness = false
+
+[[bench]]
+name = "native_acceptance"
+harness = false
+
+[[bench]]
+name = "native_streaming"
+harness = false
+
+[[bench]]
+name = "native_allocations"
 harness = false

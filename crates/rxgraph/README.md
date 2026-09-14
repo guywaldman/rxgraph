@@ -171,3 +171,23 @@ binding layer is available from this crate via the `python` feature; downstream
 native-kernel plugins enable `features = ["python"]` and use the
 `rxgraph::plugin!` macro to register kernels and build a custom extension; see
 [`examples/rust-kernel-plugin/`](../../examples/rust-kernel-plugin/README.md).
+
+## Native result streams
+
+`graph.search_batches_with(kernel, run, batch_size)` returns an iterator of
+`Result<Vec<GraphPath<K::State>>>`. For custom stores, use
+`rxgraph::traversal::native::search_batches(&store, kernel, run, batch_size)`.
+Both retain traversal state between calls and expose `stats()` and `close()`.
+Native-store paths borrow the caller's store, so they remain usable after the
+cursor closes. Store traversal remains serial and accepts non-`Send` kernels.
+Graph kernels retain Rayon support; parallel result ordering is unspecified.
+
+The batch size must be positive and is a maximum; batches may be smaller.
+No empty batches are emitted. Errors terminate the cursor, and `max_paths`
+applies across the whole stream. Dropping the cursor releases its scratch state.
+
+Named runners expose optional `RunKernel::stream`,
+`RunTypedKernel::stream_eager_cached`, and `stream_parquet_lazy` methods returning
+owned `NativeBatchStream` sessions. Existing custom eager-only implementations
+remain valid and report an unsupported-capability error for streaming.
+The standard `boxed_run` and `boxed_typed_run` wrappers implement streaming.
