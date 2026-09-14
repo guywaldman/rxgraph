@@ -48,6 +48,9 @@ these gates. Results are measured against `3df81bd`.
 - Python consumes result vectors once. Named typed runners encode directly from
   traversal state, without constructing intermediate typed result states.
   The Serde encoder constructs traversal values without a JSON object tree.
+- Unlabeled native streams construct the public Python `SearchPath` directly at
+  the binding boundary. They do not allocate an internal path wrapper and tuple
+  before constructing the public object. Labeled graphs retain the mapping path.
 - Native stores can expose a dense node count. Built-in stores use dense DFS
   visit tracking; custom sparse stores keep their fallback.
 - Typed eager decoding and lazy file setup are deferred to the first pull.
@@ -123,15 +126,38 @@ command with `--check` exited with status 1. No failing workload was removed.
 These are baseline/candidate ratios. Values below 1 mean regressions; the median
 across cases is descriptive and does not replace the per-case acceptance gate.
 
-At batch size 1024, **74/80 Rust cases and 88/106 Python cases** satisfy the 5%
-full-drain gate: **162/186 total**, with 24 failures. The largest measured overhead
-was 18.8% in Rust (`first/BreadthFirst/typed-cold`) and 17.3% in Python
-(`plugin/wide/eager/dfs`).
+In the retained full-matrix artifacts, before the direct Python stream-boundary
+change above, batch size 1024 has **74/80 Rust cases and 88/106 Python cases**
+within the 5% full-drain gate: **162/186 total**, with 24 failures. The largest
+measured overhead was 18.8% in Rust (`first/BreadthFirst/typed-cold`) and 17.3%
+in Python (`plugin/wide/eager/dfs`).
 
 Latency improves even in some full-drain failures. For
 `plugin/wide/arrow/bfs/parallel`, the first 1024 results arrive in a median
 **1.20 ms**, versus **14.05 ms** for optimized eager completion. Full streaming
 drain takes **16.45 ms**, so this case still fails the overhead gate.
+
+### Custom Rust kernel follow-up
+
+The former worst Python output case was rerun after removing the intermediate
+stream representation. The focused run used 8 warmups and 51 interleaved timed
+samples and retained the same 12,160-path output-equivalence check:
+
+| `plugin/wide/eager/dfs` | Median | Ratio to eager | p90 |
+| --- | ---: | ---: | ---: |
+| Optimized eager | 12.386 ms | 1.000 | 12.858 ms |
+| Stream, batch 64 | 12.139 ms | 0.980 | 12.646 ms |
+| Stream, batch 1024 | 11.760 ms | 0.950 | 12.176 ms |
+| Stream, batch 4096 | 11.747 ms | 0.948 | 12.181 ms |
+
+This custom typed Rust-kernel case now clears the 5% full-drain gate at the
+default size. The retained full-matrix totals above have not been regenerated,
+so the overall acceptance result remains unmet until that complete run passes.
+
+`LazyFrame` is not used for the batch boundary. The search has already produced
+materialized paths, so wrapping them in a lazy query plan does not avoid result
+conversion. Arrow/Polars output would need a separate columnar result contract
+and a stable schema for arbitrary serialized kernel state.
 
 ### Remaining costs and regressions
 
@@ -144,8 +170,8 @@ drain takes **16.45 ms**, so this case still fails the overhead gate.
 - Lazy `many/DepthFirst/typed-lazy` still issues **4096 payload reads** in both
   versions. Caching across pulls and cheaper bookkeeping have not eliminated
   repeated Parquet decoding within a search.
-- Wide Python output has substantial batching/conversion overhead. The measured
-  17.3% regression against optimized eager remains above the allowed 5%.
+- The remaining full-matrix stream failures still require a complete rerun after
+  the Python boundary change; the focused former worst case now passes.
 
 Separate Rust allocation profiles show where storage/conversion changes help:
 

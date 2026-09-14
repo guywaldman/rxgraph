@@ -321,6 +321,7 @@ impl PyGraph {
             inner: Some(inner),
             batch_size,
             stats: SearchStats::default(),
+            path_factory: None,
         })
     }
 
@@ -625,6 +626,29 @@ impl PySearchResult {
             stats: result.stats.into(),
         })
     }
+}
+
+pub(super) fn owned_paths_into_py(
+    py: Python<'_>,
+    paths: Vec<crate::OwnedGraphPath>,
+    path_factory: Option<&Py<PyAny>>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let nodes = owned_ids_into_py(py, path.nodes)?;
+            let edges = owned_ids_into_py(py, path.edges)?;
+            let state = state_to_py(py, path.state)?;
+            let history = path
+                .intermediate_states
+                .map(|states| states_to_py(py, states))
+                .transpose()?;
+            match path_factory {
+                Some(factory) => factory.call1(py, (nodes, edges, state, history)),
+                None => (nodes, edges, state, history).into_py_any(py),
+            }
+        })
+        .collect()
 }
 
 #[pyclass(name = "SearchStats", frozen, skip_from_py_object)]

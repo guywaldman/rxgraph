@@ -752,6 +752,9 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             )
 
     def _consume_paths(inner, id_to_label, edge_id_to_label):
+        return _consume_path_rows(inner._take_paths(), id_to_label, edge_id_to_label)
+
+    def _consume_path_rows(rows, id_to_label, edge_id_to_label):
         return [
             SearchPath(
                 nodes=_map_search_nodes(nodes, id_to_label),
@@ -759,7 +762,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 state=state,
                 intermediate_states=history,
             )
-            for nodes, edges, state, history in inner._take_paths()
+            for nodes, edges, state, history in rows
         ]
 
     class SearchStream:
@@ -769,14 +772,25 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             self._inner = inner
             self._id_to_label = id_to_label
             self._edge_id_to_label = edge_id_to_label
+            self._native_paths = (
+                id_to_label is None
+                and edge_id_to_label is None
+                and hasattr(inner, "_set_path_factory")
+            )
+            if self._native_paths:
+                inner._set_path_factory(SearchPath)
 
         def __iter__(self):
             return self
 
         def __next__(self) -> list[SearchPath]:
             try:
-                result = next(self._inner)
-                return _consume_paths(result, self._id_to_label, self._edge_id_to_label)
+                rows = next(self._inner)
+                if self._native_paths:
+                    return rows
+                return _consume_path_rows(
+                    rows, self._id_to_label, self._edge_id_to_label
+                )
             except BaseException:
                 self.close()
                 raise
