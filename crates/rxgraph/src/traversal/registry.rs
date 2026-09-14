@@ -13,14 +13,14 @@
 
 use std::{
     collections::HashMap,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 
 use crate::{
-    Graph, StateRow, Value,
+    Graph, StateRow,
     traversal::{
         Kernel, RunOptions, SearchResult,
         typed::{self, OwnedSearchResult, ParquetPaths, TypedKernel, TypedPayloadCache},
@@ -38,6 +38,14 @@ pub use inventory;
 pub trait RunKernel: Send + Sync {
     /// Runs the kernel against `graph` with `run` options.
     fn run<'g>(&self, graph: &'g Graph, run: RunOptions) -> Result<SearchResult<'g>>;
+    /// Optional pull capability. Eager-only custom runners retain source compatibility.
+    fn stream(
+        &self,
+        _graph: Arc<Graph>,
+        _run: RunOptions,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this native kernel runner does not support streaming")
+    }
 }
 
 impl<F> RunKernel for F
@@ -81,6 +89,25 @@ inventory::collect!(KernelEntry);
 
 /// Object-safe typed native runner.
 pub trait RunTypedKernel: Send + Sync {
+    /// Optional owned eager stream. Default supports legacy eager-only runners.
+    fn stream_eager_cached(
+        &self,
+        _graph: Arc<Graph>,
+        _cache: &TypedPayloadCache,
+        _run: RunOptions,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this typed native kernel runner does not support streaming")
+    }
+    /// Optional owned lazy stream.
+    fn stream_parquet_lazy(
+        &self,
+        _graph: Arc<Graph>,
+        _paths: ParquetPaths,
+        _run: RunOptions,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this typed native kernel runner does not support streaming")
+    }
+
     /// Runs against the graph's eager Arrow payload tables.
     fn run_eager(&self, graph: &Graph, run: RunOptions) -> Result<OwnedSearchResult>;
 
@@ -135,7 +162,7 @@ where
     K::State: Send + Sync + Clone,
     F: Fn(&K::State) -> Result<StateRow> + Send + Sync + 'static,
 {
-    struct Runner<K, F>(K, F);
+    struct Runner<K, F>(K, Arc<F>);
 
     impl<K, F> RunKernel for Runner<K, F>
     where
@@ -146,54 +173,22 @@ where
         fn run<'g>(&self, graph: &'g Graph, run: RunOptions) -> Result<SearchResult<'g>> {
             graph
                 .search_paths_with(self.0.clone(), run)?
-                .try_map_state(&self.1)
+                .try_map_state(|state| (self.1)(state))
+        }
+        fn stream(
+            &self,
+            graph: Arc<Graph>,
+            run: RunOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            super::stream::graph_stream(graph, self.0.clone(), Arc::clone(&self.1), run)
         }
     }
 
-    Box::new(Runner(kernel, encode))
+    Box::new(Runner(kernel, Arc::new(encode)))
 }
 
 pub(crate) fn encode_state<T: Serialize>(state: &T) -> Result<StateRow> {
-    let serde_json::Value::Object(fields) = serde_json::to_value(state)? else {
-        bail!("kernel state must serialize as an object")
-    };
-    let mut row = fields
-        .into_iter()
-        .map(|(name, value)| Ok((name, value_from_json(value)?)))
-        .collect::<Result<StateRow>>()?;
-    row.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(row)
-}
-
-fn value_from_json(value: serde_json::Value) -> Result<Value> {
-    Ok(match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(value) => Value::Bool(value),
-        serde_json::Value::Number(value) if value.is_u64() => {
-            Value::U64(value.as_u64().context("invalid u64 state value")?)
-        }
-        serde_json::Value::Number(value) if value.is_i64() => {
-            Value::I64(value.as_i64().context("invalid i64 state value")?)
-        }
-        serde_json::Value::Number(value) => {
-            Value::F64(value.as_f64().context("invalid f64 state value")?)
-        }
-        serde_json::Value::String(value) => Value::Str(value.into()),
-        serde_json::Value::Array(values) => Value::List(
-            values
-                .into_iter()
-                .map(value_from_json)
-                .collect::<Result<_>>()?,
-        ),
-        serde_json::Value::Object(fields) => {
-            let mut fields = fields
-                .into_iter()
-                .map(|(name, value)| Ok((name, value_from_json(value)?)))
-                .collect::<Result<Vec<_>>>()?;
-            fields.sort_by(|left, right| left.0.cmp(&right.0));
-            Value::Struct(fields)
-        }
-    })
+    super::state_encoder::encode(state)
 }
 
 /// Wraps a concrete [`TypedKernel`] into a boxed typed native runner.
@@ -213,6 +208,22 @@ where
         K::Edge: Send + Sync + 'static,
         K::State: Send + Sync + Clone + Serialize,
     {
+        fn stream_eager_cached(
+            &self,
+            graph: Arc<Graph>,
+            cache: &TypedPayloadCache,
+            run: RunOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            typed::stream_typed_eager_cached(graph, cache, self.0.clone(), run)
+        }
+        fn stream_parquet_lazy(
+            &self,
+            graph: Arc<Graph>,
+            paths: ParquetPaths,
+            run: RunOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            typed::stream_typed_parquet_lazy(graph, paths, self.0.clone(), run)
+        }
         fn run_eager(&self, graph: &Graph, run: RunOptions) -> Result<OwnedSearchResult> {
             typed::run_typed_eager(graph, self.0.clone(), run)
         }

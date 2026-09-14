@@ -34,7 +34,7 @@ use parquet::arrow::arrow_reader::{
 use crate::{
     dsl::{StateRow, Value, arrow_value},
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId},
-    traversal::{RunOptions, SearchStats, native},
+    traversal::{RunOptions, SearchStats, native, ownership::Owner},
 };
 
 /// A projected Arrow row handed to `TryFrom<ArrowRow<'_>>`.
@@ -671,9 +671,10 @@ struct TypedCacheKey {
 }
 
 struct DecodedPayloads<N, E> {
-    nodes: Vec<N>,
-    edges: Vec<E>,
+    nodes: Arc<[N]>,
+    edges: Arc<[E]>,
 }
+type PayloadSlot<N, E> = Arc<OnceLock<Arc<DecodedPayloads<N, E>>>>;
 
 impl TypedPayloadCache {
     fn payloads<K>(
@@ -681,6 +682,16 @@ impl TypedPayloadCache {
         graph: &Graph,
         kernel: &K,
     ) -> Result<Arc<DecodedPayloads<K::Node, K::Edge>>>
+    where
+        K: TypedKernel + 'static,
+        K::Node: 'static,
+        K::Edge: 'static,
+    {
+        let slot = self.payload_slot(kernel)?;
+        cached_payloads(&slot, graph, kernel)
+    }
+
+    fn payload_slot<K>(&self, kernel: &K) -> Result<PayloadSlot<K::Node, K::Edge>>
     where
         K: TypedKernel + 'static,
         K::Node: 'static,
@@ -697,22 +708,34 @@ impl TypedPayloadCache {
 
         if let Some(existing) = self.entries.borrow().get(&key) {
             let payloads = existing
-                .downcast_ref::<Arc<DecodedPayloads<K::Node, K::Edge>>>()
+                .downcast_ref::<PayloadSlot<K::Node, K::Edge>>()
                 .context("typed payload cache stored an unexpected payload type")?;
             return Ok(Arc::clone(payloads));
         }
 
-        let node_batch = project_batch(graph.node_payloads(), &key.node_fields)?;
-        let edge_batch = project_batch(graph.edge_payloads(), &key.edge_fields)?;
-        let payloads = Arc::new(DecodedPayloads {
-            nodes: decode_all::<K::Node>(&node_batch)?,
-            edges: decode_all::<K::Edge>(&edge_batch)?,
-        });
+        let payloads: PayloadSlot<K::Node, K::Edge> = Arc::new(OnceLock::new());
         self.entries
             .borrow_mut()
             .insert(key, Box::new(Arc::clone(&payloads)));
         Ok(payloads)
     }
+}
+
+fn cached_payloads<K: TypedKernel>(
+    slot: &PayloadSlot<K::Node, K::Edge>,
+    graph: &Graph,
+    kernel: &K,
+) -> Result<Arc<DecodedPayloads<K::Node, K::Edge>>> {
+    if let Some(payloads) = slot.get() {
+        return Ok(Arc::clone(payloads));
+    }
+    let node_batch = project_batch(graph.node_payloads(), &kernel.node_fields())?;
+    let edge_batch = project_batch(graph.edge_payloads(), &kernel.edge_fields())?;
+    let payloads = Arc::new(DecodedPayloads {
+        nodes: decode_all::<K::Node>(&node_batch)?.into(),
+        edges: decode_all::<K::Edge>(&edge_batch)?.into(),
+    });
+    Ok(Arc::clone(slot.get_or_init(|| payloads)))
 }
 
 pub(crate) fn run_typed_eager<K>(
@@ -760,8 +783,7 @@ where
 {
     let store = native::EagerGraphStore::new(graph, nodes, edges)?;
     let adapter = TypedKernelAdapter::new(kernel);
-    let result = native::search_native(&store, adapter.clone(), run)?;
-    owned_result(result)
+    search_owned(&store, &adapter, run)
 }
 
 pub(crate) fn run_typed_parquet_lazy<K>(
@@ -781,8 +803,7 @@ where
         kernel.edge_fields(),
     )?;
     let adapter = TypedKernelAdapter::new(kernel);
-    let result = native::search_native(&store, adapter.clone(), run)?;
-    let mut owned = owned_result(result)?;
+    let mut owned = search_owned(&store, &adapter, run)?;
     owned.stats.materialized_node_payloads = store.loaded_node_count();
     owned.stats.materialized_edge_payloads = store.loaded_edge_count();
     let io = store.io_stats();
@@ -793,73 +814,74 @@ where
     Ok(owned)
 }
 
-pub(crate) fn owned_result<N, E, S>(
-    result: native::SearchResult<'_, N, E, S>,
-) -> Result<OwnedSearchResult>
+fn search_owned<K, G>(store: &G, kernel: &K, run: RunOptions) -> Result<OwnedSearchResult>
 where
-    S: Clone + serde::Serialize,
+    K: native::Kernel,
+    K::State: serde::Serialize,
+    G: native::GraphStore<Node = K::Node, Edge = K::Edge>,
 {
-    let paths = result
-        .paths
-        .into_iter()
-        .map(|path| {
-            let final_state = super::registry::encode_state(&path.state)?;
-            let intermediate_states = path
-                .nodes
-                .iter()
-                .any(|node| node.state.is_some())
-                .then(|| {
-                    path.nodes
-                        .iter()
-                        .map(|node| {
-                            let state =
-                                node.state.as_ref().context("missing intermediate state")?;
-                            super::registry::encode_state(state)
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-                .transpose()?;
-            let nodes = path
-                .nodes
-                .into_iter()
-                .map(|node| {
-                    node.external_id
-                        .context("path references missing node")?
-                        .into_owned()
-                        .pipe(Ok)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let edges = path
-                .edges
-                .into_iter()
-                .map(|edge| {
-                    edge.external_id
-                        .context("path references missing edge")?
-                        .into_owned()
-                        .pipe(Ok)
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(OwnedGraphPath {
-                nodes,
-                edges,
-                state: final_state,
-                intermediate_states,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let adapter = native::NativeSearchAdapter {
+        store,
+        kernel,
+        materialize: materialize_owned::<G, K::State>,
+    };
+    let result = super::engine::search_serial(&adapter, run)?;
     Ok(OwnedSearchResult {
-        paths,
+        paths: result.paths,
         stats: result.stats,
     })
 }
 
-trait Pipe: Sized {
-    fn pipe<T>(self, f: impl FnOnce(Self) -> T) -> T {
-        f(self)
+/// Project directly from traversal state, avoiding intermediate typed path/state copies.
+fn materialize_owned<G: native::GraphStore, S: serde::Serialize>(
+    store: &G,
+    arena: &[super::engine::PathEntry<S>],
+    mut path: usize,
+    intermediate_states: bool,
+) -> Result<OwnedGraphPath> {
+    let state = super::registry::encode_state(&arena[path].state)?;
+    let mut nodes = Vec::with_capacity(arena[path].depth + 1);
+    let mut edges = Vec::with_capacity(arena[path].depth);
+    let mut history = intermediate_states.then(|| Vec::with_capacity(arena[path].depth + 1));
+    loop {
+        let entry = &arena[path];
+        // Preserve the native path's payload validation/loading contract.
+        store.node(entry.node)?;
+        nodes.push(
+            store
+                .external_node(entry.node)?
+                .context("path references missing node")?
+                .into_owned(),
+        );
+        if let Some(edge) = entry.incoming_edge {
+            store.edge(edge)?;
+            edges.push(
+                store
+                    .external_edge(edge)?
+                    .context("path references missing edge")?
+                    .into_owned(),
+            );
+        }
+        if let Some(history) = &mut history {
+            history.push(super::registry::encode_state(&entry.state)?);
+        }
+        match entry.parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
     }
+    nodes.reverse();
+    edges.reverse();
+    if let Some(history) = &mut history {
+        history.reverse();
+    }
+    Ok(OwnedGraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states: history,
+    })
 }
-
-impl<T> Pipe for T {}
 
 #[derive(Clone, Debug)]
 pub struct ParquetPaths {
@@ -1147,14 +1169,12 @@ where
 fn read_many<T>(
     source: &ParquetPayloadFile,
     fields: &[PayloadField],
-    rows: impl IntoIterator<Item = usize>,
+    rows: Vec<usize>,
 ) -> Result<Vec<(usize, T)>>
 where
     T: for<'row> TryFrom<ArrowRow<'row>, Error = anyhow::Error>,
 {
-    let mut rows = rows.into_iter().collect::<Vec<_>>();
-    rows.sort_unstable();
-    rows.dedup();
+    // missing_rows already sorted and deduplicated the demand set.
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -1214,7 +1234,7 @@ impl ParquetPayloadFile {
             File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
         let metadata = ArrowReaderMetadata::load(&file, Default::default())
             .with_context(|| format!("failed to read parquet metadata from {}", path.display()))?;
-        let row_group_offsets = row_group_offsets(&file, &path)?;
+        let row_group_offsets = row_group_offsets(metadata.metadata());
         Ok(Self {
             path,
             file,
@@ -1314,24 +1334,20 @@ struct RowGroupSelection {
     selected_rows: usize,
 }
 
-fn row_group_offsets(file: &File, path: &Path) -> Result<Vec<usize>> {
-    let file = file
-        .try_clone()
-        .with_context(|| format!("failed to clone file handle for {}", path.display()))?;
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .with_context(|| format!("failed to read parquet metadata from {}", path.display()))?;
-    let metadata = builder.metadata();
+fn row_group_offsets(metadata: &parquet::file::metadata::ParquetMetaData) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(metadata.num_row_groups() + 1);
     offsets.push(0);
     for group in 0..metadata.num_row_groups() {
         let next = offsets[group] + metadata.row_group(group).num_rows() as usize;
         offsets.push(next);
     }
-    Ok(offsets)
+    offsets
 }
 
 struct ParquetGraphStore<'a, N, E> {
-    graph: &'a Graph,
+    graph: Owner<'a, Graph>,
+    loaded_nodes: AtomicUsize,
+    loaded_edges: AtomicUsize,
     node_file: ParquetPayloadFile,
     edge_file: ParquetPayloadFile,
     node_fields: Vec<PayloadField>,
@@ -1348,11 +1364,22 @@ impl<'a, N, E> ParquetGraphStore<'a, N, E> {
         node_fields: Vec<PayloadField>,
         edge_fields: Vec<PayloadField>,
     ) -> Result<Self> {
+        Self::from_owner(Owner::Borrowed(graph), paths, node_fields, edge_fields)
+    }
+
+    fn from_owner(
+        graph: Owner<'a, Graph>,
+        paths: ParquetPaths,
+        node_fields: Vec<PayloadField>,
+        edge_fields: Vec<PayloadField>,
+    ) -> Result<Self> {
         Ok(Self {
             nodes: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
             edges: (0..graph.edge_count()).map(|_| OnceLock::new()).collect(),
             outgoing: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
             graph,
+            loaded_nodes: AtomicUsize::new(0),
+            loaded_edges: AtomicUsize::new(0),
             node_file: ParquetPayloadFile::open(paths.nodes)?,
             edge_file: ParquetPayloadFile::open(paths.edges)?,
             node_fields,
@@ -1361,17 +1388,10 @@ impl<'a, N, E> ParquetGraphStore<'a, N, E> {
     }
 
     fn loaded_node_count(&self) -> usize {
-        self.nodes
-            .iter()
-            .filter(|cell| cell.get().is_some())
-            .count()
+        self.loaded_nodes.load(Ordering::Relaxed)
     }
-
     fn loaded_edge_count(&self) -> usize {
-        self.edges
-            .iter()
-            .filter(|cell| cell.get().is_some())
-            .count()
+        self.loaded_edges.load(Ordering::Relaxed)
     }
 
     fn io_stats(&self) -> LazyPayloadIoSnapshot {
@@ -1406,7 +1426,9 @@ where
                 .nodes
                 .get(row)
                 .with_context(|| format!("node row {row} is out of range"))?;
-            let _ = cell.set(Ok(payload));
+            if cell.set(Ok(payload)).is_ok() {
+                self.loaded_nodes.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -1418,7 +1440,9 @@ where
                 .edges
                 .get(row)
                 .with_context(|| format!("edge row {row} is out of range"))?;
-            let _ = cell.set(Ok(payload));
+            if cell.set(Ok(payload)).is_ok() {
+                self.loaded_edges.fetch_add(1, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -1450,6 +1474,10 @@ where
 {
     type Node = N;
     type Edge = E;
+
+    fn dense_node_count(&self) -> Option<usize> {
+        Some(self.graph.node_count())
+    }
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
         Ok(self.graph.repo.internal_node(external))
@@ -1542,4 +1570,109 @@ where
             .as_ref()
             .map_err(|err| anyhow!("failed to materialize edge row {id}: {err}"))
     }
+}
+
+struct TypedStream<K: TypedKernel, G> {
+    store: G,
+    kernel: TypedKernelAdapter<K>,
+    cursor: super::engine::cursor::Cursor<K::State, ()>,
+    update_stats: fn(&G, &mut SearchStats),
+}
+impl<K, G> super::NativeBatchStream for TypedStream<K, G>
+where
+    K: TypedKernel + Send + Sync + 'static,
+    K::State: serde::Serialize + Send,
+    G: native::GraphStore<Node = K::Node, Edge = K::Edge> + Send,
+{
+    fn next_batch(&mut self, size: usize) -> Result<Option<OwnedSearchResult>> {
+        let result = (|| {
+            let adapter = native::NativeSearchAdapter {
+                store: &self.store,
+                kernel: &self.kernel,
+                materialize: materialize_owned::<G, K::State>,
+            };
+            let paths = self.cursor.next_batch(&adapter, size)?;
+            let stats = self.stats();
+            Ok(paths.map(|paths| OwnedSearchResult { paths, stats }))
+        })();
+        if result.is_err() {
+            self.cursor.close();
+        }
+        result
+    }
+    fn stats(&self) -> SearchStats {
+        let mut stats = self.cursor.stats;
+        (self.update_stats)(&self.store, &mut stats);
+        stats
+    }
+    fn close(&mut self) {
+        self.cursor.close();
+    }
+}
+
+pub(crate) fn stream_typed_eager_cached<K>(
+    graph: Arc<Graph>,
+    cache: &TypedPayloadCache,
+    kernel: K,
+    run: RunOptions,
+) -> Result<Box<dyn super::NativeBatchStream>>
+where
+    K: TypedKernel + Send + Sync + 'static,
+    K::Node: Send + Sync + 'static,
+    K::Edge: Send + Sync + 'static,
+    K::State: serde::Serialize + Send,
+{
+    let slot = cache.payload_slot(&kernel)?;
+    let cursor = super::engine::cursor::Cursor::new(run)?;
+    Ok(super::stream::deferred(move || {
+        let payloads = cached_payloads(&slot, &graph, &kernel)?;
+        let store = native::EagerGraphStore::shared(
+            graph,
+            Arc::clone(&payloads.nodes),
+            Arc::clone(&payloads.edges),
+        );
+        Ok(super::stream::managed(TypedStream {
+            store,
+            kernel: TypedKernelAdapter::new(kernel),
+            cursor,
+            update_stats: |_, _| {},
+        }))
+    }))
+}
+
+pub(crate) fn stream_typed_parquet_lazy<K>(
+    graph: Arc<Graph>,
+    paths: ParquetPaths,
+    kernel: K,
+    run: RunOptions,
+) -> Result<Box<dyn super::NativeBatchStream>>
+where
+    K: TypedKernel + Send + Sync + 'static,
+    K::Node: Send + Sync + 'static,
+    K::Edge: Send + Sync + 'static,
+    K::State: serde::Serialize + Send,
+{
+    let cursor = super::engine::cursor::Cursor::new(run)?;
+    Ok(super::stream::deferred(move || {
+        let store = ParquetGraphStore::<K::Node, K::Edge>::from_owner(
+            Owner::Shared(graph),
+            paths,
+            kernel.node_fields(),
+            kernel.edge_fields(),
+        )?;
+        Ok(super::stream::managed(TypedStream {
+            store,
+            kernel: TypedKernelAdapter::new(kernel),
+            cursor,
+            update_stats: |store, stats| {
+                stats.materialized_node_payloads = store.loaded_node_count();
+                stats.materialized_edge_payloads = store.loaded_edge_count();
+                let io = store.io_stats();
+                stats.lazy_payload_read_calls = io.read_calls;
+                stats.lazy_payload_requested_rows = io.requested_rows;
+                stats.lazy_payload_selected_rows = io.selected_rows;
+                stats.lazy_payload_row_groups = io.row_groups;
+            },
+        }))
+    }))
 }

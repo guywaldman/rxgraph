@@ -41,6 +41,7 @@ PUBLIC_API = (
     "Traversal",
     "SearchPath",
     "SearchResult",
+    "SearchStream",
     "build_bidirectional_edges",
     "build_labeled_tables",
     "normalize_table",
@@ -50,6 +51,8 @@ PUBLIC_API = (
 def export_api(namespace: dict[str, Any], native_module: Any) -> None:
     """Export the Python API bound to ``native_module`` into ``namespace``."""
     _rxgraph = native_module
+    _consumes_paths = hasattr(_rxgraph.SearchResult, "_take_paths")
+    _supports_streaming = hasattr(_rxgraph.Graph, "search_kernel_batches")
     module_name = namespace.get("__name__", __name__)
 
     TYPE_COL = "type"
@@ -340,6 +343,57 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             return SearchResult._from_inner(
                 inner, self._id_to_label, self._edge_id_to_label
             )
+
+        def search_batches(
+            self,
+            *,
+            start_nodes: Iterable[Hashable],
+            kernel: str,
+            params: Mapping[str, Any] | None = None,
+            columns: Iterable[str] | None = None,
+            max_depth: int | None = None,
+            max_paths: int | None = None,
+            strategy: str = "dfs",
+            parallel: bool | str = True,
+            intermediate_states: bool = False,
+            progress: bool = False,
+            max_visits_per_node: int = 1,
+            batch_size: int = 1024,
+        ) -> "SearchStream":
+            """Pull batches from a named native kernel. No work runs between pulls.
+
+            Batches contain at most ``batch_size`` paths. Use a context manager
+            or ``close()`` to release an unfinished search. DSL streaming is not
+            supported yet. Typed stores retain their serial execution behavior.
+            """
+            if not _supports_streaming:
+                raise NotImplementedError(
+                    "this native backend does not support streaming; rebuild the plugin"
+                )
+            if (
+                not isinstance(batch_size, int)
+                or isinstance(batch_size, bool)
+                or batch_size <= 0
+            ):
+                raise ValueError("batch_size must be a positive integer")
+            if not isinstance(kernel, str):
+                raise TypeError("search_batches requires a named native kernel")
+            translated_params = self._translate_params(params or {})
+            self._ensure_payload_columns(columns)
+            inner = self._inner.search_kernel_batches(
+                kernel,
+                translated_params,
+                [self.node_id(node) for node in start_nodes],
+                max_depth,
+                max_paths,
+                strategy,
+                _parallel_bool(parallel),
+                intermediate_states,
+                progress,
+                max_visits_per_node,
+                batch_size,
+            )
+            return SearchStream(inner, self._id_to_label, self._edge_id_to_label)
 
         search_paths = search
 
@@ -684,19 +738,83 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             id_to_label: list[Hashable] | None,
             edge_id_to_label: dict[Hashable, Hashable] | None,
         ) -> Self:
+            if not _consumes_paths:
+                return cls(
+                    paths=[
+                        SearchPath._from_inner(path, id_to_label, edge_id_to_label)
+                        for path in inner.paths
+                    ],
+                    stats=inner.stats,
+                )
             return cls(
-                paths=[
-                    SearchPath._from_inner(path, id_to_label, edge_id_to_label)
-                    for path in inner.paths
-                ],
+                paths=_consume_paths(inner, id_to_label, edge_id_to_label),
                 stats=inner.stats,
             )
+
+    def _consume_paths(inner, id_to_label, edge_id_to_label):
+        return _consume_path_rows(inner._take_paths(), id_to_label, edge_id_to_label)
+
+    def _consume_path_rows(rows, id_to_label, edge_id_to_label):
+        return [
+            SearchPath(
+                nodes=_map_search_nodes(nodes, id_to_label),
+                edges=_map_search_edges(edges, edge_id_to_label),
+                state=state,
+                intermediate_states=history,
+            )
+            for nodes, edges, state, history in rows
+        ]
+
+    class SearchStream:
+        """Synchronous batches of native search paths, with cumulative statistics."""
+
+        def __init__(self, inner, id_to_label, edge_id_to_label):
+            self._inner = inner
+            self._id_to_label = id_to_label
+            self._edge_id_to_label = edge_id_to_label
+            self._native_paths = (
+                id_to_label is None
+                and edge_id_to_label is None
+                and hasattr(inner, "_set_path_factory")
+            )
+            if self._native_paths:
+                inner._set_path_factory(SearchPath)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> list[SearchPath]:
+            try:
+                rows = next(self._inner)
+                if self._native_paths:
+                    return rows
+                return _consume_path_rows(
+                    rows, self._id_to_label, self._edge_id_to_label
+                )
+            except BaseException:
+                self.close()
+                raise
+
+        @property
+        def stats(self) -> SearchStats:
+            return self._inner.stats
+
+        def close(self) -> None:
+            self._inner.close()
+            self._id_to_label = None
+            self._edge_id_to_label = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            self.close()
 
     def _map_search_nodes(
         nodes: list[Any], id_to_label: list[Hashable] | None
     ) -> list[Any]:
         if id_to_label is None:
-            return list(nodes)
+            return nodes
         return [id_to_label[node] for node in nodes]
 
     def _map_search_edges(
@@ -704,7 +822,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
         edge_id_to_label: dict[Hashable, Hashable] | None,
     ) -> list[Any]:
         if edge_id_to_label is None:
-            return list(edges)
+            return edges
         return [edge_id_to_label[edge] for edge in edges]
 
     def _parallel_bool(value: bool | str) -> bool:
@@ -761,7 +879,15 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
     def _payload_projection(cols: frozenset[str]) -> list[str]:
         return sorted(cols) or [ID_COL]
 
-    for cls in (Kernel, Graph, DiGraph, Traversal, SearchPath, SearchResult):
+    for cls in (
+        Kernel,
+        Graph,
+        DiGraph,
+        Traversal,
+        SearchPath,
+        SearchResult,
+        SearchStream,
+    ):
         cls.__module__ = module_name
 
     namespace.update(
@@ -786,6 +912,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             "Traversal": Traversal,
             "SearchPath": SearchPath,
             "SearchResult": SearchResult,
+            "SearchStream": SearchStream,
             "build_bidirectional_edges": build_bidirectional_edges,
             "build_labeled_tables": build_labeled_tables,
             "normalize_table": normalize_table,

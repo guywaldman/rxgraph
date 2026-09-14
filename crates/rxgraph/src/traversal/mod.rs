@@ -23,8 +23,11 @@ mod config;
 mod engine;
 mod kernel;
 pub mod native;
+mod ownership;
 mod progress;
 mod registry;
+mod state_encoder;
+mod stream;
 mod typed;
 
 use crate::{dsl::StateRow, graph::GraphId};
@@ -38,6 +41,7 @@ pub use registry::{
     boxed_typed_run, build_kernel, build_typed_kernel, inventory, register_kernel,
     try_build_kernel, try_build_typed_kernel,
 };
+pub use stream::{GraphSearchStream, NativeBatchStream, NativeSearchStream};
 pub use typed::ParquetPaths;
 pub use typed::{
     ArrowList, ArrowRow, ArrowStruct, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel,

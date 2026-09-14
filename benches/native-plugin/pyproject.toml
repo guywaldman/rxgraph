@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.13,<1.14"]
+build-backend = "maturin"
+
+[project]
+name = "rxgraph-native-bench"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.maturin]
+module-name = "rxgraph_native_bench._native"
+python-source = "python"

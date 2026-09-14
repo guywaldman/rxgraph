@@ -161,11 +161,11 @@ impl Graph {
     }
 }
 
-struct GraphSearchAdapter<'g, 'k, K, P, O> {
-    graph: &'g Graph,
-    kernel: &'k K,
-    project: P,
-    output: PhantomData<fn() -> O>,
+pub(crate) struct GraphSearchAdapter<'g, 'k, K, P, O> {
+    pub(crate) graph: &'g Graph,
+    pub(crate) kernel: &'k K,
+    pub(crate) project: P,
+    pub(crate) output: PhantomData<fn() -> O>,
 }
 
 impl<'g, 'k, K, P, O> SearchAdapter for GraphSearchAdapter<'g, 'k, K, P, O>
@@ -193,22 +193,17 @@ where
         Ok(self.graph.repo.outgoing_slice(node).0.len())
     }
 
-    fn for_each_outgoing<F>(&self, node: NodeId, mut visit: F) -> Result<()>
+    fn for_each_range<F>(&self, node: NodeId, start: usize, end: usize, mut visit: F) -> Result<()>
     where
         F: FnMut(EdgeId, NodeId) -> Result<bool>,
     {
         let (edges, dests) = self.graph.repo.outgoing_slice(node);
-        for (&edge, &dest) in edges.iter().zip(dests) {
+        for (&edge, &dest) in edges[start..end].iter().zip(&dests[start..end]) {
             if !visit(edge, dest)? {
                 break;
             }
         }
         Ok(())
-    }
-
-    fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)> {
-        let (edges, dests) = self.graph.repo.outgoing_slice(node);
-        Ok((edges[index], dests[index]))
     }
 
     fn make_cache(&self) -> Self::Cache {

@@ -1,0 +1,18 @@
+[package]
+name = "rxgraph-native-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[workspace]
+
+[dependencies]
+anyhow = "~1.0.102"
+pyo3 = { version = "~0.28.3", features = ["extension-module"] }
+rxgraph = { path = "../../crates/rxgraph", features = ["python"] }
+serde = { version = "~1.0.228", features = ["derive"] }
+serde_json = "~1.0.150"

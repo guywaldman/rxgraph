@@ -12,7 +12,9 @@ use pyo3::{
 };
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
-use std::{path::PathBuf, thread};
+use std::{path::PathBuf, sync::Arc, thread};
+mod stream;
+use stream::PySearchStream;
 
 /// Registers all rxgraph native classes and functions into a Python module.
 ///
@@ -26,6 +28,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyKernel>()?;
     m.add_class::<PyTraversal>()?;
     m.add_class::<PySearchResult>()?;
+    m.add_class::<PySearchStream>()?;
     m.add_class::<PySearchStats>()?;
     m.add_class::<PySearchPath>()?;
     m.add_function(wrap_pyfunction!(rayon_thread_count, m)?)?;
@@ -104,7 +107,7 @@ fn rayon_thread_count() -> usize {
 
 #[pyclass(name = "Graph", unsendable)]
 struct PyGraph {
-    inner: Graph,
+    inner: Arc<Graph>,
     parquet: Option<PyParquetPayloads>,
     typed_cache: TypedPayloadCache,
 }
@@ -127,8 +130,10 @@ impl PyGraph {
     #[pyo3(signature = (nodes, edges))]
     fn new(nodes: PyTable, edges: PyTable) -> PyResult<Self> {
         Ok(Self {
-            inner: Graph::new(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
-                .map_err(to_py_value_err)?,
+            inner: Arc::new(
+                Graph::new(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
+                    .map_err(to_py_value_err)?,
+            ),
             parquet: None,
             typed_cache: TypedPayloadCache::default(),
         })
@@ -152,7 +157,7 @@ impl PyGraph {
         }
         .map_err(to_py_value_err)?;
         Ok(Self {
-            inner,
+            inner: Arc::new(inner),
             parquet: Some(PyParquetPayloads { paths, mode }),
             typed_cache: TypedPayloadCache::default(),
         })
@@ -254,6 +259,70 @@ impl PyGraph {
         Err(PyValueError::new_err(format!(
             "unknown kernel {name:?}; no legacy or typed native kernel is registered with that name"
         )))
+    }
+
+    #[pyo3(signature = (name, params, start_nodes, max_depth=None, max_paths=None, strategy="dfs", parallel=true, intermediate_states=false, progress=false, max_visits_per_node=1, batch_size=1024))]
+    #[allow(clippy::too_many_arguments)]
+    fn search_kernel_batches(
+        &self,
+        name: &str,
+        params: &Bound<'_, PyAny>,
+        start_nodes: Vec<PyGraphId>,
+        max_depth: Option<usize>,
+        max_paths: Option<usize>,
+        strategy: &str,
+        parallel: bool,
+        intermediate_states: bool,
+        progress: bool,
+        max_visits_per_node: usize,
+        batch_size: usize,
+    ) -> PyResult<PySearchStream> {
+        if batch_size == 0 {
+            return Err(PyValueError::new_err("batch_size must be at least 1"));
+        }
+        if max_visits_per_node == 0 {
+            return Err(PyValueError::new_err(
+                "max_visits_per_node must be at least 1",
+            ));
+        }
+        let params = py_dict_to_json(params)?;
+        let run = RunOptions {
+            start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
+            max_depth,
+            max_paths,
+            strategy: parse_strategy(strategy)?,
+            parallel,
+            intermediate_states,
+            progress,
+            max_visits_per_node,
+        };
+        let graph = Arc::clone(&self.inner);
+        let inner = if let Some(kernel) =
+            try_build_typed_kernel(name, &params).map_err(to_py_value_err)?
+        {
+            if let Some(parquet) = &self.parquet
+                && matches!(parquet.mode, PayloadMode::Lazy)
+            {
+                kernel.stream_parquet_lazy(graph, parquet.paths.clone(), run)
+            } else {
+                kernel.stream_eager_cached(graph, &self.typed_cache, run)
+            }
+        } else if self.parquet.is_some() {
+            return Err(PyValueError::new_err(format!(
+                "file-backed graph search requires a typed native kernel; {name:?} is not registered as typed"
+            )));
+        } else if let Some(kernel) = try_build_kernel(name, &params).map_err(to_py_value_err)? {
+            kernel.stream(graph, run)
+        } else {
+            return Err(PyValueError::new_err(format!("unknown kernel {name:?}")));
+        }
+        .map_err(to_py_runtime_err)?;
+        Ok(PySearchStream {
+            inner: Some(inner),
+            batch_size,
+            stats: SearchStats::default(),
+            path_factory: None,
+        })
     }
 
     #[pyo3(signature = (start, max_depth = None))]
@@ -376,7 +445,10 @@ impl PyGraph {
     /// and we want to lazily pull their payloads to reduce memory strain.
     /// Each table must have one row per node/edge in internal-ID order.
     fn set_payloads(&mut self, nodes: PyTable, edges: PyTable) -> PyResult<()> {
-        self.inner
+        Arc::get_mut(&mut self.inner)
+            .ok_or_else(|| {
+                PyRuntimeError::new_err("cannot replace payloads while a search stream is open")
+            })?
             .set_payloads(one_batch(nodes, "nodes")?, one_batch(edges, "edges")?)
             .map_err(to_py_value_err)?;
         self.typed_cache = TypedPayloadCache::default();
@@ -512,6 +584,26 @@ struct PySearchResult {
     stats: PySearchStats,
 }
 
+#[pymethods]
+impl PySearchResult {
+    /// Consume the binding representation once at the high-level Python boundary.
+    fn _take_paths(&mut self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        std::mem::take(&mut self.paths)
+            .into_iter()
+            .map(|path| {
+                let nodes = owned_ids_into_py(py, path.nodes)?;
+                let edges = owned_ids_into_py(py, path.edges)?;
+                let state = state_to_py(py, path.state)?;
+                let history = path
+                    .intermediate_states
+                    .map(|states| states_to_py(py, states))
+                    .transpose()?;
+                (nodes, edges, state, history).into_py_any(py)
+            })
+            .collect()
+    }
+}
+
 impl PySearchResult {
     fn from_result(py: Python<'_>, result: SearchResult<'_>) -> PyResult<Self> {
         Ok(Self {
@@ -534,6 +626,29 @@ impl PySearchResult {
             stats: result.stats.into(),
         })
     }
+}
+
+pub(super) fn owned_paths_into_py(
+    py: Python<'_>,
+    paths: Vec<crate::OwnedGraphPath>,
+    path_factory: Option<&Py<PyAny>>,
+) -> PyResult<Vec<Py<PyAny>>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let nodes = owned_ids_into_py(py, path.nodes)?;
+            let edges = owned_ids_into_py(py, path.edges)?;
+            let state = state_to_py(py, path.state)?;
+            let history = path
+                .intermediate_states
+                .map(|states| states_to_py(py, states))
+                .transpose()?;
+            match path_factory {
+                Some(factory) => factory.call1(py, (nodes, edges, state, history)),
+                None => (nodes, edges, state, history).into_py_any(py),
+            }
+        })
+        .collect()
 }
 
 #[pyclass(name = "SearchStats", frozen, skip_from_py_object)]
@@ -682,6 +797,16 @@ fn ids_to_py(py: Python<'_>, ids: Vec<GraphId<'_>>) -> PyResult<Py<PyAny>> {
             .collect::<Vec<_>>()
             .into_py_any(py)
     }
+}
+
+fn owned_ids_into_py(py: Python<'_>, ids: Vec<OwnedGraphId>) -> PyResult<Py<PyAny>> {
+    ids.into_iter()
+        .map(|id| match id {
+            OwnedGraphId::U64(n) => n.into_py_any(py),
+            OwnedGraphId::Str(s) => s.into_py_any(py),
+        })
+        .collect::<PyResult<Vec<_>>>()?
+        .into_py_any(py)
 }
 
 fn owned_ids_to_py(py: Python<'_>, ids: &[OwnedGraphId]) -> PyResult<Py<PyAny>> {

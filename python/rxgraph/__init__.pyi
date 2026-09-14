@@ -103,6 +103,22 @@ class Graph:
         native kernels and do not need ``columns``.
         """
         ...
+    def search_batches(
+        self,
+        *,
+        start_nodes: Iterable[Hashable],
+        kernel: str,
+        params: Mapping[str, Any] | None = None,
+        columns: Iterable[str] | None = None,
+        max_depth: int | None = None,
+        max_paths: int | None = None,
+        strategy: Literal["dfs", "bfs"] = "dfs",
+        parallel: bool | Literal["auto", "off", "on"] = True,
+        intermediate_states: bool = False,
+        progress: bool = False,
+        max_visits_per_node: int = 1,
+        batch_size: int = 1024,
+    ) -> SearchStream: ...
     def search_paths(
         self,
         *,
@@ -276,3 +292,13 @@ class SearchResult:
 
     paths: list[SearchPath]
     stats: SearchStats
+
+class SearchStream:
+    """Native path batches; use close() or a context manager for early termination."""
+    def __iter__(self) -> SearchStream: ...
+    def __next__(self) -> list[SearchPath]: ...
+    @property
+    def stats(self) -> SearchStats: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> SearchStream: ...
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None: ...

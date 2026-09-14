@@ -5,7 +5,8 @@
 //! payload rows lazily, then want traversal kernels to operate on Rust structs
 //! instead of Arrow-backed [`Value`](crate::Value) rows.
 
-use std::sync::OnceLock;
+use super::ownership::Owner;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -39,6 +40,11 @@ pub trait GraphStore {
 
     /// External edge ID for materialized paths, if the backend exposes one.
     fn external_edge(&self, internal: EdgeId) -> Result<Option<GraphId<'_>>>;
+
+    /// Dense internal ID count, when IDs cover `0..count`.
+    fn dense_node_count(&self) -> Option<usize> {
+        None
+    }
 
     /// Outgoing topology for `src`.
     fn outgoing(&self, src: NodeId) -> Result<&[OutgoingEdge]>;
@@ -244,9 +250,9 @@ pub struct FirstResult<'a, N, E, S> {
 /// This is a compatibility/testing adapter. The underlying `Graph` already owns
 /// full topology, and the supplied payload slices are already materialized.
 pub struct EagerGraphStore<'a, N, E> {
-    graph: &'a Graph,
-    nodes: &'a [N],
-    edges: &'a [E],
+    graph: Owner<'a, Graph>,
+    nodes: Owner<'a, [N]>,
+    edges: Owner<'a, [E]>,
     outgoing: Vec<OnceLock<Vec<OutgoingEdge>>>,
 }
 
@@ -269,17 +275,33 @@ impl<'a, N, E> EagerGraphStore<'a, N, E> {
         }
 
         Ok(Self {
-            graph,
-            nodes,
-            edges,
+            graph: Owner::Borrowed(graph),
+            nodes: Owner::Borrowed(nodes),
+            edges: Owner::Borrowed(edges),
             outgoing: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
         })
+    }
+}
+
+impl<N: 'static, E: 'static> EagerGraphStore<'static, N, E> {
+    pub(crate) fn shared(graph: Arc<Graph>, nodes: Arc<[N]>, edges: Arc<[E]>) -> Self {
+        let outgoing = (0..graph.node_count()).map(|_| OnceLock::new()).collect();
+        Self {
+            graph: Owner::Shared(graph),
+            nodes: Owner::Shared(nodes),
+            edges: Owner::Shared(edges),
+            outgoing,
+        }
     }
 }
 
 impl<N, E> GraphStore for EagerGraphStore<'_, N, E> {
     type Node = N;
     type Edge = E;
+
+    fn dense_node_count(&self) -> Option<usize> {
+        Some(self.graph.node_count())
+    }
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
         Ok(self.graph.repo.internal_node(external))
@@ -336,12 +358,27 @@ where
     let adapter = NativeSearchAdapter {
         store,
         kernel: &kernel,
+        materialize: materialize_native::<G, K::State>,
     };
     let result = engine::search_serial(&adapter, run)?;
     Ok(SearchResult {
         paths: result.paths,
         stats: result.stats,
     })
+}
+
+/// Starts a serial native-store stream without evaluating any edges.
+pub fn search_batches<K, G>(
+    store: &G,
+    kernel: K,
+    run: RunOptions,
+    batch_size: usize,
+) -> Result<super::NativeSearchStream<'_, K, G>>
+where
+    K: Kernel,
+    G: GraphStore<Node = K::Node, Edge = K::Edge>,
+{
+    super::NativeSearchStream::new(store, kernel, run, batch_size)
 }
 
 /// Explicit path-enumeration entrypoint for a native store.
@@ -377,20 +414,22 @@ where
     })
 }
 
-struct NativeSearchAdapter<'store, 'kernel, G, K> {
-    store: &'store G,
-    kernel: &'kernel K,
+pub(crate) struct NativeSearchAdapter<'store, 'kernel, G, K, F> {
+    pub(crate) store: &'store G,
+    pub(crate) kernel: &'kernel K,
+    pub(crate) materialize: F,
 }
 
-impl<'store, 'kernel, G, K> SearchAdapter for NativeSearchAdapter<'store, 'kernel, G, K>
+impl<'store, 'kernel, G, K, F, P> SearchAdapter for NativeSearchAdapter<'store, 'kernel, G, K, F>
 where
     K: Kernel,
     G: GraphStore<Node = K::Node, Edge = K::Edge>,
     K::Node: 'store,
     K::Edge: 'store,
+    F: Fn(&'store G, &[PathEntry<K::State>], usize, bool) -> Result<P>,
 {
     type State = K::State;
-    type Path = Path<'store, K::Node, K::Edge, K::State>;
+    type Path = P;
     type Cache = ();
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
@@ -407,30 +446,24 @@ where
         self.store.prefetch_outgoing(nodes)
     }
 
+    fn dense_node_count(&self) -> Option<usize> {
+        self.store.dense_node_count()
+    }
+
     fn out_degree(&self, node: NodeId) -> Result<usize> {
-        self.store.prefetch_outgoing(&[node])?;
         Ok(self.store.outgoing(node)?.len())
     }
 
-    fn for_each_outgoing<F>(&self, node: NodeId, mut visit: F) -> Result<()>
+    fn for_each_range<V>(&self, node: NodeId, start: usize, end: usize, mut visit: V) -> Result<()>
     where
-        F: FnMut(EdgeId, NodeId) -> Result<bool>,
+        V: FnMut(EdgeId, NodeId) -> Result<bool>,
     {
-        for &OutgoingEdge { edge, dest } in self.store.outgoing(node)? {
+        for &OutgoingEdge { edge, dest } in &self.store.outgoing(node)?[start..end] {
             if !visit(edge, dest)? {
                 break;
             }
         }
         Ok(())
-    }
-
-    fn outgoing_at(&self, node: NodeId, index: usize) -> Result<(EdgeId, NodeId)> {
-        let edge = self
-            .store
-            .outgoing(node)?
-            .get(index)
-            .with_context(|| format!("outgoing edge {index} for node {node} is missing"))?;
-        Ok((edge.edge, edge.dest))
     }
 
     fn make_cache(&self) -> Self::Cache {}
@@ -455,67 +488,76 @@ where
     fn materialize(
         &self,
         arena: &[PathEntry<Self::State>],
-        mut path: usize,
+        path: usize,
         intermediate_states: bool,
     ) -> Result<Self::Path> {
-        let final_state = arena[path].state.clone();
-        let mut node_ids = Vec::with_capacity(arena[path].depth + 1);
-        let mut edge_ids = Vec::with_capacity(arena[path].depth);
-        let mut states = intermediate_states.then(|| Vec::with_capacity(node_ids.capacity()));
-
-        loop {
-            node_ids.push(arena[path].node);
-            if let Some(edge) = arena[path].incoming_edge {
-                edge_ids.push(edge);
-            }
-            if let Some(states) = &mut states {
-                states.push(arena[path].state.clone());
-            }
-            match arena[path].parent {
-                Some(parent) => path = parent,
-                None => break,
-            }
-        }
-
-        node_ids.reverse();
-        edge_ids.reverse();
-        if let Some(states) = &mut states {
-            states.reverse();
-        }
-
-        let mut state_iter = states.map(Vec::into_iter);
-        let nodes = node_ids
-            .into_iter()
-            .map(|id| {
-                Ok(PathNode {
-                    id,
-                    external_id: self.store.external_node(id)?,
-                    payload: self.store.node(id)?,
-                    state: state_iter.as_mut().map(|states| {
-                        states
-                            .next()
-                            .expect("intermediate state count must match node count")
-                    }),
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let edges = edge_ids
-            .into_iter()
-            .map(|id| {
-                Ok(PathEdge {
-                    id,
-                    external_id: self.store.external_edge(id)?,
-                    payload: self.store.edge(id)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Ok(Path {
-            nodes,
-            edges,
-            state: final_state,
-        })
+        (self.materialize)(self.store, arena, path, intermediate_states)
     }
+}
+
+pub(crate) fn materialize_native<'store, G: GraphStore, S: Clone>(
+    store: &'store G,
+    arena: &[PathEntry<S>],
+    mut path: usize,
+    intermediate_states: bool,
+) -> Result<Path<'store, G::Node, G::Edge, S>> {
+    let final_state = arena[path].state.clone();
+    let mut node_ids = Vec::with_capacity(arena[path].depth + 1);
+    let mut edge_ids = Vec::with_capacity(arena[path].depth);
+    let mut states = intermediate_states.then(|| Vec::with_capacity(node_ids.capacity()));
+
+    loop {
+        node_ids.push(arena[path].node);
+        if let Some(edge) = arena[path].incoming_edge {
+            edge_ids.push(edge);
+        }
+        if let Some(states) = &mut states {
+            states.push(arena[path].state.clone());
+        }
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+
+    node_ids.reverse();
+    edge_ids.reverse();
+    if let Some(states) = &mut states {
+        states.reverse();
+    }
+
+    let mut state_iter = states.map(Vec::into_iter);
+    let nodes = node_ids
+        .into_iter()
+        .map(|id| {
+            Ok(PathNode {
+                id,
+                external_id: store.external_node(id)?,
+                payload: store.node(id)?,
+                state: state_iter.as_mut().map(|states| {
+                    states
+                        .next()
+                        .expect("intermediate state count must match node count")
+                }),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edges = edge_ids
+        .into_iter()
+        .map(|id| {
+            Ok(PathEdge {
+                id,
+                external_id: store.external_edge(id)?,
+                payload: store.edge(id)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Path {
+        nodes,
+        edges,
+        state: final_state,
+    })
 }
 
 #[cfg(test)]
