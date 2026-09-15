@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/guywaldman/rxgraph/compare/v0.11.0...v0.12.0) (2026-09-15)
+
+
+### Features
+
+* Add native search streaming and optimize traversal storage ([32083fe](https://github.com/guywaldman/rxgraph/commit/32083fe87e701d45e9a15704f69d830eef9a4a1f))
+
 ## [0.11.0](https://github.com/guywaldman/rxgraph/compare/v0.10.0...v0.11.0) (2026-07-10)
 
 
