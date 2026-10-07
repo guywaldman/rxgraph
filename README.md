@@ -34,7 +34,12 @@ pip install rxgraph polars
 
 > [!NOTE]
 >
-> Requires Python 3.11+ and currently depends on Polars for expression input.
+> Requires Python 3.11+ and supports Polars 1.x (1.40.1+) and 2.x.
+
+The same rxgraph wheel and Rust search-kernel plugins work with either Polars
+major version: tables cross the Python/Rust boundary through Arrow, without a
+dependency on the Polars Rust ABI. LazyFrame topology and payload projections
+use the in-memory engine to keep their row positions aligned.
 
 ## Quick Start
 

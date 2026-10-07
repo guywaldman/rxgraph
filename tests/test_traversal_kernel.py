@@ -187,6 +187,45 @@ def test_search_supports_native_list_operations() -> None:
     assert state["filtered"] == [31]
 
 
+@pytest.mark.parametrize("values", [[3, 1, 3, None], [], None])
+def test_search_list_series_operations(values) -> None:
+    nodes = pl.DataFrame(
+        {"id": [0, 1], "values": [[], values]},
+        schema={"id": pl.UInt64, "values": pl.List(pl.Int64)},
+    )
+    edges = pl.DataFrame(
+        {"id": [0], "src": [0], "dest": [1]},
+        schema={"id": pl.UInt64, "src": pl.UInt64, "dest": pl.UInt64},
+    )
+    column = pl.col("dest.values")
+    expressions = {
+        "reverse": column.list.reverse(),
+        "unique": column.list.unique(maintain_order=True),
+        "n_unique": column.list.n_unique(),
+    }
+    result = rxg.Graph(nodes, edges).search(
+        start_nodes=[0], next_state=expressions, max_paths=1, parallel=False
+    )
+    expected = nodes.rename({"values": "dest.values"}).select(
+        expr.alias(name) for name, expr in expressions.items()
+    )
+    assert result.paths[0].state == expected.row(1, named=True)
+
+
+def test_search_list_eval_preserves_nested_list_operations() -> None:
+    graph = rxg.Graph.from_edges(
+        [("a", "b")], nodes=[("b", {"values": [[1, 2], [], [3, 4]]})]
+    )
+    result = graph.search(
+        start_nodes=["a"],
+        next_state={
+            "reverse": pl.col("dest.values").list.eval(pl.element().list.reverse())
+        },
+        max_paths=1,
+    )
+    assert result.paths[0].state == {"reverse": [[2, 1], [], [4, 3]]}
+
+
 def test_search_supports_native_struct_operations() -> None:
     nodes = (
         pl.DataFrame(

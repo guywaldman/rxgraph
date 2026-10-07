@@ -27,6 +27,36 @@ jobs:
       - name: Run CI checks
         run: just ci
 
+  polars-compatibility:
+    name: "Polars 1.x / 2.x compatibility"
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RXGRAPH_REQUIRE_KERNEL_PLUGIN_EXAMPLE: "1"
+      RXGRAPH_REQUIRE_NATIVE_BENCH_PLUGIN: "1"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: astral-sh/setup-uv@v7
+      - name: Install development tools
+        run: uv sync --locked --group dev --no-install-project
+      - name: Build rxgraph and Rust kernel plugin wheels once
+        run: |
+          .venv/bin/maturin build --release --locked --interpreter .venv/bin/python --out dist/polars-compat
+          .venv/bin/maturin build --release --manifest-path examples/rust-kernel-plugin/Cargo.toml --interpreter .venv/bin/python --out dist/polars-compat
+          .venv/bin/maturin build --release --locked --manifest-path benches/native-plugin/Cargo.toml --interpreter .venv/bin/python --out dist/polars-compat
+          uv pip install --python .venv/bin/python --no-deps dist/polars-compat/*.whl
+      - name: Test the same wheels with both Polars majors
+        run: |
+          for version in '1.40.1' '1.*' '2.*'; do
+            uv pip install --python .venv/bin/python "polars==$version"
+            .venv/bin/python -c 'import polars; print("Testing Polars", polars.__version__)'
+            .venv/bin/python -m pytest -q
+          done
+
   prek:
     name: Prek
     runs-on: ubuntu-latest

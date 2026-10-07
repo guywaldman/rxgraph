@@ -354,6 +354,21 @@ fn parse_eval(value: &Json) -> Result<Expr<ColumnRef>> {
             if let Some(filter) = evaluation.get("Filter") {
                 return parse_filter_with_list(list, filter);
             }
+            // Newer Polars represents list.reverse/unique as operations on the whole
+            // element series inside Eval, rather than as ListExpr functions.
+            if evaluation.pointer("/Function/input") == Some(&serde_json::json!(["Element"])) {
+                let function = &evaluation["Function"]["function"];
+                let op = if function.as_str() == Some("Reverse") {
+                    Some(ListOp::Reverse)
+                } else if function.get("Unique").and_then(Json::as_bool).is_some() {
+                    Some(ListOp::Unique)
+                } else {
+                    None
+                };
+                if let Some(op) = op {
+                    return Ok(Expr::List(op, vec![list]));
+                }
+            }
             Ok(Expr::List(
                 ListOp::Eval,
                 vec![list, parse_expr(evaluation)?],
@@ -420,6 +435,9 @@ fn parse_filter_with_list(list: Expr<ColumnRef>, value: &Json) -> Result<Expr<Co
 }
 
 fn list_agg_op(value: &Json) -> Result<ListOp> {
+    if value.pointer("/Agg/NUnique").and_then(Json::as_str) == Some("Element") {
+        return Ok(ListOp::NUnique);
+    }
     let function = value
         .get("Function")
         .and_then(Json::as_object)
