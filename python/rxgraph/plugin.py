@@ -20,6 +20,12 @@ from ._graph_tables import (
 )
 
 
+def _collect_stable(frame: pl.LazyFrame) -> pl.DataFrame:
+    # Topology and payloads are collected separately and aligned by row position.
+    # Polars 2's default streaming engine can reorder otherwise identical queries.
+    return frame.collect(engine="in-memory")
+
+
 PUBLIC_API = (
     "DEST_COL",
     "ID_COL",
@@ -166,8 +172,8 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             graph = cls.__new__(cls)
             Graph.__init__(
                 graph,
-                nodes.select(node_topo).collect(),
-                edges.select(edge_topo).collect(),
+                _collect_stable(nodes.select(node_topo)),
+                _collect_stable(edges.select(edge_topo)),
             )
             graph._lazy_nodes = nodes
             graph._lazy_edges = edges
@@ -532,8 +538,12 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             ):
                 return
 
-            nodes = self._lazy_nodes.select(_payload_projection(node_cols)).collect()
-            edges = self._lazy_edges.select(_payload_projection(edge_cols)).collect()
+            nodes = _collect_stable(
+                self._lazy_nodes.select(_payload_projection(node_cols))
+            )
+            edges = _collect_stable(
+                self._lazy_edges.select(_payload_projection(edge_cols))
+            )
             self._inner.set_payloads(nodes, edges)
             self._loaded_node_cols = node_cols
             self._loaded_edge_cols = edge_cols
@@ -556,8 +566,12 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             ):
                 return
 
-            nodes = self._lazy_nodes.select(_payload_projection(node_cols)).collect()
-            edges = self._lazy_edges.select(_payload_projection(edge_cols)).collect()
+            nodes = _collect_stable(
+                self._lazy_nodes.select(_payload_projection(node_cols))
+            )
+            edges = _collect_stable(
+                self._lazy_edges.select(_payload_projection(edge_cols))
+            )
             self._inner.set_payloads(nodes, edges)
             self._loaded_node_cols = node_cols
             self._loaded_edge_cols = edge_cols
