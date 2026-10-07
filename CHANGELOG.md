@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/guywaldman/rxgraph/compare/v0.12.0...v0.12.1) (2026-10-07)
+
+
+### Bug Fixes
+
+* support Polars 1.40.1 and 2.x ([#38](https://github.com/guywaldman/rxgraph/issues/38)) ([d51a891](https://github.com/guywaldman/rxgraph/commit/d51a891bb7702937ad8fe973865fc700e37ef5e5))
+
 ## [0.12.0](https://github.com/guywaldman/rxgraph/compare/v0.11.0...v0.12.0) (2026-09-15)
 
 
