@@ -161,6 +161,73 @@ impl Graph {
         self.bfs_u64(start, None)
     }
 
+    /// Nodes that can reach any target, in multi-source BFS order.
+    ///
+    /// Targets are excluded, even when reachable through a cycle. Duplicate
+    /// targets are ignored; missing targets return an error. Uses the cached
+    /// incoming CSR without constructing a reversed graph.
+    pub fn ancestors_many(&self, targets: &[GraphId<'_>]) -> Result<Vec<GraphId<'_>>> {
+        let targets = targets
+            .iter()
+            .map(|&target| self.required_internal_node(target))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .walk_many(targets, true)
+            .into_iter()
+            .map(|node| self.external_node(node))
+            .collect())
+    }
+
+    /// Integer-ID variant of [`Self::ancestors_many`].
+    ///
+    /// Returns `Ok(None)` for string-ID graphs or if any target is missing.
+    pub fn ancestors_many_u64(&self, targets: &[u64]) -> Result<Option<Vec<u64>>> {
+        if !self.repo.has_u64_ids() {
+            return Ok(None);
+        }
+        let Some(targets) = targets
+            .iter()
+            .map(|&target| self.repo.internal_node_u64(target))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        self.materialize_nodes_u64(self.walk_many(targets, true))
+    }
+
+    /// Nodes reachable from any source, in multi-source BFS order.
+    ///
+    /// Sources are excluded, even when reachable through a cycle. Duplicate
+    /// sources are ignored; missing sources return an error. Uses outgoing CSR.
+    pub fn descendants_many(&self, sources: &[GraphId<'_>]) -> Result<Vec<GraphId<'_>>> {
+        let sources = sources
+            .iter()
+            .map(|&source| self.required_internal_node(source))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .walk_many(sources, false)
+            .into_iter()
+            .map(|node| self.external_node(node))
+            .collect())
+    }
+
+    /// Integer-ID variant of [`Self::descendants_many`].
+    ///
+    /// Returns `Ok(None)` for string-ID graphs or if any source is missing.
+    pub fn descendants_many_u64(&self, sources: &[u64]) -> Result<Option<Vec<u64>>> {
+        if !self.repo.has_u64_ids() {
+            return Ok(None);
+        }
+        let Some(sources) = sources
+            .iter()
+            .map(|&source| self.repo.internal_node_u64(source))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        self.materialize_nodes_u64(self.walk_many(sources, false))
+    }
+
     /// Shortest unweighted directed path between two external node IDs.
     pub fn shortest_path(
         &self,
@@ -564,6 +631,42 @@ impl Graph {
         frontier
     }
 
+    fn walk_many(&self, seeds: Vec<NodeId>, incoming: bool) -> Vec<NodeId> {
+        if seeds.is_empty() {
+            return Vec::new();
+        }
+        let mut visited = vec![false; self.node_count()];
+        let mut frontier = Vec::new();
+        for seed in seeds {
+            if !visited[seed as usize] {
+                visited[seed as usize] = true;
+                frontier.push(seed);
+            }
+        }
+        let seed_count = frontier.len();
+        let mut head = 0;
+        while let Some(&node) = frontier.get(head) {
+            head += 1;
+            let mut visit = |neighbor: NodeId| {
+                if !visited[neighbor as usize] {
+                    visited[neighbor as usize] = true;
+                    frontier.push(neighbor);
+                }
+            };
+            if incoming {
+                for source in self.repo.incoming(node) {
+                    visit(source);
+                }
+            } else {
+                for &dest in self.repo.outgoing_slice(node).1 {
+                    visit(dest);
+                }
+            }
+        }
+        frontier.drain(..seed_count);
+        frontier
+    }
+
     fn walk_depth_first(&self, start: NodeId, max_depth: Option<usize>) -> Vec<NodeId> {
         let mut visited = vec![0u8; self.node_count()];
         let mut order = Vec::new();
@@ -698,6 +801,79 @@ mod tests {
             graph.bfs_many_u64([0, 2, 99], Some(1)).unwrap().unwrap(),
             vec![Some(vec![0, 1]), Some(vec![2, 3]), None]
         );
+    }
+
+    #[test]
+    fn multi_source_reachability_uses_bfs_and_excludes_seeds() {
+        let nodes = record_batch!((ID_COL, UInt64, [10, 20, 30, 40, 50, 60, 70])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, UInt64, [1, 2, 3, 4, 5, 6, 7, 8]),
+            (EDGE_SRC_COL, UInt64, [10, 10, 10, 20, 30, 40, 40, 60]),
+            (EDGE_DEST_COL, UInt64, [20, 20, 30, 40, 40, 20, 40, 70])
+        )
+        .unwrap();
+        let graph = Graph::new(nodes, edges).unwrap();
+
+        for (seeds, ancestors, descendants) in [
+            (vec![40, 70, 40], vec![20, 30, 60, 10], vec![20]),
+            (vec![10, 30, 10], vec![], vec![20, 40]),
+            (vec![20], vec![10, 40, 30], vec![40]),
+            (vec![50], vec![], vec![]),
+            (vec![], vec![], vec![]),
+        ] {
+            let ids: Vec<_> = seeds.iter().copied().map(GraphId::U64).collect();
+            assert_eq!(
+                graph.ancestors_many_u64(&seeds).unwrap(),
+                Some(ancestors.clone())
+            );
+            assert_eq!(
+                graph.descendants_many_u64(&seeds).unwrap(),
+                Some(descendants.clone())
+            );
+            assert_eq!(
+                graph.ancestors_many(&ids).unwrap(),
+                ancestors.into_iter().map(GraphId::U64).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                graph.descendants_many(&ids).unwrap(),
+                descendants
+                    .into_iter()
+                    .map(GraphId::U64)
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(graph.ancestors_many_u64(&[40, 99]).unwrap(), None);
+        assert_eq!(graph.descendants_many_u64(&[10, 99]).unwrap(), None);
+        assert!(graph.ancestors_many(&[GraphId::U64(99)]).is_err());
+        assert!(graph.descendants_many(&[GraphId::U64(99)]).is_err());
+    }
+
+    #[test]
+    fn multi_source_reachability_supports_string_ids() {
+        let nodes = record_batch!((ID_COL, Utf8, ["a", "b", "c", "d"])).unwrap();
+        let edges = record_batch!(
+            (ID_COL, Utf8, ["ab", "bc", "cd"]),
+            (EDGE_SRC_COL, Utf8, ["a", "b", "c"]),
+            (EDGE_DEST_COL, Utf8, ["b", "c", "d"])
+        )
+        .unwrap();
+        let graph = Graph::new(nodes, edges).unwrap();
+        assert_eq!(
+            graph
+                .ancestors_many(&[GraphId::Str("c"), GraphId::Str("d")])
+                .unwrap(),
+            vec![GraphId::Str("b"), GraphId::Str("a")]
+        );
+        assert_eq!(
+            graph
+                .descendants_many(&[GraphId::Str("b"), GraphId::Str("a")])
+                .unwrap(),
+            vec![GraphId::Str("c"), GraphId::Str("d")]
+        );
+        assert_eq!(graph.ancestors_many_u64(&[]).unwrap(), None);
+        assert_eq!(graph.descendants_many_u64(&[]).unwrap(), None);
+        assert!(graph.ancestors_many(&[GraphId::Str("missing")]).is_err());
+        assert!(graph.descendants_many(&[GraphId::Str("missing")]).is_err());
     }
 
     fn small_graph() -> Graph {
