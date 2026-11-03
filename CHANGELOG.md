@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/guywaldman/rxgraph/compare/v0.12.1...v0.13.0) (2026-11-03)
+
+
+### Features
+
+* add multi-source ancestors and descendants queries ([#40](https://github.com/guywaldman/rxgraph/issues/40)) ([fb3813e](https://github.com/guywaldman/rxgraph/commit/fb3813ebfd7521af9741f50315d0f8e232c17d14))
+
 ## [0.12.1](https://github.com/guywaldman/rxgraph/compare/v0.12.0...v0.12.1) (2026-10-07)
 
 
