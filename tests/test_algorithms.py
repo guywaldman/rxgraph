@@ -32,6 +32,52 @@ def test_shortest_path() -> None:
     assert g.shortest_path(10, 10) == [10]
 
 
+def test_multi_source_reachability() -> None:
+    g = graph()
+    assert g.ancestors_many([40, 30, 40]) == [20, 10]
+    assert g.descendants_many(iter([20, 10, 20])) == [40, 30]
+    assert g.ancestors_many([50]) == []
+    assert g.descendants_many([50]) == []
+    assert g.ancestors_many([]) == []
+    assert g.descendants_many([]) == []
+    for method in (g.ancestors_many, g.descendants_many):
+        with pytest.raises(ValueError, match="node id 99"):
+            method([10, 99])
+
+
+@pytest.mark.parametrize("labeled", [False, True])
+def test_multi_source_reachability_with_cycles_and_labels(labeled: bool) -> None:
+    edges = [
+        ("a", "b"),
+        ("a", "b"),
+        ("a", "c"),
+        ("b", "d"),
+        ("c", "d"),
+        ("d", "b"),
+        ("d", "d"),
+    ]
+    if labeled:
+        g = rxg.Graph.from_edges(edges, nodes=["isolated"])
+    else:
+        nodes = pl.DataFrame({"id": ["a", "b", "c", "d", "isolated"]})
+        edge_table = pl.DataFrame(
+            {
+                "id": [str(i) for i in range(len(edges))],
+                "src": [src for src, _ in edges],
+                "dest": [dest for _, dest in edges],
+            }
+        )
+        g = rxg.Graph(nodes, edge_table)
+    assert g.ancestors_many(["d", "c", "d"]) == ["b", "a"]
+    assert g.descendants_many(["a", "c", "a"]) == ["b", "d"]
+    assert g.ancestors_many(["b"]) == ["a", "d", "c"]
+    assert g.descendants_many(["b"]) == ["d"]
+    assert g.ancestors_many(["isolated"]) == []
+    assert g.descendants_many(["isolated"]) == []
+    assert g.ancestors_many([]) == []
+    assert g.descendants_many([]) == []
+
+
 def test_degrees_and_components() -> None:
     g = graph()
 

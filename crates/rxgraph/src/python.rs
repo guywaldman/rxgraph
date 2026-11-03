@@ -388,6 +388,58 @@ impl PyGraph {
         )
     }
 
+    /// Nodes that can reach any target, excluding all targets, in BFS order.
+    fn ancestors_many(&self, py: Python<'_>, targets: Vec<PyGraphId>) -> PyResult<Py<PyAny>> {
+        let numeric: Option<Vec<_>> = targets
+            .iter()
+            .map(|target| match &target.0 {
+                OwnedGraphId::U64(value) => Some(*value),
+                _ => None,
+            })
+            .collect();
+        if let Some(targets) = numeric
+            && let Some(ids) = self
+                .inner
+                .ancestors_many_u64(&targets)
+                .map_err(to_py_value_err)?
+        {
+            return ids.into_py_any(py);
+        }
+        let targets: Vec<_> = targets.iter().map(|target| target.0.as_ref()).collect();
+        ids_to_py(
+            py,
+            self.inner
+                .ancestors_many(&targets)
+                .map_err(to_py_value_err)?,
+        )
+    }
+
+    /// Nodes reachable from any source, excluding all sources, in BFS order.
+    fn descendants_many(&self, py: Python<'_>, sources: Vec<PyGraphId>) -> PyResult<Py<PyAny>> {
+        let numeric: Option<Vec<_>> = sources
+            .iter()
+            .map(|source| match &source.0 {
+                OwnedGraphId::U64(value) => Some(*value),
+                _ => None,
+            })
+            .collect();
+        if let Some(sources) = numeric
+            && let Some(ids) = self
+                .inner
+                .descendants_many_u64(&sources)
+                .map_err(to_py_value_err)?
+        {
+            return ids.into_py_any(py);
+        }
+        let sources: Vec<_> = sources.iter().map(|source| source.0.as_ref()).collect();
+        ids_to_py(
+            py,
+            self.inner
+                .descendants_many(&sources)
+                .map_err(to_py_value_err)?,
+        )
+    }
+
     fn shortest_path(
         &self,
         py: Python<'_>,

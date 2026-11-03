@@ -599,6 +599,24 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             """
             return self._map_nodes(self._inner.reachable_nodes(self.node_id(start)))
 
+        def ancestors_many(self, targets: Iterable[Hashable]) -> list[Any]:
+            """Return nodes that can reach any target, excluding targets, in BFS order.
+
+            Duplicate targets are ignored; missing targets raise ValueError.
+            """
+            return self._map_nodes(
+                self._inner.ancestors_many([self.node_id(node) for node in targets])
+            )
+
+        def descendants_many(self, sources: Iterable[Hashable]) -> list[Any]:
+            """Return nodes reachable from any source, excluding sources, in BFS order.
+
+            Duplicate sources are ignored; missing sources raise ValueError.
+            """
+            return self._map_nodes(
+                self._inner.descendants_many([self.node_id(node) for node in sources])
+            )
+
         def shortest_path(self, source: Hashable, target: Hashable) -> list[Any] | None:
             """Shortest path between two nodes, or ``None`` if unreachable.
 
