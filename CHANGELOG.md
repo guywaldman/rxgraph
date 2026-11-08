@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/guywaldman/rxgraph/compare/v0.14.0...v1.0.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* add reusable reachability indexes ([#44](https://github.com/guywaldman/rxgraph/issues/44))
+
+### Features
+
+* add reusable reachability indexes ([#44](https://github.com/guywaldman/rxgraph/issues/44)) ([63d68c8](https://github.com/guywaldman/rxgraph/commit/63d68c88a83b97a0b78ea3968df1b34b2a730262))
+
 ## [0.14.0](https://github.com/guywaldman/rxgraph/compare/v0.13.0...v0.14.0) (2026-11-08)
 
 
