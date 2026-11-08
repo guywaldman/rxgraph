@@ -17,16 +17,27 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/release/examples/possible_targets_poc"
 OUTPUT = ROOT / "benches/results/possible-targets-poc-2026-11-08.json"
-CASES = [(case, strategy) for case in ("refinable", "state_rejection") for strategy in ("dfs", "bfs")]
+CASES = [
+    (case, strategy)
+    for case in ("refinable", "state_rejection")
+    for strategy in ("dfs", "bfs")
+]
 ARMS = ["baseline", "coarse_targets", "refined_eager", "refined_lazy"]
 ORDERS = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2]]
 
 
 def execute(case, strategy, mode, arm=0):
     env = os.environ.copy()
-    env.update(RX_PT_CASE=case, RX_PT_STRATEGY=strategy, RX_PT_MODE=mode, RX_PT_ARM=str(arm))
-    with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
-        child = subprocess.Popen([str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr)
+    env.update(
+        RX_PT_CASE=case, RX_PT_STRATEGY=strategy, RX_PT_MODE=mode, RX_PT_ARM=str(arm)
+    )
+    with (
+        tempfile.TemporaryFile(mode="w+") as stdout,
+        tempfile.TemporaryFile(mode="w+") as stderr,
+    ):
+        child = subprocess.Popen(
+            [str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr
+        )
         _, status, usage = os.wait4(child.pid, 0)
         child.returncode = os.waitstatus_to_exitcode(status)
         stdout.seek(0)
@@ -49,9 +60,14 @@ def main():
     report = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
-        "base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "base_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-        "source_sha256": {path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest() for path in paths},
+        "source_sha256": {
+            path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
+            for path in paths
+        },
         "arms": ARMS,
         "notes": [
             "Each measurement runs in a fresh process. Three independent samples per arm; arm order rotates.",
@@ -88,12 +104,21 @@ def main():
             "validation": validation,
             "rss_runs": rss,
             "timing_runs": timing,
-            "median_peak_rss_bytes": [statistics.median(r["process_peak_rss_bytes"] for r in samples) for samples in rss],
-            "median_seconds": [statistics.median(r["seconds_per_search"] for r in samples) for samples in timing],
+            "median_peak_rss_bytes": [
+                statistics.median(r["process_peak_rss_bytes"] for r in samples)
+                for samples in rss
+            ],
+            "median_seconds": [
+                statistics.median(r["seconds_per_search"] for r in samples)
+                for samples in timing
+            ],
         }
         report["cases"].append(row)
         OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
-        print(f"{case} {strategy}: seconds {row['median_seconds']}; RSS MiB {[round(v/2**20, 1) for v in row['median_peak_rss_bytes']]}", flush=True)
+        print(
+            f"{case} {strategy}: seconds {row['median_seconds']}; RSS MiB {[round(v / 2**20, 1) for v in row['median_peak_rss_bytes']]}",
+            flush=True,
+        )
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
     OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
 

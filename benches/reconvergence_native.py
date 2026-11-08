@@ -14,15 +14,24 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/release/examples/reconvergence_native"
 OUTPUT = ROOT / "benches/results/reconvergence-native-2026-11-08.json"
 CASES = [
-    "vec-bfs", "vec-bfs-parallel", "vec-dfs", "vec-eager", "cpu-dfs",
+    "vec-bfs",
+    "vec-bfs-parallel",
+    "vec-dfs",
+    "vec-eager",
+    "cpu-dfs",
 ]
 
 
 def execute(case, mode, arm=0):
     env = os.environ.copy()
     env.update(RX_NATIVE_CASE=case, RX_NATIVE_MODE=mode, RX_NATIVE_ARM=str(arm))
-    with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
-        child = subprocess.Popen([str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr)
+    with (
+        tempfile.TemporaryFile(mode="w+") as stdout,
+        tempfile.TemporaryFile(mode="w+") as stderr,
+    ):
+        child = subprocess.Popen(
+            [str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr
+        )
         _, status, usage = os.wait4(child.pid, 0)
         stdout.seek(0)
         stderr.seek(0)
@@ -37,7 +46,9 @@ def main():
     report = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
-        "base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "base_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "source_sha256": {
             path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
@@ -75,13 +86,22 @@ def main():
         row = {
             "case": case,
             "memory_runs": memory,
-            "median_peak_rss_bytes": [statistics.median(r["process_peak_rss_bytes"] for r in arm) for arm in memory],
+            "median_peak_rss_bytes": [
+                statistics.median(r["process_peak_rss_bytes"] for r in arm)
+                for arm in memory
+            ],
             "timing_runs": timings,
-            "median_seconds": [statistics.median(r["seconds_per_search"] for r in arm) for arm in timings],
+            "median_seconds": [
+                statistics.median(r["seconds_per_search"] for r in arm)
+                for arm in timings
+            ],
         }
         report["cases"].append(row)
         OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
-        print(f"{case}: RSS MiB {[round(v/2**20, 1) for v in row['median_peak_rss_bytes']]}; seconds {row['median_seconds']}; hits {[arm[0]['hits'] for arm in memory]}", flush=True)
+        print(
+            f"{case}: RSS MiB {[round(v / 2**20, 1) for v in row['median_peak_rss_bytes']]}; seconds {row['median_seconds']}; hits {[arm[0]['hits'] for arm in memory]}",
+            flush=True,
+        )
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
     OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
 

@@ -33,7 +33,6 @@ struct Light {
 struct Fixture {
     graph: Graph,
     target_base: u64,
-    first_leaf: u64,
     gate: bool,
 }
 impl Fixture {
@@ -63,7 +62,6 @@ impl Fixture {
         Ok(Self {
             graph: Graph::new(nodes, edges)?,
             target_base: base,
-            first_leaf,
             gate,
         })
     }

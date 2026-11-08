@@ -18,9 +18,19 @@ CASES = [("sparse-target", "dfs"), ("sparse-target", "bfs"), ("state-rejection",
 
 def execute(case, strategy, mode, arm=0):
     env = os.environ.copy()
-    env.update(RX_TARGET_CASE=case, RX_TARGET_STRATEGY=strategy, RX_TARGET_MODE=mode, RX_TARGET_ARM=str(arm))
-    with tempfile.TemporaryFile(mode="w+") as stdout, tempfile.TemporaryFile(mode="w+") as stderr:
-        child = subprocess.Popen([str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr)
+    env.update(
+        RX_TARGET_CASE=case,
+        RX_TARGET_STRATEGY=strategy,
+        RX_TARGET_MODE=mode,
+        RX_TARGET_ARM=str(arm),
+    )
+    with (
+        tempfile.TemporaryFile(mode="w+") as stdout,
+        tempfile.TemporaryFile(mode="w+") as stderr,
+    ):
+        child = subprocess.Popen(
+            [str(BINARY)], cwd=ROOT, env=env, stdout=stdout, stderr=stderr
+        )
         _, status, usage = os.wait4(child.pid, 0)
         child.returncode = os.waitstatus_to_exitcode(status)
         stdout.seek(0)
@@ -36,13 +46,24 @@ def main():
     report = {
         "started_utc": datetime.now(timezone.utc).isoformat(),
         "platform": platform.platform(),
-        "base_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "base_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT, text=True
+        ).strip(),
         "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
         "source_sha256": {
             path: hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
-            for path in ["crates/rxgraph/examples/target_pruning_poc.rs", "crates/rxgraph/src/traversal/engine/cursor.rs", "crates/rxgraph/src/graph/graph.rs", "crates/rxgraph/src/graph/repo.rs"]
+            for path in [
+                "crates/rxgraph/examples/target_pruning_poc.rs",
+                "crates/rxgraph/src/traversal/engine/cursor.rs",
+                "crates/rxgraph/src/graph/graph.rs",
+                "crates/rxgraph/src/graph/repo.rs",
+            ]
         },
-        "arms": ["normal stateful search", "reverse-reachability pruning then stateful search", "topology search then lazy state replay"],
+        "arms": [
+            "normal stateful search",
+            "reverse-reachability pruning then stateful search",
+            "topology search then lazy state replay",
+        ],
         "notes": [
             "Each memory or timing sample runs in a fresh process; timing uses a 0.5s warmup and at least a 2s window, with no transition counters.",
             "RSS is peak process-wide Darwin wait4 RSS and includes graph construction; reverse RSS includes cold incoming-index construction.",
@@ -64,14 +85,26 @@ def main():
             for arm in [[0, 1, 2], [2, 1, 0], [1, 2, 0]][repeat]:
                 timings[arm].append(execute(case, strategy, "timing", arm))
         row = {
-            "case": case, "strategy": strategy, "validation": validation,
-            "rss_runs": rss, "timing_runs": timings,
-            "median_peak_rss_bytes": [statistics.median(r["process_peak_rss_bytes"] for r in arm) for arm in rss],
-            "median_seconds": [statistics.median(r["seconds_per_search"] for r in arm) for arm in timings],
+            "case": case,
+            "strategy": strategy,
+            "validation": validation,
+            "rss_runs": rss,
+            "timing_runs": timings,
+            "median_peak_rss_bytes": [
+                statistics.median(r["process_peak_rss_bytes"] for r in arm)
+                for arm in rss
+            ],
+            "median_seconds": [
+                statistics.median(r["seconds_per_search"] for r in arm)
+                for arm in timings
+            ],
         }
         report["cases"].append(row)
         OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
-        print(f"{case} {strategy}: seconds {row['median_seconds']}; RSS MiB {[round(v/2**20, 1) for v in row['median_peak_rss_bytes']]}", flush=True)
+        print(
+            f"{case} {strategy}: seconds {row['median_seconds']}; RSS MiB {[round(v / 2**20, 1) for v in row['median_peak_rss_bytes']]}",
+            flush=True,
+        )
     report["finished_utc"] = datetime.now(timezone.utc).isoformat()
     OUTPUT.write_text(json.dumps(report, indent=2) + "\n")
 
