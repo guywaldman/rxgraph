@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/guywaldman/rxgraph/compare/v0.15.0...v0.16.0) (2026-11-08)
+
+
+### Features
+
+* cache graph-derived data for native kernels ([#46](https://github.com/guywaldman/rxgraph/issues/46)) ([612f473](https://github.com/guywaldman/rxgraph/commit/612f473382275e9f92cc380fd7df71ef1fbffb79))
+
 ## [0.15.0](https://github.com/guywaldman/rxgraph/compare/v0.14.0...v0.15.0) (2026-11-08)
 
 
