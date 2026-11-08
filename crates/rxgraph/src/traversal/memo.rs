@@ -162,11 +162,21 @@ impl Budget {
     }
 
     fn reserve(&self) -> bool {
-        self.reserved
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
-                (used < self.capacity).then(|| used + 1)
-            })
-            .is_ok()
+        let mut used = self.reserved.load(Ordering::Relaxed);
+        loop {
+            if used >= self.capacity {
+                return false;
+            }
+            match self.reserved.compare_exchange_weak(
+                used,
+                used + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => used = actual,
+            }
+        }
     }
 }
 
