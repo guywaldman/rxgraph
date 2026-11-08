@@ -188,6 +188,36 @@ predicate can exclude edges only when they cannot occur in any valid
 continuation. An index belongs to its source topology and must not be used with
 a different graph.
 
+### Cached graph-derived data
+
+Typed kernels can derive data once per graph and reuse it across searches:
+
+```rust
+use std::sync::Arc;
+use rxgraph::{EdgeId, traversal::native};
+
+struct Node;
+struct Edge { cost: u64 }
+
+fn edge_costs(cx: &native::StartCtx<'_, Node, Edge>) -> anyhow::Result<Arc<Vec<u64>>> {
+    let graph = cx.graph().ok_or_else(|| anyhow::anyhow!("graph-backed store required"))?;
+    graph.cached("edge-costs:v1", || {
+        (0..graph.edge_count())
+            .map(|id| Ok(cx.edge_at(id as EdgeId)?.cost))
+            .collect()
+    })
+}
+```
+
+`Graph::cached` keys entries by result type and string key. Concurrent callers
+for the same entry share one successful initialization; errors can be retried.
+Include every dependency, including payload type and version, in the key.
+`Graph::set_payloads` preserves the cache, so use a new key when replaced
+payloads affect a cached result. `StartCtx` and `EdgeCtx` can read any node or
+edge via `node_at` and `edge_at`; for lazy Parquet stores, those calls load rows
+on demand, so a full scan loads all rows. Untyped kernels can access Arrow rows
+through `Graph::node_at` and `Graph::edge_at`.
+
 ### Target-aware native search
 
 For a `Graph` search using `rxgraph::Kernel`, implement `possible_targets` to

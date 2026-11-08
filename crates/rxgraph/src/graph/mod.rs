@@ -1,3 +1,4 @@
+mod cache;
 mod csr;
 #[allow(clippy::module_inception)]
 mod graph;

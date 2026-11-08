@@ -109,6 +109,7 @@ pub trait GraphRepo {
 pub(crate) struct Repo {
     /// Stable identity of this topology, even if the Graph value is moved.
     pub(crate) topology_identity: Arc<()>,
+    pub(crate) derived_cache: super::cache::DerivedCache,
     csr_offsets: Vec<Offset>,
     csr_dests: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
@@ -418,6 +419,7 @@ impl Repo {
 
         Ok(Self {
             topology_identity: Arc::new(()),
+            derived_cache: super::cache::DerivedCache::default(),
             nodes: strip_topology_columns(nodes, NODE_TOPOLOGY_COLS)?,
             edges: strip_topology_columns(edges, EDGE_TOPOLOGY_COLS)?,
             node_count,
