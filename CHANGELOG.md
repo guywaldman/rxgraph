@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/guywaldman/rxgraph/compare/v0.16.0...v0.17.0) (2026-11-08)
+
+
+### Features
+
+* add Arrow payload presence checks ([#48](https://github.com/guywaldman/rxgraph/issues/48)) ([2665143](https://github.com/guywaldman/rxgraph/commit/2665143fb12f0de524b58e1c0000924edb169875))
+
 ## [0.16.0](https://github.com/guywaldman/rxgraph/compare/v0.15.0...v0.16.0) (2026-11-08)
 
 
