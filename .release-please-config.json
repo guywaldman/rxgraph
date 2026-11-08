@@ -3,6 +3,7 @@
   "packages": {
     ".": {
       "release-type": "simple",
+      "bump-minor-pre-major": true,
       "package-name": "rxgraph",
       "version-file": "VERSION",
       "include-component-in-tag": false,
