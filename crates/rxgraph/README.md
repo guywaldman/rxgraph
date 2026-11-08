@@ -164,6 +164,14 @@ The name-based `EdgeCtx` getters remain available for convenience and coercion.
 Pre-bound fields use exact Arrow types and are the intended maximum-throughput
 path.
 
+Typed payload decoders can use `ArrowRow::has` or `ArrowStruct::has` to check
+for an optional field without constructing an error. `ArrowRow::opt_string`,
+`opt_u64`, `opt_bool`, `opt_list_items`, and `opt_struct` return `None` for
+absent or null values and retain existing getter semantics for present values.
+`ArrowRow::schema` exposes the projected schema, including aliases. A field
+explicitly requested by `node_fields` or `edge_fields` must still exist in the
+source; these accessors do not change projection validation.
+
 ### Reusable reachability index
 
 Build a reachability index once for named sets of internal ending nodes and
