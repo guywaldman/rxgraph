@@ -125,28 +125,65 @@ pub struct NativeSearchStream<
 > {
     store: &'s G,
     kernel: K,
-    cursor: Cursor<K::State, ()>,
+    cursor: NativeCursor<K::State>,
     batch_size: usize,
+    preparation: Option<RunOptions>,
+    reverse: Option<super::targets::Reverse>,
+    options: Option<super::TargetOptions>,
+    retain_history: bool,
+}
+
+enum NativeCursor<S> {
+    Direct(Cursor<S, ()>),
+    Target(Cursor<super::targets::TargetState<S>, ()>),
+    Lazy(Cursor<super::lazy::LazyState<S>, ()>),
 }
 impl<'s, K: native::Kernel, G: native::GraphStore<Node = K::Node, Edge = K::Edge>>
     NativeSearchStream<'s, K, G>
 {
-    pub(crate) fn new(store: &'s G, kernel: K, run: RunOptions, batch_size: usize) -> Result<Self> {
+    pub(crate) fn new(
+        store: &'s G,
+        kernel: K,
+        run: impl Into<NativeRunOptions>,
+        batch_size: usize,
+    ) -> Result<Self> {
         if batch_size == 0 {
             bail!("batch_size must be at least 1");
         }
+        let NativeRunOptions { run, optimizations } = run.into();
+        let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
+        let retain_history = run.intermediate_states;
+        let cursor = match optimizations.map(|o| o.evaluation) {
+            None => NativeCursor::Direct(Cursor::new(run)?),
+            Some(super::Evaluation::Incremental) => NativeCursor::Target(Cursor::new(run)?),
+            Some(super::Evaluation::Lazy) => NativeCursor::Lazy(Cursor::new(run)?),
+        };
         Ok(Self {
             store,
             kernel,
-            cursor: Cursor::new(run)?,
+            cursor,
             batch_size,
+            preparation,
+            reverse: None,
+            options: optimizations,
+            retain_history,
         })
     }
     pub fn stats(&self) -> SearchStats {
-        self.cursor.stats
+        match &self.cursor {
+            NativeCursor::Direct(c) => c.stats,
+            NativeCursor::Target(c) => c.stats,
+            NativeCursor::Lazy(c) => c.stats,
+        }
     }
     pub fn close(&mut self) {
-        self.cursor.close();
+        match &mut self.cursor {
+            NativeCursor::Direct(c) => c.close(),
+            NativeCursor::Target(c) => c.close(),
+            NativeCursor::Lazy(c) => c.close(),
+        }
+        self.reverse = None;
+        self.preparation = None;
     }
 }
 impl<'s, K: native::Kernel, G: native::GraphStore<Node = K::Node, Edge = K::Edge>> Iterator
@@ -161,10 +198,39 @@ where
             store: self.store,
             kernel: &self.kernel,
             materialize: native::materialize_native::<G, K::State>,
+            materialize_target: native::materialize_native_target::<G, K::State>,
+            materialize_lazy: native::materialize_native_lazy::<G, K::State>,
         };
-        self.cursor
-            .next_batch(&adapter, self.batch_size)
-            .transpose()
+        if let Some(run) = self.preparation.take() {
+            match super::targets::build_reverse_for(&adapter, &run, true) {
+                Ok(reverse) => self.reverse = reverse,
+                Err(err) => {
+                    self.close();
+                    return Some(Err(err));
+                }
+            }
+        }
+        let result = match &mut self.cursor {
+            NativeCursor::Direct(cursor) => cursor.next_batch(&adapter, self.batch_size),
+            NativeCursor::Target(cursor) => cursor.next_batch(
+                &super::targets::TargetAdapter {
+                    inner: adapter,
+                    reverse: self.reverse.as_ref(),
+                    release: self.options.unwrap().release_expanded,
+                },
+                self.batch_size,
+            ),
+            NativeCursor::Lazy(cursor) => cursor.next_batch(
+                &super::lazy::LazyAdapter {
+                    inner: adapter,
+                    reverse: self.reverse.as_ref(),
+                    retain_history: self.retain_history,
+                    release_expanded: self.options.unwrap().release_expanded,
+                },
+                self.batch_size,
+            ),
+        };
+        result.transpose()
     }
 }
 impl<K: native::Kernel, G: native::GraphStore<Node = K::Node, Edge = K::Edge>> Drop
@@ -385,8 +451,12 @@ where
                 }
                 OptimizedCursor::Lazy(cursor) => {
                     let adapter = LazyAdapter {
-                        graph: &self.graph,
-                        kernel: &self.kernel,
+                        inner: GraphSearchAdapter {
+                            graph: &self.graph,
+                            kernel: &self.kernel,
+                            project: |state: &K::State| Ok(state.clone()),
+                            output: PhantomData,
+                        },
                         reverse: self.reverse.as_ref(),
                         retain_history: self.retain_history,
                         release_expanded: self.options.release_expanded,

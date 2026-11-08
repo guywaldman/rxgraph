@@ -164,27 +164,52 @@ The name-based `EdgeCtx` getters remain available for convenience and coercion.
 Pre-bound fields use exact Arrow types and are the intended maximum-throughput
 path.
 
+### Reusable reachability index
+
+Build a reachability index once for named sets of internal ending nodes and
+reuse it across searches:
+
+```rust
+use rxgraph::{Graph, ReachIndex, ReachSpec};
+
+fn index(graph: &Graph) -> anyhow::Result<ReachIndex> {
+    let target = graph.internal_node_id(42_u64).expect("target exists");
+    graph.reach_index(ReachSpec {
+        sets: vec![(3, vec![target])],
+        skip_edge: None,
+    })
+}
+```
+
+Call `cx.reaches(&index, 3, cx.dest())?` from a graph kernel transition, or
+return `Some(Cow::Borrowed(index.targets(graph, 3)?))` from `possible_targets`
+to reuse a group's endpoints without allocating in the hook. A `skip_edge`
+predicate can exclude edges only when they cannot occur in any valid
+continuation. An index belongs to its source topology and must not be used with
+a different graph.
+
 ### Target-aware native search
 
 For a `Graph` search using `rxgraph::Kernel`, implement `possible_targets` to
 give the engine a conservative bound on where a path can **end**. This hook is
 optional and the normal native search path does not call it unless optimizations
-are requested. `None` means no additional information, `Some(vec![])` means the
+are requested. `None` means no additional information, an empty slice means the
 prefix cannot complete, and a nonempty result lists possible ending nodes by
-external ID. Each refinement is intersected with the path's previous bound.
+internal `NodeId`. Each refinement is intersected with the path's previous bound.
 
 The following kernel uses an `allowed: bool` edge column and completes at node
 `42`. The graph must contain start node `1` and target node `42`.
 
 ```rust
 use rxgraph::{
-    EdgeCtx, EdgeField, Evaluation, Graph, Kernel, NodeId, OwnedGraphId,
+    EdgeCtx, EdgeField, Evaluation, Graph, Kernel, NodeId,
     RunOptions, TargetCtx, TargetOptions, Transition,
 };
+use std::borrow::Cow;
 
 struct TargetKernel {
     allowed: EdgeField<bool>,
-    target: OwnedGraphId,
+    target: NodeId,
 }
 
 impl Kernel for TargetKernel {
@@ -199,30 +224,34 @@ impl Kernel for TargetKernel {
             return Ok(Transition::Reject);
         }
         let next = cx.state() + 1;
-        Ok(if cx.dest_id() == Some(self.target.as_ref()) {
+        Ok(if cx.dest() == self.target {
             Transition::Complete(next)
         } else {
             Transition::Continue(next)
         })
     }
 
-    fn possible_targets(
-        &self,
+    fn possible_targets<'a>(
+        &'a self,
         cx: &TargetCtx<'_, u64>,
-    ) -> anyhow::Result<Option<Vec<OwnedGraphId>>> {
+    ) -> anyhow::Result<Option<Cow<'a, [NodeId]>>> {
         Ok(match cx {
-            TargetCtx::Start { .. } => Some(vec![self.target.clone()]),
+            TargetCtx::Start { .. } => Some(Cow::Borrowed(std::slice::from_ref(&self.target))),
             TargetCtx::Edge { edge, .. }
-                if !edge.edge_field(&self.allowed).unwrap_or(false) => Some(vec![]),
+                if !edge.edge_field(&self.allowed).unwrap_or(false) => Some(Cow::Borrowed(&[])),
             _ => None,
         })
+    }
+
+    fn targets_depend_on_child_state(&self) -> bool {
+        false
     }
 }
 
 fn search(graph: &Graph) -> anyhow::Result<()> {
     let kernel = TargetKernel {
         allowed: graph.edge_field("allowed")?,
-        target: 42_u64.into(),
+        target: graph.internal_node_id(42_u64).expect("target exists"),
     };
     let run = RunOptions {
         start_nodes: vec![1_u64.into()],
@@ -252,6 +281,8 @@ must not depend on call count or side effects: the engine may skip transitions
 and their errors on pruned branches. Edge contexts expose the source, edge and
 destination in graph direction. Parent and child state may be absent, so return
 `None` when a state-dependent restriction cannot be established safely.
+Return `false` from `targets_depend_on_child_state` when the bound does not
+depend on the child state to skip the post-transition callback.
 
 `TargetOptions` selects independent, opt-in execution settings:
 
@@ -275,9 +306,10 @@ and the wrapper uses a lock shared by workers. Create a fresh wrapper for each
 search. Memoization and lazy replay are workload-dependent and can increase
 latency or memory; measure them for the kernel and graph in use.
 
-These options apply to `Graph` searches using `rxgraph::Kernel`; the separate
-`traversal::native::GraphStore` and `TypedKernel` APIs use their own traversal
-interfaces.
+Target options also apply to `traversal::native::GraphStore` and `TypedKernel`
+searches. A custom store without a backing `Graph` must expose a dense node
+count to use reverse preprocessing with known targets. Transition memoization
+remains available for `Graph` kernels.
 
 ## Python Bindings
 

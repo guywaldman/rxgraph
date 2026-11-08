@@ -103,8 +103,8 @@ def test_target_optimizations_validate_and_reject_unsupported():
     with pytest.raises(ValueError, match="named graph-native"):
         graph.search(start_nodes=["a"], optimizations={})
     for method in (graph.search, graph.search_batches):
-        with pytest.raises(ValueError, match="typed kernels"):
-            method(kernel="bench_typed", optimizations={}, **kwargs)
+        with pytest.raises(ValueError, match="memoization.*typed kernels"):
+            method(kernel="bench_typed", optimizations={"memo_capacity": 5}, **kwargs)
         with pytest.raises((TypeError, ValueError), match="evaluation"):
             method(
                 kernel="bench_arrow", optimizations={"evaluation": "wrong"}, **kwargs
@@ -179,14 +179,17 @@ def test_dual_registration_retains_typed_dispatch():
         kernel="weighted_budget",
         params={"weight_col": "cost", "budget": 10, "target": "target"},
     )
-    assert graph.search(**kwargs).paths
-    for search in (graph.search, graph.search_batches):
-        with pytest.raises(ValueError, match="typed kernels"):
-            search(**kwargs, optimizations={})
+    expected = graph.search(**kwargs).paths
+    assert expected
+    assert graph.search(**kwargs, optimizations={}).paths == expected
+    with graph.search_batches(**kwargs, optimizations={}) as stream:
+        assert [path for batch in stream for path in batch] == expected
 
 
 @pytest.mark.parametrize("mode", ["eager", "lazy"])
-def test_file_backed_optimization_rejection(mode, tmp_path):
+@pytest.mark.parametrize("evaluation", ["incremental", "lazy"])
+@pytest.mark.parametrize("strategy", ["dfs", "bfs"])
+def test_file_backed_target_optimizations(mode, evaluation, strategy, tmp_path):
     rxg = plugin()
     nodes = pl.DataFrame({"id": [0, 1]}, schema={"id": pl.UInt64})
     edges = pl.DataFrame(
@@ -202,8 +205,30 @@ def test_file_backed_optimization_rejection(mode, tmp_path):
         start_nodes=[0],
         kernel="bench_typed",
         params={"budget": 10, "target": 1},
-        optimizations={},
+        strategy=strategy,
     )
-    for search in (graph.search, graph.search_batches):
-        with pytest.raises(ValueError, match="file-backed|typed kernels"):
-            search(**kwargs)
+    expected = graph.search(**kwargs).paths
+    options = {"evaluation": evaluation, "reverse": True, "release_expanded": True}
+    assert graph.search(**kwargs, optimizations=options).paths == expected
+    with graph.search_batches(**kwargs, optimizations=options, batch_size=1) as stream:
+        assert [path for batch in stream for path in batch] == expected
+
+
+@pytest.mark.parametrize("evaluation", ["incremental", "lazy"])
+@pytest.mark.parametrize("strategy", ["dfs", "bfs"])
+def test_typed_target_optimizations_prune(evaluation, strategy):
+    graph = target_graph(plugin())
+    kwargs = dict(
+        start_nodes=["a"],
+        kernel="bench_typed",
+        params={"budget": 10, "target": "target"},
+        strategy=strategy,
+        parallel=False,
+    )
+    baseline = graph.search(**kwargs)
+    options = {"evaluation": evaluation, "reverse": True, "release_expanded": True}
+    result = graph.search(**kwargs, optimizations=options)
+    assert result.paths == baseline.paths
+    assert result.stats.evaluated_edges < baseline.stats.evaluated_edges
+    with graph.search_batches(**kwargs, optimizations=options, batch_size=1) as stream:
+        assert [path for batch in stream for path in batch] == baseline.paths

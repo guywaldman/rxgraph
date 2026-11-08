@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -6,8 +7,8 @@ use std::sync::{
 use anyhow::{Result, bail};
 use arrow::array::record_batch;
 use rxgraph::{
-    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, NodeId, OwnedGraphId, RunOptions,
-    TargetCtx, TargetOptions, Transition, TraversalStrategy,
+    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, NodeId, RunOptions, TargetCtx,
+    TargetOptions, Transition, TraversalStrategy,
 };
 
 fn optimized(run: RunOptions, options: TargetOptions) -> rxgraph::NativeRunOptions {
@@ -39,24 +40,27 @@ impl Kernel for Example {
             },
         )
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, u64>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
         let targets = match cx {
-            TargetCtx::Start { .. } => Some(vec![1u64.into(), 3u64.into()]),
+            TargetCtx::Start { .. } => Some(vec![1, 3]),
             TargetCtx::Edge { edge, .. } if edge.edge() == 2 => Some(vec![]),
-            TargetCtx::Edge { edge, .. } if edge.dest() == 3 => Some(vec![3u64.into()]),
+            TargetCtx::Edge { edge, .. } if edge.dest() == 3 => Some(vec![3]),
             TargetCtx::Edge {
                 edge,
                 parent: Some(value),
                 ..
-            } if edge.edge() == 0 && **value == 0 => Some(vec![3u64.into()]),
+            } if edge.edge() == 0 && **value == 0 => Some(vec![3]),
             TargetCtx::Edge {
                 edge,
                 parent: Some(value),
                 ..
-            } if edge.edge() == 5 && **value != 2 => Some(vec![3u64.into()]),
+            } if edge.edge() == 5 && **value != 2 => Some(vec![3]),
             _ => None,
         };
-        Ok(targets)
+        Ok(targets.map(Cow::Owned))
     }
 }
 
@@ -228,9 +232,9 @@ impl Kernel for Spy {
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(Transition::Reject)
     }
-    fn possible_targets(&self, _: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(&'a self, _: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
         self.hooks.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(vec![]))
+        Ok(Some(Cow::Owned(vec![])))
     }
 }
 #[test]
@@ -278,12 +282,16 @@ impl Kernel for InvalidPostBound {
     fn transition(&self, cx: &EdgeCtx<'_, u64>) -> Result<Transition<u64>> {
         Ok(Transition::Complete(*cx.state() + 1))
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, u64>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(match cx {
-            TargetCtx::Start { .. } => Some(vec![1u64.into()]),
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((match cx {
+            TargetCtx::Start { .. } => Some(vec![1]),
             TargetCtx::Edge { child: Some(_), .. } => Some(vec![]),
             _ => None,
         })
+        .map(Cow::Owned))
     }
 }
 

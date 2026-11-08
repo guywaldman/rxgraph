@@ -78,6 +78,12 @@ impl Graph {
         self.repo.edge_count()
     }
 
+    /// Resolves an external graph ID to the dense internal node ID used by
+    /// traversal contexts and reachability indexes.
+    pub fn internal_node_id(&self, id: impl Into<OwnedGraphId>) -> Option<NodeId> {
+        self.repo.internal_node(id.into().as_ref())
+    }
+
     /// Topology-only breadth-first traversal from an external node ID.
     pub fn bfs(
         &self,

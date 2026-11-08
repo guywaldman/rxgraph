@@ -301,7 +301,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             :param intermediate_states: Whether to include per-node state history on returned paths (false by default).
             :param progress: Whether to report running counters on stderr (live spinner on a terminal/TTY, plain log lines otherwise).
             :param max_visits_per_node: Maximum occurrences of a node within one path (1 by default, i.e. no revisits).
-            :param optimizations: Graph-native kernel options: ``evaluation`` (``"incremental"`` or ``"lazy"``), ``reverse`` and ``release_expanded`` (booleans), and ``memo_capacity`` (nonnegative integer, requiring a memoizable registration). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires registration through ``boxed_memoizable_run``. Typed kernels, file-backed searches, and DSL searches do not support these options.
+            :param optimizations: Native kernel options: ``evaluation`` (``"incremental"`` or ``"lazy"``), ``reverse`` and ``release_expanded`` (booleans), and ``memo_capacity`` (nonnegative integer). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires an in-memory graph kernel registered through ``boxed_memoizable_run``. DSL searches do not support these options.
 
             >>> import rxgraph as rxg
             >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])

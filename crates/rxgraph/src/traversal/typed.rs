@@ -606,6 +606,19 @@ pub trait TypedKernel: Clone {
         &self,
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
     ) -> Result<crate::Transition<Self::State>>;
+
+    /// Return a conservative set of possible ending node IDs, or `None` if unknown.
+    fn possible_targets<'a>(
+        &'a self,
+        _cx: &native::TargetCtx<'a, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Option<std::borrow::Cow<'a, [NodeId]>>> {
+        Ok(None)
+    }
+
+    /// Whether the target bound may change after the transition computes child state.
+    fn targets_depend_on_child_state(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone)]
@@ -639,6 +652,17 @@ where
         cx: &native::EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
     ) -> Result<crate::Transition<Self::State>> {
         self.kernel.transition(cx)
+    }
+
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &native::TargetCtx<'a, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Option<std::borrow::Cow<'a, [NodeId]>>> {
+        self.kernel.possible_targets(cx)
+    }
+
+    fn targets_depend_on_child_state(&self) -> bool {
+        self.kernel.targets_depend_on_child_state()
     }
 }
 
@@ -741,7 +765,7 @@ fn cached_payloads<K: TypedKernel>(
 pub(crate) fn run_typed_eager<K>(
     graph: &Graph,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
@@ -758,7 +782,7 @@ pub(crate) fn run_typed_eager_cached<K>(
     graph: &Graph,
     cache: &TypedPayloadCache,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel + 'static,
@@ -775,7 +799,7 @@ fn run_typed_payloads<K>(
     kernel: K,
     nodes: &[K::Node],
     edges: &[K::Edge],
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
@@ -790,7 +814,7 @@ pub(crate) fn run_typed_parquet_lazy<K>(
     graph: &Graph,
     paths: ParquetPaths,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
@@ -814,7 +838,11 @@ where
     Ok(owned)
 }
 
-fn search_owned<K, G>(store: &G, kernel: &K, run: RunOptions) -> Result<OwnedSearchResult>
+fn search_owned<K, G>(
+    store: &G,
+    kernel: &K,
+    run: impl Into<super::NativeRunOptions>,
+) -> Result<OwnedSearchResult>
 where
     K: native::Kernel,
     K::State: serde::Serialize,
@@ -824,8 +852,34 @@ where
         store,
         kernel,
         materialize: materialize_owned::<G, K::State>,
+        materialize_target: materialize_owned_target::<G, K::State>,
+        materialize_lazy: materialize_owned_lazy::<G, K::State>,
     };
-    let result = super::engine::search_serial(&adapter, run)?;
+    let super::NativeRunOptions { run, optimizations } = run.into();
+    let result = if let Some(options) = optimizations {
+        let reverse = super::targets::build_reverse_for(&adapter, &run, options.reverse)?;
+        match options.evaluation {
+            super::Evaluation::Incremental => super::engine::search_serial(
+                &super::targets::TargetAdapter {
+                    inner: adapter,
+                    reverse: reverse.as_ref(),
+                    release: options.release_expanded,
+                },
+                run,
+            )?,
+            super::Evaluation::Lazy => super::engine::search_serial(
+                &super::lazy::LazyAdapter {
+                    inner: adapter,
+                    reverse: reverse.as_ref(),
+                    retain_history: run.intermediate_states,
+                    release_expanded: options.release_expanded,
+                },
+                run,
+            )?,
+        }
+    } else {
+        super::engine::search_serial(&adapter, run)?
+    };
     Ok(OwnedSearchResult {
         paths: result.paths,
         stats: result.stats,
@@ -836,10 +890,92 @@ where
 fn materialize_owned<G: native::GraphStore, S: serde::Serialize>(
     store: &G,
     arena: &[super::engine::PathEntry<S>],
+    path: usize,
+    intermediate_states: bool,
+) -> Result<OwnedGraphPath> {
+    materialize_owned_projected(store, arena, path, intermediate_states, |s| s)
+}
+
+fn materialize_owned_target<G: native::GraphStore, S: serde::Serialize>(
+    store: &G,
+    arena: &[super::engine::PathEntry<super::targets::TargetState<S>>],
+    path: usize,
+    intermediate_states: bool,
+) -> Result<OwnedGraphPath> {
+    materialize_owned_projected(store, arena, path, intermediate_states, |s| {
+        s.state.as_ref().expect("requested state retained")
+    })
+}
+
+fn materialize_owned_lazy<G: native::GraphStore, S: serde::Serialize>(
+    store: &G,
+    arena: &[super::engine::PathEntry<super::lazy::LazyState<S>>],
     mut path: usize,
     intermediate_states: bool,
 ) -> Result<OwnedGraphPath> {
-    let state = super::registry::encode_state(&arena[path].state)?;
+    let completed = &arena[path].state;
+    let state = super::registry::encode_state(
+        completed
+            .final_state
+            .as_ref()
+            .expect("completed path has state"),
+    )?;
+    let intermediate_states = if intermediate_states {
+        Some(
+            completed
+                .history
+                .as_ref()
+                .expect("history retained")
+                .iter()
+                .map(super::registry::encode_state)
+                .collect::<Result<Vec<_>>>()?,
+        )
+    } else {
+        None
+    };
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    loop {
+        let entry = &arena[path];
+        store.node(entry.node)?;
+        nodes.push(
+            store
+                .external_node(entry.node)?
+                .context("path references missing node")?
+                .into_owned(),
+        );
+        if let Some(edge) = entry.incoming_edge {
+            store.edge(edge)?;
+            edges.push(
+                store
+                    .external_edge(edge)?
+                    .context("path references missing edge")?
+                    .into_owned(),
+            );
+        }
+        match entry.parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+    nodes.reverse();
+    edges.reverse();
+    Ok(OwnedGraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states,
+    })
+}
+
+fn materialize_owned_projected<G: native::GraphStore, S: serde::Serialize, T>(
+    store: &G,
+    arena: &[super::engine::PathEntry<T>],
+    mut path: usize,
+    intermediate_states: bool,
+    project: impl Fn(&T) -> &S,
+) -> Result<OwnedGraphPath> {
+    let state = super::registry::encode_state(project(&arena[path].state))?;
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
     let mut history = intermediate_states.then(|| Vec::with_capacity(arena[path].depth + 1));
@@ -863,7 +999,7 @@ fn materialize_owned<G: native::GraphStore, S: serde::Serialize>(
             );
         }
         if let Some(history) = &mut history {
-            history.push(super::registry::encode_state(&entry.state)?);
+            history.push(super::registry::encode_state(project(&entry.state))?);
         }
         match entry.parent {
             Some(parent) => path = parent,
@@ -1479,6 +1615,10 @@ where
         Some(self.graph.node_count())
     }
 
+    fn graph(&self) -> Option<&Graph> {
+        Some(&self.graph)
+    }
+
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
         Ok(self.graph.repo.internal_node(external))
     }
@@ -1575,8 +1715,44 @@ where
 struct TypedStream<K: TypedKernel, G> {
     store: G,
     kernel: TypedKernelAdapter<K>,
-    cursor: super::engine::cursor::Cursor<K::State, ()>,
+    cursor: TypedCursor<K::State>,
+    preparation: Option<RunOptions>,
+    reverse: Option<super::targets::Reverse>,
+    options: Option<super::TargetOptions>,
+    retain_history: bool,
     update_stats: fn(&G, &mut SearchStats),
+}
+
+enum TypedCursor<S> {
+    Direct(super::engine::cursor::Cursor<S, ()>),
+    Target(super::engine::cursor::Cursor<super::targets::TargetState<S>, ()>),
+    Lazy(super::engine::cursor::Cursor<super::lazy::LazyState<S>, ()>),
+}
+
+impl<S: Clone> TypedCursor<S> {
+    fn new(run: RunOptions, options: Option<super::TargetOptions>) -> Result<Self> {
+        Ok(match options.map(|o| o.evaluation) {
+            None => Self::Direct(super::engine::cursor::Cursor::new(run)?),
+            Some(super::Evaluation::Incremental) => {
+                Self::Target(super::engine::cursor::Cursor::new(run)?)
+            }
+            Some(super::Evaluation::Lazy) => Self::Lazy(super::engine::cursor::Cursor::new(run)?),
+        })
+    }
+    fn stats(&self) -> SearchStats {
+        match self {
+            Self::Direct(c) => c.stats,
+            Self::Target(c) => c.stats,
+            Self::Lazy(c) => c.stats,
+        }
+    }
+    fn close(&mut self) {
+        match self {
+            Self::Direct(c) => c.close(),
+            Self::Target(c) => c.close(),
+            Self::Lazy(c) => c.close(),
+        }
+    }
 }
 impl<K, G> super::NativeBatchStream for TypedStream<K, G>
 where
@@ -1590,8 +1766,32 @@ where
                 store: &self.store,
                 kernel: &self.kernel,
                 materialize: materialize_owned::<G, K::State>,
+                materialize_target: materialize_owned_target::<G, K::State>,
+                materialize_lazy: materialize_owned_lazy::<G, K::State>,
             };
-            let paths = self.cursor.next_batch(&adapter, size)?;
+            if let Some(run) = self.preparation.take() {
+                self.reverse = super::targets::build_reverse_for(&adapter, &run, true)?;
+            }
+            let paths = match &mut self.cursor {
+                TypedCursor::Direct(c) => c.next_batch(&adapter, size)?,
+                TypedCursor::Target(c) => c.next_batch(
+                    &super::targets::TargetAdapter {
+                        inner: adapter,
+                        reverse: self.reverse.as_ref(),
+                        release: self.options.unwrap().release_expanded,
+                    },
+                    size,
+                )?,
+                TypedCursor::Lazy(c) => c.next_batch(
+                    &super::lazy::LazyAdapter {
+                        inner: adapter,
+                        reverse: self.reverse.as_ref(),
+                        retain_history: self.retain_history,
+                        release_expanded: self.options.unwrap().release_expanded,
+                    },
+                    size,
+                )?,
+            };
             let stats = self.stats();
             Ok(paths.map(|paths| OwnedSearchResult { paths, stats }))
         })();
@@ -1601,12 +1801,14 @@ where
         result
     }
     fn stats(&self) -> SearchStats {
-        let mut stats = self.cursor.stats;
+        let mut stats = self.cursor.stats();
         (self.update_stats)(&self.store, &mut stats);
         stats
     }
     fn close(&mut self) {
         self.cursor.close();
+        self.reverse = None;
+        self.preparation = None;
     }
 }
 
@@ -1614,7 +1816,7 @@ pub(crate) fn stream_typed_eager_cached<K>(
     graph: Arc<Graph>,
     cache: &TypedPayloadCache,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<Box<dyn super::NativeBatchStream>>
 where
     K: TypedKernel + Send + Sync + 'static,
@@ -1623,7 +1825,10 @@ where
     K::State: serde::Serialize + Send,
 {
     let slot = cache.payload_slot(&kernel)?;
-    let cursor = super::engine::cursor::Cursor::new(run)?;
+    let super::NativeRunOptions { run, optimizations } = run.into();
+    let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
+    let retain_history = run.intermediate_states;
+    let cursor = TypedCursor::new(run, optimizations)?;
     Ok(super::stream::deferred(move || {
         let payloads = cached_payloads(&slot, &graph, &kernel)?;
         let store = native::EagerGraphStore::shared(
@@ -1635,6 +1840,10 @@ where
             store,
             kernel: TypedKernelAdapter::new(kernel),
             cursor,
+            preparation,
+            reverse: None,
+            options: optimizations,
+            retain_history,
             update_stats: |_, _| {},
         }))
     }))
@@ -1644,7 +1853,7 @@ pub(crate) fn stream_typed_parquet_lazy<K>(
     graph: Arc<Graph>,
     paths: ParquetPaths,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<Box<dyn super::NativeBatchStream>>
 where
     K: TypedKernel + Send + Sync + 'static,
@@ -1652,7 +1861,10 @@ where
     K::Edge: Send + Sync + 'static,
     K::State: serde::Serialize + Send,
 {
-    let cursor = super::engine::cursor::Cursor::new(run)?;
+    let super::NativeRunOptions { run, optimizations } = run.into();
+    let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
+    let retain_history = run.intermediate_states;
+    let cursor = TypedCursor::new(run, optimizations)?;
     Ok(super::stream::deferred(move || {
         let store = ParquetGraphStore::<K::Node, K::Edge>::from_owner(
             Owner::Shared(graph),
@@ -1664,6 +1876,10 @@ where
             store,
             kernel: TypedKernelAdapter::new(kernel),
             cursor,
+            preparation,
+            reverse: None,
+            options: optimizations,
+            retain_history,
             update_stats: |store, stats| {
                 stats.materialized_node_payloads = store.loaded_node_count();
                 stats.materialized_edge_payloads = store.loaded_edge_count();

@@ -249,7 +249,7 @@ Performance results and the explicit acceptance gates are documented in
 
 ### Target-aware graph kernels
 
-For a named plugin kernel implemented with `rxgraph::Kernel`, pass
+For a named plugin kernel implemented with `rxgraph::Kernel` or `TypedKernel`, pass
 `optimizations` to `search`, `search_first`, or `search_batches`:
 
 ```python
@@ -283,10 +283,10 @@ The kernel can implement `possible_targets` to provide conservative bounds on
 where paths can end. Any mapping, including `{}`, enables target-aware
 search - omitting it preserves the existing search.
 
-These options require an in-memory graph kernel registered with `boxed_run` or
-`boxed_memoizable_run`; typed kernels, file-backed graphs, and DSL searches do
-not support them. If a name also has a typed registration, Python selects that
-registration and rejects the options. See the [Rust kernel guide](crates/rxgraph/README.md#target-aware-native-search)
+Named graph-native and typed kernels support target options, including on
+file-backed graphs. Memoization requires an in-memory graph kernel registered
+with `boxed_memoizable_run`. DSL searches do not support these options.
+See the [Rust kernel guide](crates/rxgraph/README.md#target-aware-native-search)
 for the bounds contract and performance tradeoffs.
 
 ## Architecture

@@ -6,6 +6,7 @@
 //! instead of Arrow-backed [`Value`](crate::Value) rows.
 
 use super::ownership::Owner;
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
@@ -13,10 +14,13 @@ use anyhow::{Context, Result};
 use crate::{
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId},
     traversal::{
-        RunOptions, SearchStats, Transition,
+        SearchStats, Transition,
         engine::{self, PathEntry, SearchAdapter},
     },
 };
+
+#[cfg(test)]
+use crate::RunOptions;
 
 type StoreRef<'a, N, E> = &'a dyn GraphStore<Node = N, Edge = E>;
 
@@ -46,6 +50,12 @@ pub trait GraphStore {
         None
     }
 
+    /// Graph whose topology and internal IDs exactly match this store, when one exists.
+    /// Return `None` unless all outgoing edges and IDs match the graph.
+    fn graph(&self) -> Option<&Graph> {
+        None
+    }
+
     /// Outgoing topology for `src`.
     fn outgoing(&self, src: NodeId) -> Result<&[OutgoingEdge]>;
 
@@ -59,6 +69,19 @@ pub trait GraphStore {
 
     /// Native edge payload for `id`.
     fn edge(&self, id: EdgeId) -> Result<&Self::Edge>;
+}
+
+/// Conservative bounds for a starting node or a candidate transition.
+pub enum TargetCtx<'a, N, E, S> {
+    Start {
+        start: StartCtx<'a, N, E>,
+        state: Option<&'a S>,
+    },
+    Edge {
+        edge: EdgeCtx<'a, 'a, N, E, ()>,
+        parent: Option<&'a S>,
+        child: Option<&'a S>,
+    },
 }
 
 /// One outgoing topology entry from a source node.
@@ -91,9 +114,32 @@ impl<'a, N, E> StartCtx<'a, N, E> {
         self.store.external_node(self.node)
     }
 
+    /// Resolve an external node ID against this store.
+    pub fn resolve_node(&self, id: GraphId<'_>) -> Result<Option<NodeId>> {
+        self.store.resolve_node(id)
+    }
+
     /// Native node payload.
     pub fn node(&self) -> Result<&'a N> {
         self.store.node(self.node)
+    }
+
+    /// Test reachability using an index built for this store's graph.
+    pub fn reaches(&self, index: &crate::ReachIndex, group: u32, node: NodeId) -> Result<bool> {
+        let graph = self
+            .store
+            .graph()
+            .context("reachability index requires a graph-backed store")?;
+        index.reaches(graph, group, node)
+    }
+
+    /// Borrow the ending nodes of a group from an index for this graph.
+    pub fn targets<'i>(&self, index: &'i crate::ReachIndex, group: u32) -> Result<&'i [NodeId]> {
+        let graph = self
+            .store
+            .graph()
+            .context("reachability index requires a graph-backed store")?;
+        index.targets(graph, group)
     }
 }
 
@@ -143,6 +189,11 @@ impl<'store, 'state, N, E, S> EdgeCtx<'store, 'state, N, E, S> {
         self.store.external_node(self.src)
     }
 
+    /// Resolve an external node ID against this store.
+    pub fn resolve_node(&self, id: GraphId<'_>) -> Result<Option<NodeId>> {
+        self.store.resolve_node(id)
+    }
+
     /// External destination node ID, if available.
     pub fn dest_external_id(&self) -> Result<Option<GraphId<'store>>> {
         self.store.external_node(self.dest)
@@ -172,6 +223,24 @@ impl<'store, 'state, N, E, S> EdgeCtx<'store, 'state, N, E, S> {
     pub fn state(&self) -> &S {
         self.state
     }
+
+    /// Test reachability using an index built for this store's graph.
+    pub fn reaches(&self, index: &crate::ReachIndex, group: u32, node: NodeId) -> Result<bool> {
+        let graph = self
+            .store
+            .graph()
+            .context("reachability index requires a graph-backed store")?;
+        index.reaches(graph, group, node)
+    }
+
+    /// Borrow the ending nodes of a group from an index for this graph.
+    pub fn targets<'i>(&self, index: &'i crate::ReachIndex, group: u32) -> Result<&'i [NodeId]> {
+        let graph = self
+            .store
+            .graph()
+            .context("reachability index requires a graph-backed store")?;
+        index.targets(graph, group)
+    }
 }
 
 /// Native Rust traversal predicate/state machine.
@@ -191,6 +260,19 @@ pub trait Kernel {
         &self,
         cx: &EdgeCtx<'_, '_, Self::Node, Self::Edge, Self::State>,
     ) -> Result<Transition<Self::State>>;
+
+    /// Return a conservative set of possible ending node IDs, or `None` if unknown.
+    fn possible_targets<'a>(
+        &'a self,
+        _cx: &TargetCtx<'a, Self::Node, Self::Edge, Self::State>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok(None)
+    }
+
+    /// Whether a bound may become more restrictive after evaluating a transition.
+    fn targets_depend_on_child_state(&self) -> bool {
+        true
+    }
 }
 
 /// One node in a returned native path.
@@ -303,6 +385,10 @@ impl<N, E> GraphStore for EagerGraphStore<'_, N, E> {
         Some(self.graph.node_count())
     }
 
+    fn graph(&self) -> Option<&Graph> {
+        Some(&self.graph)
+    }
+
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
         Ok(self.graph.repo.internal_node(external))
     }
@@ -349,7 +435,7 @@ impl<N, E> GraphStore for EagerGraphStore<'_, N, E> {
 pub fn search_native<'a, K, G>(
     store: &'a G,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<SearchResult<'a, K::Node, K::Edge, K::State>>
 where
     K: Kernel,
@@ -359,8 +445,34 @@ where
         store,
         kernel: &kernel,
         materialize: materialize_native::<G, K::State>,
+        materialize_target: materialize_native_target::<G, K::State>,
+        materialize_lazy: materialize_native_lazy::<G, K::State>,
     };
-    let result = engine::search_serial(&adapter, run)?;
+    let super::NativeRunOptions { run, optimizations } = run.into();
+    let result = if let Some(options) = optimizations {
+        let reverse = super::targets::build_reverse_for(&adapter, &run, options.reverse)?;
+        match options.evaluation {
+            super::Evaluation::Incremental => engine::search_serial(
+                &super::targets::TargetAdapter {
+                    inner: adapter,
+                    reverse: reverse.as_ref(),
+                    release: options.release_expanded,
+                },
+                run,
+            )?,
+            super::Evaluation::Lazy => engine::search_serial(
+                &super::lazy::LazyAdapter {
+                    inner: adapter,
+                    reverse: reverse.as_ref(),
+                    retain_history: run.intermediate_states,
+                    release_expanded: options.release_expanded,
+                },
+                run,
+            )?,
+        }
+    } else {
+        engine::search_serial(&adapter, run)?
+    };
     Ok(SearchResult {
         paths: result.paths,
         stats: result.stats,
@@ -371,7 +483,7 @@ where
 pub fn search_batches<K, G>(
     store: &G,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
     batch_size: usize,
 ) -> Result<super::NativeSearchStream<'_, K, G>>
 where
@@ -385,7 +497,7 @@ where
 pub fn search_paths<'a, K, G>(
     store: &'a G,
     kernel: K,
-    run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<SearchResult<'a, K::Node, K::Edge, K::State>>
 where
     K: Kernel,
@@ -398,15 +510,16 @@ where
 pub fn search_first<'a, K, G>(
     store: &'a G,
     kernel: K,
-    mut run: RunOptions,
+    run: impl Into<super::NativeRunOptions>,
 ) -> Result<FirstResult<'a, K::Node, K::Edge, K::State>>
 where
     K: Kernel,
     G: GraphStore<Node = K::Node, Edge = K::Edge>,
 {
-    run.max_paths = Some(1);
-    run.strategy = crate::TraversalStrategy::BreadthFirst;
-    run.parallel = false;
+    let mut run = run.into();
+    run.run.max_paths = Some(1);
+    run.run.strategy = crate::TraversalStrategy::BreadthFirst;
+    run.run.parallel = false;
     let mut result = search_native(store, kernel, run)?;
     Ok(FirstResult {
         path: result.paths.pop(),
@@ -414,13 +527,20 @@ where
     })
 }
 
-pub(crate) struct NativeSearchAdapter<'store, 'kernel, G, K, F> {
+type TargetMaterializer<'store, G, S, P> =
+    fn(&'store G, &[PathEntry<super::targets::TargetState<S>>], usize, bool) -> Result<P>;
+type LazyMaterializer<'store, G, S, P> =
+    fn(&'store G, &[PathEntry<super::lazy::LazyState<S>>], usize, bool) -> Result<P>;
+
+pub(crate) struct NativeSearchAdapter<'store, 'kernel, G, K: Kernel, F, P> {
     pub(crate) store: &'store G,
     pub(crate) kernel: &'kernel K,
     pub(crate) materialize: F,
+    pub(crate) materialize_target: TargetMaterializer<'store, G, K::State, P>,
+    pub(crate) materialize_lazy: LazyMaterializer<'store, G, K::State, P>,
 }
 
-impl<'store, 'kernel, G, K, F, P> SearchAdapter for NativeSearchAdapter<'store, 'kernel, G, K, F>
+impl<'store, 'kernel, G, K, F, P> SearchAdapter for NativeSearchAdapter<'store, 'kernel, G, K, F, P>
 where
     K: Kernel,
     G: GraphStore<Node = K::Node, Edge = K::Edge>,
@@ -495,13 +615,168 @@ where
     }
 }
 
+impl<'store, G, K, F, P> super::targets::TargetBackend
+    for NativeSearchAdapter<'store, '_, G, K, F, P>
+where
+    K: Kernel,
+    G: GraphStore<Node = K::Node, Edge = K::Edge>,
+    K::Node: 'store,
+    K::Edge: 'store,
+    F: Fn(&'store G, &[PathEntry<K::State>], usize, bool) -> Result<P>,
+{
+    fn possible_start(
+        &self,
+        node: NodeId,
+        state: Option<&Self::State>,
+    ) -> Result<super::targets::TargetBound> {
+        let cx = TargetCtx::Start {
+            start: StartCtx::new(self.store, node),
+            state,
+        };
+        super::targets::normalize_target(
+            self.kernel.possible_targets(&cx)?,
+            self.store.dense_node_count(),
+        )
+    }
+    fn possible_edge(
+        &self,
+        (src, edge, dest): (NodeId, EdgeId, NodeId),
+        (parent, child): (Option<&Self::State>, Option<&Self::State>),
+        _: &Self::Cache,
+        current: &super::targets::TargetBound,
+    ) -> Result<super::targets::TargetBound> {
+        let unit = ();
+        let cx = TargetCtx::Edge {
+            edge: EdgeCtx::new(self.store, src, dest, edge, &unit),
+            parent,
+            child,
+        };
+        super::targets::normalize_refinement(
+            self.kernel.possible_targets(&cx)?,
+            self.store.dense_node_count(),
+            current,
+        )
+    }
+    fn target_needs_post(&self) -> bool {
+        self.kernel.targets_depend_on_child_state()
+    }
+    fn graph(&self) -> Option<&Graph> {
+        self.store.graph()
+    }
+    fn materialize_target(
+        &self,
+        arena: &[PathEntry<super::targets::TargetState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path> {
+        (self.materialize_target)(self.store, arena, path, history)
+    }
+    fn materialize_lazy(
+        &self,
+        arena: &[PathEntry<super::lazy::LazyState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path> {
+        (self.materialize_lazy)(self.store, arena, path, history)
+    }
+}
+
 pub(crate) fn materialize_native<'store, G: GraphStore, S: Clone>(
     store: &'store G,
     arena: &[PathEntry<S>],
+    path: usize,
+    intermediate_states: bool,
+) -> Result<Path<'store, G::Node, G::Edge, S>> {
+    materialize_native_projected(store, arena, path, intermediate_states, |s| s)
+}
+
+pub(crate) fn materialize_native_target<'store, G: GraphStore, S: Clone>(
+    store: &'store G,
+    arena: &[PathEntry<super::targets::TargetState<S>>],
+    path: usize,
+    intermediate_states: bool,
+) -> Result<Path<'store, G::Node, G::Edge, S>> {
+    materialize_native_projected(store, arena, path, intermediate_states, |s| {
+        s.state.as_ref().expect("requested state retained")
+    })
+}
+
+pub(crate) fn materialize_native_lazy<'store, G: GraphStore, S: Clone>(
+    store: &'store G,
+    arena: &[PathEntry<super::lazy::LazyState<S>>],
     mut path: usize,
     intermediate_states: bool,
 ) -> Result<Path<'store, G::Node, G::Edge, S>> {
-    let final_state = arena[path].state.clone();
+    let completed = &arena[path].state;
+    let final_state = completed
+        .final_state
+        .as_ref()
+        .expect("completed path has state")
+        .clone();
+    let history = if intermediate_states {
+        Some(
+            completed
+                .history
+                .as_ref()
+                .expect("history retained")
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let mut node_ids = Vec::new();
+    let mut edge_ids = Vec::new();
+    loop {
+        node_ids.push(arena[path].node);
+        if let Some(edge) = arena[path].incoming_edge {
+            edge_ids.push(edge);
+        }
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+    node_ids.reverse();
+    edge_ids.reverse();
+    let mut states = history.map(Vec::into_iter);
+    let nodes = node_ids
+        .into_iter()
+        .map(|id| {
+            Ok(PathNode {
+                id,
+                external_id: store.external_node(id)?,
+                payload: store.node(id)?,
+                state: states
+                    .as_mut()
+                    .map(|s| s.next().expect("history count matches path")),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let edges = edge_ids
+        .into_iter()
+        .map(|id| {
+            Ok(PathEdge {
+                id,
+                external_id: store.external_edge(id)?,
+                payload: store.edge(id)?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Path {
+        nodes,
+        edges,
+        state: final_state,
+    })
+}
+
+fn materialize_native_projected<'store, G: GraphStore, S: Clone, T>(
+    store: &'store G,
+    arena: &[PathEntry<T>],
+    mut path: usize,
+    intermediate_states: bool,
+    project: impl Fn(&T) -> &S,
+) -> Result<Path<'store, G::Node, G::Edge, S>> {
+    let final_state = project(&arena[path].state).clone();
     let mut node_ids = Vec::with_capacity(arena[path].depth + 1);
     let mut edge_ids = Vec::with_capacity(arena[path].depth);
     let mut states = intermediate_states.then(|| Vec::with_capacity(node_ids.capacity()));
@@ -512,7 +787,7 @@ pub(crate) fn materialize_native<'store, G: GraphStore, S: Clone>(
             edge_ids.push(edge);
         }
         if let Some(states) = &mut states {
-            states.push(arena[path].state.clone());
+            states.push(project(&arena[path].state).clone());
         }
         match arena[path].parent {
             Some(parent) => path = parent,

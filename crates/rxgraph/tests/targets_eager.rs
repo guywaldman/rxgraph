@@ -1,9 +1,10 @@
 use anyhow::Result;
 use arrow::array::record_batch;
 use rxgraph::{
-    EdgeCtx, Graph, Kernel, MemoizableKernel, NodeId, OwnedGraphId, RunOptions, TargetCtx,
-    TargetOptions, Transition, TraversalStrategy,
+    EdgeCtx, Graph, Kernel, MemoizableKernel, NodeId, RunOptions, TargetCtx, TargetOptions,
+    Transition, TraversalStrategy,
 };
+use std::borrow::Cow;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -22,12 +23,13 @@ impl Kernel for HookSpy {
     fn transition(&self, _: &EdgeCtx<'_, ()>) -> Result<Transition<()>> {
         Ok(Transition::Complete(()))
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(&'a self, cx: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(match cx {
-            TargetCtx::Start { .. } => Some(vec![1u64.into(), 2u64.into(), 4u64.into()]),
+        Ok((match cx {
+            TargetCtx::Start { .. } => Some(vec![1, 2, 4]),
             TargetCtx::Edge { .. } => None,
         })
+        .map(Cow::Owned))
     }
 }
 
@@ -98,20 +100,24 @@ impl Kernel for K {
             Transition::Continue(n)
         })
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, u64>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(match cx {
-            TargetCtx::Start { .. } => Some(vec![1u64.into(), 3u64.into()]),
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((match cx {
+            TargetCtx::Start { .. } => Some(vec![1, 3]),
             TargetCtx::Edge {
                 edge, child: None, ..
             } if edge.dest() == 4 => Some(vec![]),
             TargetCtx::Edge {
                 edge, child: None, ..
-            } if edge.dest() == 3 => Some(vec![3u64.into()]),
+            } if edge.dest() == 3 => Some(vec![3]),
             TargetCtx::Edge {
                 edge, child: None, ..
-            } if edge.src() == 2 && edge.dest() == 1 => Some(vec![1u64.into()]),
+            } if edge.src() == 2 && edge.dest() == 1 => Some(vec![1]),
             _ => None,
         })
+        .map(Cow::Owned))
     }
 }
 fn graph() -> Result<Graph> {
@@ -186,9 +192,9 @@ impl Kernel for Count {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(Transition::Complete(()))
     }
-    fn possible_targets(&self, _: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(&'a self, _: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
         self.0.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(vec![3u64.into()]))
+        Ok(Some(Cow::Owned(vec![3])))
     }
 }
 #[test]
@@ -246,14 +252,18 @@ impl Kernel for Reconverging {
             Transition::Continue(state)
         })
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, u64>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(match cx {
-            TargetCtx::Start { .. } => Some(vec![3u64.into(), 4u64.into()]),
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((match cx {
+            TargetCtx::Start { .. } => Some(vec![3, 4]),
             TargetCtx::Edge {
                 edge, child: None, ..
-            } if edge.src() == 0 => Some(vec![(edge.dest() as u64 + 2).into()]),
+            } if edge.src() == 0 => Some(vec![edge.dest() + 2]),
             _ => None,
         })
+        .map(Cow::Owned))
     }
 }
 impl MemoizableKernel for Reconverging {
@@ -362,12 +372,13 @@ impl Kernel for ManyTargets {
     fn transition(&self, _: &EdgeCtx<'_, ()>) -> Result<Transition<()>> {
         Ok(Transition::Complete(()))
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(if matches!(cx, TargetCtx::Start { .. }) {
-            Some((1..=10u64).map(Into::into).collect())
+    fn possible_targets<'a>(&'a self, cx: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((if matches!(cx, TargetCtx::Start { .. }) {
+            Some((1..=10).collect())
         } else {
             None
         })
+        .map(Cow::Owned))
     }
 }
 #[test]
@@ -414,12 +425,13 @@ impl Kernel for EmptyTargets {
         self.0.fetch_add(1, Ordering::Relaxed);
         Ok(Transition::Complete(()))
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(if matches!(cx, TargetCtx::Start { .. }) {
+    fn possible_targets<'a>(&'a self, cx: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((if matches!(cx, TargetCtx::Start { .. }) {
             Some(vec![])
         } else {
             None
         })
+        .map(Cow::Owned))
     }
 }
 #[test]
@@ -455,6 +467,52 @@ fn empty_initial_targets_skip_exact_kernel_work() -> Result<()> {
                 assert_eq!(calls.load(Ordering::Relaxed), 0);
             }
         }
+    }
+    Ok(())
+}
+
+struct PreOnly;
+impl Kernel for PreOnly {
+    type State = u64;
+    fn initial_state(&self, graph: &Graph, start: NodeId) -> Result<u64> {
+        K.initial_state(graph, start)
+    }
+    fn transition(&self, cx: &EdgeCtx<'_, u64>) -> Result<Transition<u64>> {
+        K.transition(cx)
+    }
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        match cx {
+            TargetCtx::Start { .. } => Ok(Some(Cow::Borrowed(&[1, 3]))),
+            TargetCtx::Edge { child, .. } => {
+                assert!(child.is_none(), "post-transition hook must be skipped");
+                Ok(None)
+            }
+        }
+    }
+    fn targets_depend_on_child_state(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn child_independent_bounds_skip_post_transition_hooks() -> Result<()> {
+    let graph = graph()?;
+    let run = RunOptions {
+        start_nodes: vec![0u64.into()],
+        parallel: false,
+        ..Default::default()
+    };
+    let expected = graph.search_paths_with(K, run.clone())?.paths;
+    for evaluation in [rxgraph::Evaluation::Incremental, rxgraph::Evaluation::Lazy] {
+        let run = run.clone().with_optimizations(TargetOptions {
+            evaluation,
+            reverse: true,
+            ..Default::default()
+        });
+        assert_eq!(graph.search_paths_with(PreOnly, run)?.paths, expected);
     }
     Ok(())
 }
