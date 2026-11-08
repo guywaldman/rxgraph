@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/guywaldman/rxgraph/compare/v0.13.0...v0.14.0) (2026-11-08)
+
+
+### Features
+
+* add target-aware native search optimizations ([#42](https://github.com/guywaldman/rxgraph/issues/42)) ([7e69c59](https://github.com/guywaldman/rxgraph/commit/7e69c59d9a5742dfb9e55058207b29cdb5584303))
+
 ## [0.13.0](https://github.com/guywaldman/rxgraph/compare/v0.12.1...v0.13.0) (2026-11-03)
 
 
