@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.0.0](https://github.com/guywaldman/rxgraph/compare/v0.14.0...v1.0.0) (2026-11-08)
+## [0.15.0](https://github.com/guywaldman/rxgraph/compare/v0.14.0...v0.15.0) (2026-11-08)
 
 
 ### ⚠ BREAKING CHANGES
