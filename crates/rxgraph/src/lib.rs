@@ -38,13 +38,15 @@ pub use python::register;
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
 pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
 pub use traversal::{
-    ArrowList, ArrowRow, ArrowStruct, BoxedRun, EdgeCtx, EdgeField, FieldValue, FirstResult,
-    GraphPath, GraphSearchStream, Kernel, KernelEntry, NativeBatchStream, NativeSearchStream,
-    NodeField, OwnedGraphPath, OwnedSearchResult, ParquetPaths, PathsResult, PayloadField,
-    RunKernel, RunOptions, SearchResult, SearchStats, Transition, TraversalConfig,
-    TraversalConfigBuilder, TraversalStrategy, TypedKernel, TypedKernelEntry, TypedPayloadCache,
-    boxed_run, boxed_typed_run, build_kernel, build_typed_kernel, register_kernel, search_native,
-    try_build_kernel, try_build_typed_kernel,
+    ArrowList, ArrowRow, ArrowStruct, BoxedRun, EdgeCtx, EdgeField, Evaluation, FieldValue,
+    FirstResult, GraphPath, GraphSearchStream, Kernel, KernelEntry, MemoOptions, MemoizableKernel,
+    MemoizedGraphSearchStream, MemoizedKernel, NativeBatchStream, NativeRunOptions,
+    NativeSearchStream, NodeField, OwnedGraphPath, OwnedSearchResult, ParquetPaths, PathsResult,
+    PayloadField, RunKernel, RunOptions, SearchResult, SearchStats, TargetCtx, TargetOptions,
+    Transition, TraversalConfig, TraversalConfigBuilder, TraversalStrategy, TypedKernel,
+    TypedKernelEntry, TypedPayloadCache, boxed_memoizable_run, boxed_run, boxed_typed_run,
+    build_kernel, build_typed_kernel, register_kernel, search_native, try_build_kernel,
+    try_build_typed_kernel,
 };
 
 // Re-exported so plugin crates can register kernels without their own dependency.

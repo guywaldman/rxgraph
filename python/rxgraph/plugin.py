@@ -59,6 +59,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
     _rxgraph = native_module
     _consumes_paths = hasattr(_rxgraph.SearchResult, "_take_paths")
     _supports_streaming = hasattr(_rxgraph.Graph, "search_kernel_batches")
+    _supports_optimizations = hasattr(_rxgraph.Graph, "supports_kernel_optimizations")
     module_name = namespace.get("__name__", __name__)
 
     TYPE_COL = "type"
@@ -268,6 +269,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             intermediate_states: bool = False,
             progress: bool = False,
             max_visits_per_node: int = 1,
+            optimizations: Mapping[str, Any] | None = None,
         ) -> "SearchResult":
             """Run a stateful traversal.
 
@@ -299,6 +301,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             :param intermediate_states: Whether to include per-node state history on returned paths (false by default).
             :param progress: Whether to report running counters on stderr (live spinner on a terminal/TTY, plain log lines otherwise).
             :param max_visits_per_node: Maximum occurrences of a node within one path (1 by default, i.e. no revisits).
+            :param optimizations: Graph-native kernel options: ``evaluation`` (``"incremental"`` or ``"lazy"``), ``reverse`` and ``release_expanded`` (booleans), and ``memo_capacity`` (nonnegative integer, requiring a memoizable registration). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires registration through ``boxed_memoizable_run``. Typed kernels, file-backed searches, and DSL searches do not support these options.
 
             >>> import rxgraph as rxg
             >>> graph = rxg.Graph.from_edges([("a", "b"), ("b", "c")])
@@ -323,8 +326,13 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                     intermediate_states=intermediate_states,
                     progress=progress,
                     max_visits_per_node=max_visits_per_node,
+                    optimizations=optimizations,
                 )
 
+            if optimizations is not None:
+                raise ValueError(
+                    "target optimizations require a named graph-native kernel"
+                )
             stop = _default_stop(stop, max_paths)
             kernel_obj = Kernel(
                 visit,
@@ -365,12 +373,14 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             progress: bool = False,
             max_visits_per_node: int = 1,
             batch_size: int = 1024,
+            optimizations: Mapping[str, Any] | None = None,
         ) -> "SearchStream":
             """Pull batches from a named native kernel. No work runs between pulls.
 
             Batches contain at most ``batch_size`` paths. Use a context manager
             or ``close()`` to release an unfinished search. DSL streaming is not
             supported yet. Typed stores retain their serial execution behavior.
+            ``optimizations`` has the same graph-native options as :meth:`search`.
             """
             if not _supports_streaming:
                 raise NotImplementedError(
@@ -386,6 +396,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 raise TypeError("search_batches requires a named native kernel")
             translated_params = self._translate_params(params or {})
             self._ensure_payload_columns(columns)
+            extra = self._optimization_args(optimizations)
             inner = self._inner.search_kernel_batches(
                 kernel,
                 translated_params,
@@ -398,6 +409,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 progress,
                 max_visits_per_node,
                 batch_size,
+                *extra,
             )
             return SearchStream(inner, self._id_to_label, self._edge_id_to_label)
 
@@ -418,6 +430,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             intermediate_states: bool = False,
             progress: bool = False,
             max_visits_per_node: int = 1,
+            optimizations: Mapping[str, Any] | None = None,
         ) -> "SearchPath | None":
             """Return the canonical shallowest path in stable input order."""
             result = self.search(
@@ -436,6 +449,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 intermediate_states=intermediate_states,
                 progress=progress,
                 max_visits_per_node=max_visits_per_node,
+                optimizations=optimizations,
             )
             return result.paths[0] if result.paths else None
 
@@ -460,6 +474,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             intermediate_states: bool,
             progress: bool,
             max_visits_per_node: int = 1,
+            optimizations: Mapping[str, Any] | None = None,
         ) -> "SearchResult":
             if any(arg is not None for arg in (visit, next_state, stop, initial_state)):
                 raise ValueError(
@@ -471,6 +486,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             self._ensure_payload_columns(columns)
             start_node_ids = [self.node_id(node) for node in start_nodes]
 
+            extra = self._optimization_args(optimizations)
             inner = self._inner.search_kernel(
                 name,
                 translated_params,
@@ -482,10 +498,25 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 intermediate_states,
                 progress,
                 max_visits_per_node,
+                *extra,
             )
             return SearchResult._from_inner(
                 inner, self._id_to_label, self._edge_id_to_label
             )
+
+        @staticmethod
+        def _optimization_args(
+            optimizations: Mapping[str, Any] | None,
+        ) -> tuple[dict[str, Any], ...]:
+            if optimizations is None:
+                return ()
+            if not isinstance(optimizations, Mapping):
+                raise TypeError("optimizations must be a mapping")
+            if not _supports_optimizations:
+                raise NotImplementedError(
+                    "this native backend does not support target optimizations; rebuild the plugin"
+                )
+            return (dict(optimizations),)
 
         def _translate_params(self, params: Mapping[str, Any]) -> dict[str, Any]:
             """Translate node-label-valued params to engine IDs.

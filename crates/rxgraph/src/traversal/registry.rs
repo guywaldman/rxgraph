@@ -22,7 +22,7 @@ use serde::Serialize;
 use crate::{
     Graph, StateRow,
     traversal::{
-        Kernel, RunOptions, SearchResult,
+        Kernel, RunOptions, SearchResult, TargetOptions,
         typed::{self, OwnedSearchResult, ParquetPaths, TypedKernel, TypedPayloadCache},
     },
 };
@@ -45,6 +45,26 @@ pub trait RunKernel: Send + Sync {
         _run: RunOptions,
     ) -> Result<Box<dyn super::NativeBatchStream>> {
         bail!("this native kernel runner does not support streaming")
+    }
+    /// Optional target-aware execution; custom runners may leave this unsupported.
+    fn run_optimized<'g>(
+        &self,
+        _graph: &'g Graph,
+        _run: RunOptions,
+        _options: TargetOptions,
+        _memo_capacity: Option<usize>,
+    ) -> Result<SearchResult<'g>> {
+        bail!("this native kernel runner does not support target optimizations")
+    }
+    /// Optional target-aware pull execution.
+    fn stream_optimized(
+        &self,
+        _graph: Arc<Graph>,
+        _run: RunOptions,
+        _options: TargetOptions,
+        _memo_capacity: Option<usize>,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this native kernel runner does not support target optimizations")
     }
 }
 
@@ -182,9 +202,119 @@ where
         ) -> Result<Box<dyn super::NativeBatchStream>> {
             super::stream::graph_stream(graph, self.0.clone(), Arc::clone(&self.1), run)
         }
+        fn run_optimized<'g>(
+            &self,
+            graph: &'g Graph,
+            run: RunOptions,
+            options: TargetOptions,
+            memo_capacity: Option<usize>,
+        ) -> Result<SearchResult<'g>> {
+            if memo_capacity.unwrap_or(0) > 0 {
+                bail!("this native kernel runner does not support memoization")
+            }
+            graph
+                .search_paths_with(self.0.clone(), run.with_optimizations(options))?
+                .try_map_state(|state| (self.1)(state))
+        }
+        fn stream_optimized(
+            &self,
+            graph: Arc<Graph>,
+            run: RunOptions,
+            options: TargetOptions,
+            memo_capacity: Option<usize>,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            if memo_capacity.unwrap_or(0) > 0 {
+                bail!("this native kernel runner does not support memoization")
+            }
+            super::stream::graph_stream_optimized(
+                graph,
+                self.0.clone(),
+                Arc::clone(&self.1),
+                run,
+                options,
+            )
+        }
     }
 
     Box::new(Runner(kernel, Arc::new(encode)))
+}
+
+/// Wraps a kernel that explicitly permits bounded transition memoization.
+pub fn boxed_memoizable_run<K>(kernel: K) -> BoxedRun
+where
+    K: super::MemoizableKernel + Clone + Send + Sync + 'static,
+    K::State: Send + Sync + Clone + Serialize,
+{
+    struct Runner<K>(K);
+    impl<K> RunKernel for Runner<K>
+    where
+        K: super::MemoizableKernel + Clone + Send + Sync + 'static,
+        K::State: Send + Sync + Clone + Serialize,
+    {
+        fn run<'g>(&self, graph: &'g Graph, run: RunOptions) -> Result<SearchResult<'g>> {
+            graph
+                .search_paths_with(self.0.clone(), run)?
+                .try_map_state(encode_state)
+        }
+        fn stream(
+            &self,
+            graph: Arc<Graph>,
+            run: RunOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            super::stream::graph_stream(
+                graph,
+                self.0.clone(),
+                Arc::new(encode_state::<K::State>),
+                run,
+            )
+        }
+        fn run_optimized<'g>(
+            &self,
+            graph: &'g Graph,
+            run: RunOptions,
+            options: TargetOptions,
+            memo_capacity: Option<usize>,
+        ) -> Result<SearchResult<'g>> {
+            if let Some(capacity) = memo_capacity.filter(|&n| n > 0) {
+                graph
+                    .search_paths_with(
+                        self.0.clone().memoized(capacity),
+                        run.with_optimizations(options),
+                    )?
+                    .try_map_state(encode_state)
+            } else {
+                graph
+                    .search_paths_with(self.0.clone(), run.with_optimizations(options))?
+                    .try_map_state(encode_state)
+            }
+        }
+        fn stream_optimized(
+            &self,
+            graph: Arc<Graph>,
+            run: RunOptions,
+            options: TargetOptions,
+            memo_capacity: Option<usize>,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            if let Some(capacity) = memo_capacity.filter(|&n| n > 0) {
+                super::stream::graph_stream_optimized(
+                    graph,
+                    self.0.clone().memoized(capacity),
+                    Arc::new(encode_state::<K::State>),
+                    run,
+                    options,
+                )
+            } else {
+                super::stream::graph_stream_optimized(
+                    graph,
+                    self.0.clone(),
+                    Arc::new(encode_state::<K::State>),
+                    run,
+                    options,
+                )
+            }
+        }
+    }
+    Box::new(Runner(kernel))
 }
 
 pub(crate) fn encode_state<T: Serialize>(state: &T) -> Result<StateRow> {

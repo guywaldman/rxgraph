@@ -1,7 +1,7 @@
 use crate::{
-    DslKernel, Graph, GraphId, OwnedGraphId, OwnedSearchResult, ParquetPaths, RunOptions,
-    SearchResult, SearchStats, StateRow, TraversalConfigBuilder, TraversalStrategy,
-    TypedPayloadCache, Value, try_build_kernel, try_build_typed_kernel,
+    DslKernel, Evaluation, Graph, GraphId, OwnedGraphId, OwnedSearchResult, ParquetPaths,
+    RunOptions, SearchResult, SearchStats, StateRow, TargetOptions, TraversalConfigBuilder,
+    TraversalStrategy, TypedPayloadCache, Value, try_build_kernel, try_build_typed_kernel,
 };
 use pyo3::{
     Borrowed,
@@ -196,7 +196,7 @@ impl PyGraph {
     /// calling this; no ID remapping happens here.
     ///
     /// Result marshalling is identical to the DSL `search` path.
-    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1))]
+    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1, optimizations = None))]
     #[allow(clippy::too_many_arguments)]
     fn search_kernel(
         &self,
@@ -211,7 +211,9 @@ impl PyGraph {
         intermediate_states: bool,
         progress: bool,
         max_visits_per_node: usize,
+        optimizations: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySearchResult> {
+        let optimizations = parse_optimizations(optimizations)?;
         let params_json = py_dict_to_json(params)?;
         let run = RunOptions {
             start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
@@ -225,6 +227,11 @@ impl PyGraph {
         };
 
         if let Some(parquet) = &self.parquet {
+            if optimizations.is_some() {
+                return Err(PyValueError::new_err(
+                    "target optimizations require a graph-native kernel; file-backed kernels are unsupported",
+                ));
+            }
             let Some(kernel) =
                 try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)?
             else {
@@ -243,6 +250,11 @@ impl PyGraph {
         }
 
         if let Some(kernel) = try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)? {
+            if optimizations.is_some() {
+                return Err(PyValueError::new_err(
+                    "target optimizations are unsupported for typed kernels",
+                ));
+            }
             let result = kernel
                 .run_eager_cached(&self.inner, &self.typed_cache, run)
                 .map_err(to_py_runtime_err)?;
@@ -252,7 +264,11 @@ impl PyGraph {
         if let Some(kernel) = try_build_kernel(name, &params_json).map_err(to_py_value_err)? {
             return PySearchResult::from_result(
                 py,
-                kernel.run(&self.inner, run).map_err(to_py_runtime_err)?,
+                match optimizations {
+                    Some((options, memo)) => kernel.run_optimized(&self.inner, run, options, memo),
+                    None => kernel.run(&self.inner, run),
+                }
+                .map_err(to_py_runtime_err)?,
             );
         }
 
@@ -261,7 +277,7 @@ impl PyGraph {
         )))
     }
 
-    #[pyo3(signature = (name, params, start_nodes, max_depth=None, max_paths=None, strategy="dfs", parallel=true, intermediate_states=false, progress=false, max_visits_per_node=1, batch_size=1024))]
+    #[pyo3(signature = (name, params, start_nodes, max_depth=None, max_paths=None, strategy="dfs", parallel=true, intermediate_states=false, progress=false, max_visits_per_node=1, batch_size=1024, optimizations=None))]
     #[allow(clippy::too_many_arguments)]
     fn search_kernel_batches(
         &self,
@@ -276,7 +292,9 @@ impl PyGraph {
         progress: bool,
         max_visits_per_node: usize,
         batch_size: usize,
+        optimizations: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<PySearchStream> {
+        let optimizations = parse_optimizations(optimizations)?;
         if batch_size == 0 {
             return Err(PyValueError::new_err("batch_size must be at least 1"));
         }
@@ -300,6 +318,7 @@ impl PyGraph {
         let inner = if let Some(kernel) =
             try_build_typed_kernel(name, &params).map_err(to_py_value_err)?
         {
+            if optimizations.is_some() { return Err(PyValueError::new_err("target optimizations are unsupported for typed kernels")); }
             if let Some(parquet) = &self.parquet
                 && matches!(parquet.mode, PayloadMode::Lazy)
             {
@@ -312,7 +331,7 @@ impl PyGraph {
                 "file-backed graph search requires a typed native kernel; {name:?} is not registered as typed"
             )));
         } else if let Some(kernel) = try_build_kernel(name, &params).map_err(to_py_value_err)? {
-            kernel.stream(graph, run)
+            match optimizations { Some((options, memo)) => kernel.stream_optimized(graph, run, options, memo), None => kernel.stream(graph, run) }
         } else {
             return Err(PyValueError::new_err(format!("unknown kernel {name:?}")));
         }
@@ -323,6 +342,10 @@ impl PyGraph {
             stats: SearchStats::default(),
             path_factory: None,
         })
+    }
+
+    fn supports_kernel_optimizations(&self) -> bool {
+        true
     }
 
     #[pyo3(signature = (start, max_depth = None))]
@@ -1084,4 +1107,63 @@ fn to_py_value_err(err: anyhow::Error) -> PyErr {
 
 fn to_py_runtime_err(err: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(format!("{err:#}"))
+}
+
+fn parse_optimizations(
+    value: Option<&Bound<'_, PyAny>>,
+) -> PyResult<Option<(TargetOptions, Option<usize>)>> {
+    let Some(value) = value else { return Ok(None) };
+    let dict = value
+        .cast::<PyDict>()
+        .map_err(|_| PyTypeError::new_err("optimizations must be a mapping"))?;
+    let mut options = TargetOptions::default();
+    let mut memo_capacity = None;
+    for (key, value) in dict.iter() {
+        let key: String = key
+            .extract()
+            .map_err(|_| PyTypeError::new_err("optimization keys must be strings"))?;
+        match key.as_str() {
+            "evaluation" => {
+                let value: String = value.extract().map_err(|_| {
+                    PyTypeError::new_err("evaluation must be 'incremental' or 'lazy'")
+                })?;
+                options.evaluation = match value.as_str() {
+                    "incremental" => Evaluation::Incremental,
+                    "lazy" => Evaluation::Lazy,
+                    _ => {
+                        return Err(PyValueError::new_err(
+                            "evaluation must be 'incremental' or 'lazy'",
+                        ));
+                    }
+                };
+            }
+            "memo_capacity" => {
+                if value.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(PyTypeError::new_err(
+                        "memo_capacity must be a nonnegative integer",
+                    ));
+                }
+                memo_capacity = Some(value.extract::<usize>().map_err(|_| {
+                    PyValueError::new_err("memo_capacity must be a nonnegative integer")
+                })?);
+            }
+            "reverse" | "release_expanded" => {
+                if !value.is_instance_of::<pyo3::types::PyBool>() {
+                    return Err(PyTypeError::new_err(format!("{key} must be a bool")));
+                }
+                let flag: bool = value.extract()?;
+                if key == "reverse" {
+                    options.reverse = flag;
+                } else {
+                    options.release_expanded = flag;
+                }
+            }
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "unknown optimization {key:?}"
+                )));
+            }
+        }
+    }
+    Ok(Some((options, memo_capacity)))
 }

@@ -206,6 +206,19 @@ pub trait Kernel {
 
     /// Evaluates edge acceptance, child state, and completion in one call.
     fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>>;
+
+    /// Conservatively narrows possible ending nodes for a path prefix.
+    /// `None` supplies no additional bound; an empty vector rules out the prefix.
+    /// Every node at which this prefix or a continuation could complete must
+    /// remain in the bound. Returned bounds are intersected per path. The hook
+    /// must be deterministic and must not rely on its call count or side effects.
+    /// The engine may skip transitions on ruled-out prefixes, including their errors.
+    fn possible_targets(
+        &self,
+        _cx: &super::targets::TargetCtx<'_, Self::State>,
+    ) -> Result<Option<Vec<crate::OwnedGraphId>>> {
+        Ok(None)
+    }
 }
 
 /// Per-edge context passed to a [`Kernel`].

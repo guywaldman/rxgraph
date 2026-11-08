@@ -38,6 +38,11 @@ pub(crate) trait SearchAdapter {
     where
         F: FnMut(EdgeId, NodeId) -> Result<bool>;
     fn make_cache(&self) -> Self::Cache;
+    fn can_release_expanded_states(&self) -> bool {
+        false
+    }
+    /// Called after BFS finishes expanding a path whose history is not needed.
+    fn release_expanded_state(&self, _state: &mut Self::State) {}
     fn eval_edge(
         &self,
         src: NodeId,

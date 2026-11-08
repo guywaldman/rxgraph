@@ -164,6 +164,121 @@ The name-based `EdgeCtx` getters remain available for convenience and coercion.
 Pre-bound fields use exact Arrow types and are the intended maximum-throughput
 path.
 
+### Target-aware native search
+
+For a `Graph` search using `rxgraph::Kernel`, implement `possible_targets` to
+give the engine a conservative bound on where a path can **end**. This hook is
+optional and the normal native search path does not call it unless optimizations
+are requested. `None` means no additional information, `Some(vec![])` means the
+prefix cannot complete, and a nonempty result lists possible ending nodes by
+external ID. Each refinement is intersected with the path's previous bound.
+
+The following kernel uses an `allowed: bool` edge column and completes at node
+`42`. The graph must contain start node `1` and target node `42`.
+
+```rust
+use rxgraph::{
+    EdgeCtx, EdgeField, Evaluation, Graph, Kernel, NodeId, OwnedGraphId,
+    RunOptions, TargetCtx, TargetOptions, Transition,
+};
+
+struct TargetKernel {
+    allowed: EdgeField<bool>,
+    target: OwnedGraphId,
+}
+
+impl Kernel for TargetKernel {
+    type State = u64;
+
+    fn initial_state(&self, _: &Graph, _: NodeId) -> anyhow::Result<u64> {
+        Ok(0)
+    }
+
+    fn transition(&self, cx: &EdgeCtx<'_, u64>) -> anyhow::Result<Transition<u64>> {
+        if !cx.edge_field(&self.allowed).unwrap_or(false) {
+            return Ok(Transition::Reject);
+        }
+        let next = cx.state() + 1;
+        Ok(if cx.dest_id() == Some(self.target.as_ref()) {
+            Transition::Complete(next)
+        } else {
+            Transition::Continue(next)
+        })
+    }
+
+    fn possible_targets(
+        &self,
+        cx: &TargetCtx<'_, u64>,
+    ) -> anyhow::Result<Option<Vec<OwnedGraphId>>> {
+        Ok(match cx {
+            TargetCtx::Start { .. } => Some(vec![self.target.clone()]),
+            TargetCtx::Edge { edge, .. }
+                if !edge.edge_field(&self.allowed).unwrap_or(false) => Some(vec![]),
+            _ => None,
+        })
+    }
+}
+
+fn search(graph: &Graph) -> anyhow::Result<()> {
+    let kernel = TargetKernel {
+        allowed: graph.edge_field("allowed")?,
+        target: 42_u64.into(),
+    };
+    let run = RunOptions {
+        start_nodes: vec![1_u64.into()],
+        ..Default::default()
+    }
+    .with_optimizations(TargetOptions {
+        evaluation: Evaluation::Incremental,
+        reverse: true,
+        release_expanded: false,
+    });
+    let mut stream = graph.search_batches_with(kernel, run, 1024)?;
+    for batch in stream.by_ref() {
+        for path in batch? {
+            println!("{:?}: {}", path.nodes, path.state);
+        }
+    }
+    println!("{:?}", stream.stats());
+    Ok(())
+}
+```
+
+Every bound must include every node at which the current prefix or any of its
+valid continuations could complete. A possible ending can still be traversed as
+an intermediate node; `transition` decides whether a path completes. A missing
+ending can silently remove valid results. The hook must be deterministic and
+must not depend on call count or side effects: the engine may skip transitions
+and their errors on pruned branches. Edge contexts expose the source, edge and
+destination in graph direction. Parent and child state may be absent, so return
+`None` when a state-dependent restriction cannot be established safely.
+
+`TargetOptions` selects independent, opt-in execution settings:
+
+- `evaluation`: `Incremental` evaluates transitions during traversal; `Lazy`
+  enumerates candidates and replays the exact kernel at possible endings.
+  Lazy evaluation requires deterministic transitions, can repeat work on shared
+  prefixes, and can be much slower when state rejects branches early. Its
+  `stats.evaluated_edges` counts topology candidates, not replayed calls.
+- `reverse`: builds reverse reachability from stateless start bounds. If a start
+  has no such bound, reverse preprocessing is skipped. For streams, preparation
+  begins on the first pull. This can save work on selective targets but adds
+  preparation time and memory.
+- `release_expanded`: releases expanded BFS states when intermediate history is
+  not requested. This can reduce peak memory at a latency cost.
+
+Implement `MemoizableKernel` and call `kernel.memoized(capacity)` to reuse
+transitions with an optimized search. Equal keys for the same edge must imply
+the same transition behavior, including rejection, completion, errors and the
+entire child state. Errors are not cached. Capacity limits entries, not bytes,
+and the wrapper uses a lock shared by workers. Create a fresh wrapper for each
+search. Memoization and lazy replay are workload-dependent and can increase
+latency or memory; measure them for the kernel and graph in use.
+
+These options apply to `Graph` searches using `rxgraph::Kernel`; the separate
+`traversal::native::GraphStore` and `TypedKernel` APIs use their own traversal
+interfaces.
+
 ## Python Bindings
 
 Python bindings are published as the `rxgraph` package on PyPI. The same PyO3

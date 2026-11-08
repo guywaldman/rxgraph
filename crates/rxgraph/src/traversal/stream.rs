@@ -6,7 +6,7 @@ use super::{
     kernel::PayloadCache,
     native::{self, NativeSearchAdapter},
 };
-use crate::{Graph, GraphPath, Kernel, RunOptions, SearchStats, StateRow};
+use crate::{Graph, GraphPath, Kernel, NativeRunOptions, RunOptions, SearchStats, StateRow};
 use anyhow::{Result, bail};
 use std::{marker::PhantomData, sync::Arc};
 
@@ -20,17 +20,24 @@ pub trait NativeBatchStream: Send {
 
 /// A native graph cursor retaining typed state and borrowing graph identity.
 pub struct GraphSearchStream<'g, K: Kernel> {
-    graph: &'g Graph,
-    kernel: K,
-    cursor: GraphCursor<K::State, PayloadCache>,
-    batch_size: usize,
+    inner: GraphStreamInner<'g, K>,
+}
+
+enum GraphStreamInner<'g, K: Kernel> {
+    Direct {
+        graph: &'g Graph,
+        kernel: Option<K>,
+        cursor: GraphCursor<K::State, PayloadCache>,
+        batch_size: usize,
+    },
+    Optimized(super::targets::OptimizedSearchStream<'g, K>),
 }
 impl Graph {
     /// Starts a native pull stream. `batch_size` is a positive maximum, not a minimum.
     pub fn search_batches_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: impl Into<NativeRunOptions>,
         batch_size: usize,
     ) -> Result<GraphSearchStream<'_, K>>
     where
@@ -39,20 +46,39 @@ impl Graph {
         if batch_size == 0 {
             bail!("batch_size must be at least 1");
         }
+        let NativeRunOptions { run, optimizations } = run.into();
+        if let Some(options) = optimizations {
+            return Ok(GraphSearchStream {
+                inner: GraphStreamInner::Optimized(
+                    self.search_batches_optimized_with(kernel, run, batch_size, options)?,
+                ),
+            });
+        }
         Ok(GraphSearchStream {
-            graph: self,
-            kernel,
-            cursor: GraphCursor::new(run)?,
-            batch_size,
+            inner: GraphStreamInner::Direct {
+                graph: self,
+                kernel: Some(kernel),
+                cursor: GraphCursor::new(run)?,
+                batch_size,
+            },
         })
     }
 }
 impl<K: Kernel> GraphSearchStream<'_, K> {
     pub fn stats(&self) -> SearchStats {
-        self.cursor.stats()
+        match &self.inner {
+            GraphStreamInner::Direct { cursor, .. } => cursor.stats(),
+            GraphStreamInner::Optimized(stream) => stream.stats(),
+        }
     }
     pub fn close(&mut self) {
-        self.cursor.close();
+        match &mut self.inner {
+            GraphStreamInner::Direct { cursor, kernel, .. } => {
+                cursor.close();
+                *kernel = None;
+            }
+            GraphStreamInner::Optimized(stream) => stream.close(),
+        }
     }
 }
 impl<'g, K: Kernel + Sync> Iterator for GraphSearchStream<'g, K>
@@ -61,15 +87,28 @@ where
 {
     type Item = Result<Vec<GraphPath<'g, K::State>>>;
     fn next(&mut self) -> Option<Self::Item> {
-        let adapter = GraphSearchAdapter {
-            graph: self.graph,
-            kernel: &self.kernel,
-            project: |state: &K::State| Ok(state.clone()),
-            output: PhantomData,
-        };
-        self.cursor
-            .next_batch(&adapter, self.batch_size)
-            .transpose()
+        match &mut self.inner {
+            GraphStreamInner::Direct {
+                graph,
+                kernel,
+                cursor,
+                batch_size,
+            } => {
+                let adapter = GraphSearchAdapter {
+                    graph,
+                    kernel: kernel.as_ref()?,
+                    project: |state: &K::State| Ok(state.clone()),
+                    output: PhantomData,
+                };
+                let result = cursor.next_batch(&adapter, *batch_size);
+                if result.is_err() || matches!(result, Ok(None)) {
+                    cursor.close();
+                    *kernel = None;
+                }
+                result.transpose()
+            }
+            GraphStreamInner::Optimized(stream) => stream.next(),
+        }
     }
 }
 impl<K: Kernel> Drop for GraphSearchStream<'_, K> {
@@ -284,4 +323,131 @@ where
         initialize: Some(initialize),
         inner: None,
     })
+}
+
+pub(crate) fn graph_stream_optimized<K, F>(
+    graph: Arc<Graph>,
+    kernel: K,
+    encode: Arc<F>,
+    run: RunOptions,
+    options: super::TargetOptions,
+) -> Result<Box<dyn NativeBatchStream>>
+where
+    K: Kernel + Send + Sync + 'static,
+    K::State: Send + Sync + Clone,
+    F: Fn(&K::State) -> Result<StateRow> + Send + Sync + 'static,
+{
+    use super::{
+        Evaluation,
+        lazy::{LazyAdapter, LazyState},
+        targets::{Reverse, TargetAdapter, TargetState, build_reverse},
+    };
+    enum OptimizedCursor<S> {
+        Incremental(GraphCursor<TargetState<S>, PayloadCache>),
+        Lazy(GraphCursor<LazyState<S>, PayloadCache>),
+    }
+    struct Stream<K: Kernel, F> {
+        graph: Arc<Graph>,
+        kernel: K,
+        encode: Arc<F>,
+        cursor: OptimizedCursor<K::State>,
+        options: super::TargetOptions,
+        preparation: Option<RunOptions>,
+        reverse: Option<Reverse>,
+        retain_history: bool,
+    }
+    impl<K, F> NativeBatchStream for Stream<K, F>
+    where
+        K: Kernel + Send + Sync + 'static,
+        K::State: Send + Sync + Clone,
+        F: Fn(&K::State) -> Result<StateRow> + Send + Sync + 'static,
+    {
+        fn next_batch(&mut self, size: usize) -> Result<Option<OwnedSearchResult>> {
+            if size == 0 {
+                bail!("batch_size must be at least 1");
+            }
+            if let Some(run) = self.preparation.take() {
+                self.reverse = build_reverse(&self.graph, &self.kernel, &run, true)?;
+            }
+            let paths = match &mut self.cursor {
+                OptimizedCursor::Incremental(cursor) => {
+                    let adapter = TargetAdapter {
+                        inner: GraphSearchAdapter {
+                            graph: &self.graph,
+                            kernel: &self.kernel,
+                            project: |state: &K::State| Ok(state.clone()),
+                            output: PhantomData,
+                        },
+                        reverse: self.reverse.as_ref(),
+                        release: self.options.release_expanded,
+                    };
+                    cursor.next_batch(&adapter, size)?
+                }
+                OptimizedCursor::Lazy(cursor) => {
+                    let adapter = LazyAdapter {
+                        graph: &self.graph,
+                        kernel: &self.kernel,
+                        reverse: self.reverse.as_ref(),
+                        retain_history: self.retain_history,
+                        release_expanded: self.options.release_expanded,
+                    };
+                    cursor.next_batch(&adapter, size)?
+                }
+            };
+            paths
+                .map(|paths| {
+                    let paths = paths
+                        .into_iter()
+                        .map(|path| -> Result<OwnedGraphPath> {
+                            Ok(OwnedGraphPath {
+                                nodes: path.nodes.into_iter().map(|id| id.into_owned()).collect(),
+                                edges: path.edges.into_iter().map(|id| id.into_owned()).collect(),
+                                state: (self.encode)(&path.state)?,
+                                intermediate_states: path
+                                    .intermediate_states
+                                    .map(|states| {
+                                        states.iter().map(|state| (self.encode)(state)).collect()
+                                    })
+                                    .transpose()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(OwnedSearchResult {
+                        paths,
+                        stats: self.stats(),
+                    })
+                })
+                .transpose()
+        }
+        fn stats(&self) -> SearchStats {
+            match &self.cursor {
+                OptimizedCursor::Incremental(c) => c.stats(),
+                OptimizedCursor::Lazy(c) => c.stats(),
+            }
+        }
+        fn close(&mut self) {
+            match &mut self.cursor {
+                OptimizedCursor::Incremental(c) => c.close(),
+                OptimizedCursor::Lazy(c) => c.close(),
+            }
+            self.reverse = None;
+            self.preparation = None;
+        }
+    }
+    let preparation = (options.reverse && run.max_paths != Some(0)).then(|| run.clone());
+    let retain_history = run.intermediate_states;
+    let cursor = match options.evaluation {
+        Evaluation::Incremental => OptimizedCursor::Incremental(GraphCursor::new(run)?),
+        Evaluation::Lazy => OptimizedCursor::Lazy(GraphCursor::new(run)?),
+    };
+    Ok(managed(Stream {
+        graph,
+        kernel,
+        encode,
+        cursor,
+        options,
+        preparation,
+        reverse: None,
+        retain_history,
+    }))
 }
