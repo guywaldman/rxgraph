@@ -13,7 +13,9 @@ use fixture::{
     scale::{Dataset, Shape, Validator},
 };
 use heap::{Buffer, HeapKernel, HeapState};
-use rxgraph::{GraphPath, MemoizableKernel, RunOptions, SearchStats, TargetOptions, TraversalStrategy};
+use rxgraph::{
+    GraphPath, MemoizableKernel, RunOptions, SearchStats, TargetOptions, TraversalStrategy,
+};
 use serde_json::json;
 use std::{
     hint::black_box,
