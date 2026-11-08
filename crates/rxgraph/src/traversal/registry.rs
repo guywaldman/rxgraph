@@ -109,6 +109,50 @@ inventory::collect!(KernelEntry);
 
 /// Object-safe typed native runner.
 pub trait RunTypedKernel: Send + Sync {
+    /// Optional optimized eager execution; custom runners may leave it unsupported.
+    fn run_eager_cached_optimized(
+        &self,
+        _graph: &Graph,
+        _cache: &TypedPayloadCache,
+        _run: RunOptions,
+        _options: TargetOptions,
+    ) -> Result<OwnedSearchResult> {
+        bail!("this typed native kernel runner does not support target optimizations")
+    }
+
+    /// Optional optimized file-backed execution.
+    fn run_parquet_lazy_optimized(
+        &self,
+        _graph: &Graph,
+        _paths: ParquetPaths,
+        _run: RunOptions,
+        _options: TargetOptions,
+    ) -> Result<OwnedSearchResult> {
+        bail!("this typed native kernel runner does not support target optimizations")
+    }
+
+    /// Optional optimized eager stream.
+    fn stream_eager_cached_optimized(
+        &self,
+        _graph: Arc<Graph>,
+        _cache: &TypedPayloadCache,
+        _run: RunOptions,
+        _options: TargetOptions,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this typed native kernel runner does not support target optimizations")
+    }
+
+    /// Optional optimized file-backed stream.
+    fn stream_parquet_lazy_optimized(
+        &self,
+        _graph: Arc<Graph>,
+        _paths: ParquetPaths,
+        _run: RunOptions,
+        _options: TargetOptions,
+    ) -> Result<Box<dyn super::NativeBatchStream>> {
+        bail!("this typed native kernel runner does not support target optimizations")
+    }
+
     /// Optional owned eager stream. Default supports legacy eager-only runners.
     fn stream_eager_cached(
         &self,
@@ -338,6 +382,62 @@ where
         K::Edge: Send + Sync + 'static,
         K::State: Send + Sync + Clone + Serialize,
     {
+        fn run_eager_cached_optimized(
+            &self,
+            graph: &Graph,
+            cache: &TypedPayloadCache,
+            run: RunOptions,
+            options: TargetOptions,
+        ) -> Result<OwnedSearchResult> {
+            typed::run_typed_eager_cached(
+                graph,
+                cache,
+                self.0.clone(),
+                run.with_optimizations(options),
+            )
+        }
+        fn run_parquet_lazy_optimized(
+            &self,
+            graph: &Graph,
+            paths: ParquetPaths,
+            run: RunOptions,
+            options: TargetOptions,
+        ) -> Result<OwnedSearchResult> {
+            typed::run_typed_parquet_lazy(
+                graph,
+                paths,
+                self.0.clone(),
+                run.with_optimizations(options),
+            )
+        }
+        fn stream_eager_cached_optimized(
+            &self,
+            graph: Arc<Graph>,
+            cache: &TypedPayloadCache,
+            run: RunOptions,
+            options: TargetOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            typed::stream_typed_eager_cached(
+                graph,
+                cache,
+                self.0.clone(),
+                run.with_optimizations(options),
+            )
+        }
+        fn stream_parquet_lazy_optimized(
+            &self,
+            graph: Arc<Graph>,
+            paths: ParquetPaths,
+            run: RunOptions,
+            options: TargetOptions,
+        ) -> Result<Box<dyn super::NativeBatchStream>> {
+            typed::stream_typed_parquet_lazy(
+                graph,
+                paths,
+                self.0.clone(),
+                run.with_optimizations(options),
+            )
+        }
         fn stream_eager_cached(
             &self,
             graph: Arc<Graph>,

@@ -2,11 +2,12 @@
 use anyhow::Result;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use rxgraph::{
-    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, MemoizableKernel, NodeId, OwnedGraphId,
-    RunOptions, SearchStats, TargetCtx, TargetOptions, Transition, TraversalStrategy,
+    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, MemoizableKernel, NodeId, RunOptions,
+    SearchStats, TargetCtx, TargetOptions, Transition, TraversalStrategy,
 };
 use serde_json::json;
 use std::{
+    borrow::Cow,
     hint::black_box,
     sync::{
         Arc,
@@ -62,10 +63,10 @@ impl Fixture {
             unknown,
         })
     }
-    fn targets(&self, mask: u8) -> Vec<OwnedGraphId> {
+    fn targets(&self, mask: u8) -> Vec<NodeId> {
         (0..8)
             .filter(|i| mask & (1 << i) != 0)
-            .map(|i| (self.target_base + i).into())
+            .map(|i| (self.target_base + i) as NodeId)
             .collect()
     }
 }
@@ -158,16 +159,19 @@ impl<const COUNT: bool> Kernel for WorkKernel<'_, COUNT> {
             Transition::Continue(next)
         })
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, State>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, State>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
         if self.data.unknown {
             return Ok(None);
         }
         match cx {
-            TargetCtx::Start { .. } => Ok(Some(self.data.targets(ALL))),
+            TargetCtx::Start { .. } => Ok(Some(Cow::Owned(self.data.targets(ALL)))),
             TargetCtx::Edge { edge, .. } => {
                 Ok(
                     possible(self.data, node_depth(edge.src() as u64), edge.dest())
-                        .map(|m| self.data.targets(m)),
+                        .map(|m| Cow::Owned(self.data.targets(m))),
                 )
             }
         }

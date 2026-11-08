@@ -14,7 +14,7 @@
 //! edges of a search, so kernels in hot loops do not re-downcast/clone the
 //! underlying Arrow array on every call.
 
-use std::{cell::RefCell, collections::HashMap};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap};
 
 use anyhow::{Context, Result};
 use arrow::{
@@ -208,16 +208,24 @@ pub trait Kernel {
     fn transition(&self, cx: &EdgeCtx<'_, Self::State>) -> Result<Transition<Self::State>>;
 
     /// Conservatively narrows possible ending nodes for a path prefix.
-    /// `None` supplies no additional bound; an empty vector rules out the prefix.
+    /// `None` supplies no additional bound; an empty slice rules out the prefix.
     /// Every node at which this prefix or a continuation could complete must
     /// remain in the bound. Returned bounds are intersected per path. The hook
     /// must be deterministic and must not rely on its call count or side effects.
     /// The engine may skip transitions on ruled-out prefixes, including their errors.
-    fn possible_targets(
-        &self,
+    /// IDs are internal node IDs for this graph. A borrowed slice can reuse a
+    /// precomputed target set without allocating or resolving external IDs.
+    fn possible_targets<'a>(
+        &'a self,
         _cx: &super::targets::TargetCtx<'_, Self::State>,
-    ) -> Result<Option<Vec<crate::OwnedGraphId>>> {
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
         Ok(None)
+    }
+
+    /// Whether target bounds can be refined using the child state. Returning
+    /// false skips the post-transition edge hook; start hooks are unchanged.
+    fn targets_depend_on_child_state(&self) -> bool {
+        true
     }
 }
 
@@ -261,6 +269,16 @@ impl<'a, S> EdgeCtx<'a, S> {
     /// The graph being traversed.
     pub fn graph(&self) -> &'a Graph {
         self.graph
+    }
+
+    /// Check whether a node can reach a named group in a reusable index.
+    pub fn reaches(
+        &self,
+        index: &crate::graph::ReachIndex,
+        group: u32,
+        node: NodeId,
+    ) -> Result<bool> {
+        index.reaches(self.graph, group, node)
     }
 
     /// Internal id of the edge's source node.

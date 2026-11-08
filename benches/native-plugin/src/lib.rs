@@ -2,6 +2,7 @@
 use anyhow::{Context, Result};
 use pyo3::prelude::*;
 use rxgraph::{traversal::native, *};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static EXACT_TRANSITIONS: AtomicUsize = AtomicUsize::new(0);
@@ -71,8 +72,16 @@ impl Kernel for Budget {
         EXACT_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
         Ok(self.step(cx.state(), cx.edge_u64("cost")?.unwrap(), cx.dest_id()))
     }
-    fn possible_targets(&self, _: &TargetCtx<'_, State>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(Some(vec![OwnedGraphId::U64(self.target)]))
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, State>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        let graph = match cx {
+            TargetCtx::Start { graph, .. } => graph,
+            TargetCtx::Edge { edge, .. } => edge.graph(),
+        };
+        let target = graph.internal_node_id(self.target).context("target node")?;
+        Ok(Some(Cow::Owned(vec![target])))
     }
 }
 impl MemoizableKernel for Budget {
@@ -104,6 +113,19 @@ impl TypedKernel for Budget {
         cx: &native::EdgeCtx<'_, '_, (), Cost, State>,
     ) -> Result<Transition<State>> {
         Ok(self.step(cx.state(), cx.edge()?.0, cx.dest_external_id()?))
+    }
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &native::TargetCtx<'a, (), Cost, State>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
+        let target = match cx {
+            native::TargetCtx::Start { start, .. } => {
+                start.resolve_node(GraphId::U64(self.target))?
+            }
+            native::TargetCtx::Edge { edge, .. } => edge.resolve_node(GraphId::U64(self.target))?,
+        }
+        .context("target node")?;
+        Ok(Some(Cow::Owned(vec![target])))
     }
 }
 rxgraph::inventory::submit! {rxgraph::KernelEntry {name:"bench_arrow",make:|p|Ok(rxgraph::boxed_run(Budget::from_params(p)?))}}

@@ -1,11 +1,12 @@
-//! Checks that expanded BFS prefixes do not retain spilled target bounds.
+//! Checks that expanded BFS prefixes share target bounds.
+use std::borrow::Cow;
 use std::{alloc::System, sync::Arc};
 
 use anyhow::Result;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use rxgraph::{
-    EdgeCtx, Evaluation, Graph, Kernel, NodeId, OwnedGraphId, RunOptions, TargetCtx, TargetOptions,
-    Transition, TraversalStrategy,
+    EdgeCtx, Evaluation, Graph, Kernel, NodeId, RunOptions, TargetCtx, TargetOptions, Transition,
+    TraversalStrategy,
 };
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
@@ -28,11 +29,12 @@ impl Kernel for ManyTargets {
             Transition::Continue(())
         })
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, ()>) -> Result<Option<Vec<OwnedGraphId>>> {
-        Ok(match cx {
-            TargetCtx::Start { .. } => Some((1..=TARGETS).map(|n| (CHAIN + n).into()).collect()),
+    fn possible_targets<'a>(&'a self, cx: &TargetCtx<'_, ()>) -> Result<Option<Cow<'a, [NodeId]>>> {
+        Ok((match cx {
+            TargetCtx::Start { .. } => Some((1..=TARGETS).map(|n| (CHAIN + n) as NodeId).collect()),
             TargetCtx::Edge { .. } => None,
         })
+        .map(Cow::Owned))
     }
 }
 
@@ -83,13 +85,13 @@ fn retained_search_bytes(graph: &Graph, release_expanded: bool) -> Result<i64> {
 }
 
 #[test]
-fn releasing_expanded_prefixes_drops_large_target_bounds() -> Result<()> {
+fn expanded_prefixes_share_large_target_bounds() -> Result<()> {
     let graph = graph()?;
     let keep = retained_search_bytes(&graph, false)?;
     let release = retained_search_bytes(&graph, true)?;
     assert!(
-        keep - release >= 32 * 1024,
-        "expanded target bounds should be freed: keep={keep}, release={release}"
+        (keep - release).abs() < 16 * 1024,
+        "expanded target bounds should be shared: keep={keep}, release={release}"
     );
     Ok(())
 }

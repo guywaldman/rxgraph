@@ -107,6 +107,8 @@ pub trait GraphRepo {
 
 #[derive(Debug)]
 pub(crate) struct Repo {
+    /// Stable identity of this topology, even if the Graph value is moved.
+    pub(crate) topology_identity: Arc<()>,
     csr_offsets: Vec<Offset>,
     csr_dests: Vec<NodeId>,
     edge_ids: Vec<EdgeId>,
@@ -132,6 +134,7 @@ pub(crate) struct Repo {
 struct IncomingCsr {
     offsets: Vec<Offset>,
     srcs: Vec<NodeId>,
+    edge_ids: OnceLock<Vec<EdgeId>>,
 }
 
 #[derive(Debug)]
@@ -337,6 +340,32 @@ impl GraphRepo for Repo {
 }
 
 impl Repo {
+    pub(crate) fn incoming_edges(&self, node: NodeId) -> impl Iterator<Item = (EdgeId, NodeId)> {
+        let incoming = self.incoming();
+        let edge_ids = incoming.edge_ids.get_or_init(|| {
+            let mut result = vec![0; self.edge_count];
+            let mut cursor = incoming.offsets.clone();
+            for src in 0..self.node_count as NodeId {
+                let start = self.csr_offsets[src as usize] as usize;
+                let end = self.csr_offsets[src as usize + 1] as usize;
+                for index in start..end {
+                    let dest = self.csr_dests[index] as usize;
+                    let pos = cursor[dest] as usize;
+                    result[pos] = self.edge_ids[index];
+                    cursor[dest] += 1;
+                }
+            }
+            result
+        });
+        let i = node as usize;
+        let start = incoming.offsets[i] as usize;
+        let end = incoming.offsets[i + 1] as usize;
+        edge_ids[start..end]
+            .iter()
+            .copied()
+            .zip(incoming.srcs[start..end].iter().copied())
+    }
+
     /// Returns the reverse-adjacency CSR, building it on first use.
     fn incoming(&self) -> &IncomingCsr {
         self.incoming
@@ -388,6 +417,7 @@ impl Repo {
         let edge_count = edge_endpoints.len();
 
         Ok(Self {
+            topology_identity: Arc::new(()),
             nodes: strip_topology_columns(nodes, NODE_TOPOLOGY_COLS)?,
             edges: strip_topology_columns(edges, EDGE_TOPOLOGY_COLS)?,
             node_count,
@@ -456,7 +486,11 @@ fn build_incoming_csr(
             cursor[dest as usize] += 1;
         }
     }
-    IncomingCsr { offsets, srcs }
+    IncomingCsr {
+        offsets,
+        srcs,
+        edge_ids: OnceLock::new(),
+    }
 }
 
 struct Preprocessed {

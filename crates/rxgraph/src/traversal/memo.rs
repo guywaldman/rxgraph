@@ -119,11 +119,15 @@ impl<K: MemoizableKernel> Kernel for MemoizedKernel<K> {
         Ok(result)
     }
 
-    fn possible_targets(
-        &self,
+    fn possible_targets<'a>(
+        &'a self,
         cx: &super::targets::TargetCtx<'_, Self::State>,
-    ) -> Result<Option<Vec<crate::OwnedGraphId>>> {
+    ) -> Result<Option<std::borrow::Cow<'a, [NodeId]>>> {
         self.kernel.possible_targets(cx)
+    }
+
+    fn targets_depend_on_child_state(&self) -> bool {
+        self.kernel.targets_depend_on_child_state()
     }
 }
 

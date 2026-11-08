@@ -1,5 +1,5 @@
 //! Conservative per-path bounds on possible ending nodes.
-use std::{borrow::Cow, marker::PhantomData};
+use std::{borrow::Cow, marker::PhantomData, sync::Arc};
 
 use super::{
     algo::{GraphSearchAdapter, materialize_path},
@@ -7,11 +7,10 @@ use super::{
     kernel::PayloadCache,
 };
 use crate::{
-    EdgeCtx, EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, OwnedGraphId,
-    RunOptions, SearchResult, SearchStats,
+    EdgeCtx, EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, RunOptions,
+    SearchResult, SearchStats,
 };
 use anyhow::{Context, Result, bail};
-use smallvec::SmallVec;
 
 /// Context for an optional conservative bound on possible completion nodes.
 /// Edge contexts use the original graph direction. A pre-transition call has
@@ -65,36 +64,59 @@ pub enum Evaluation {
 }
 
 /// `None` is unknown; `Some` is a sorted set of internal ending nodes.
-pub(crate) type TargetBound = Option<SmallVec<[NodeId; 8]>>;
+pub(crate) type TargetBound = Option<Arc<[NodeId]>>;
 
-fn resolve(graph: &Graph, ids: Option<Vec<OwnedGraphId>>) -> Result<TargetBound> {
+fn resolve(graph: &Graph, ids: Option<Cow<'_, [NodeId]>>) -> Result<TargetBound> {
+    normalize_target(ids, Some(graph.node_count()))
+}
+
+pub(crate) fn normalize_target(
+    ids: Option<Cow<'_, [NodeId]>>,
+    count: Option<usize>,
+) -> Result<TargetBound> {
     ids.map(|ids| {
         let mut nodes = ids
-            .into_iter()
+            .iter()
+            .copied()
             .map(|id| {
-                graph
-                    .repo
-                    .internal_node(id.as_ref())
-                    .with_context(|| format!("unknown target node {id}"))
+                if count.is_some_and(|count| id as usize >= count) {
+                    bail!("unknown target node {id}");
+                }
+                Ok(id)
             })
-            .collect::<Result<SmallVec<[NodeId; 8]>>>()?;
+            .collect::<Result<Vec<NodeId>>>()?;
         nodes.sort_unstable();
         nodes.dedup();
-        Ok(nodes)
+        Ok(Arc::from(nodes))
     })
     .transpose()
+}
+
+/// No additional restriction when a borrowed set equals the current bound.
+pub(crate) fn normalize_refinement(
+    ids: Option<Cow<'_, [NodeId]>>,
+    count: Option<usize>,
+    current: &TargetBound,
+) -> Result<TargetBound> {
+    if let (Some(ids), Some(current)) = (&ids, current)
+        && ids.as_ref() == current.as_ref()
+    {
+        return Ok(None);
+    }
+    normalize_target(ids, count)
 }
 
 pub(crate) fn intersect(old: &TargetBound, new: TargetBound) -> TargetBound {
     match (old, new) {
         (None, new) => new,
         (Some(old), None) => Some(old.clone()),
-        (Some(old), Some(new)) => Some(
+        (Some(old), Some(new)) if old.as_ref() == new.as_ref() => Some(Arc::clone(old)),
+        (Some(old), Some(new)) => Some(Arc::from(
             old.iter()
                 .copied()
                 .filter(|n| new.binary_search(n).is_ok())
-                .collect(),
-        ),
+                .collect::<Vec<_>>(),
+        )),
     }
 }
 
@@ -114,36 +136,26 @@ pub(crate) fn initial_bound<K: Kernel>(
     )
 }
 
-pub(crate) fn advance_bound<K: Kernel>(
-    graph: &Graph,
-    kernel: &K,
-    candidate: (NodeId, EdgeId, NodeId),
-    states: (Option<&K::State>, Option<&K::State>),
-    old: &TargetBound,
-    cache: &PayloadCache,
-) -> Result<TargetBound> {
-    let next = edge_update(graph, kernel, candidate, states, cache)?;
-    Ok(intersect(old, next))
-}
-
 fn edge_update<K: Kernel>(
     graph: &Graph,
     kernel: &K,
     candidate: (NodeId, EdgeId, NodeId),
     states: (Option<&K::State>, Option<&K::State>),
     cache: &PayloadCache,
+    current: &TargetBound,
 ) -> Result<TargetBound> {
     let (src, edge, dest) = candidate;
     let (parent, child) = states;
     let unit = ();
     let edge = EdgeCtx::new(graph, src, dest, edge, &unit, cache);
-    resolve(
-        graph,
+    normalize_refinement(
         kernel.possible_targets(&TargetCtx::Edge {
             edge,
             parent,
             child,
         })?,
+        Some(graph.node_count()),
+        current,
     )
 }
 
@@ -162,7 +174,7 @@ impl Reverse {
                     return masks[node as usize] != 0;
                 };
                 let mut active = 0u64;
-                for target in bound {
+                for target in bound.iter() {
                     if let Ok(index) = ids.binary_search(target) {
                         active |= 1 << index;
                     }
@@ -193,7 +205,7 @@ pub(crate) fn build_reverse<K: Kernel>(
         let Some(ids) = initial_bound(graph, kernel, start, None)? else {
             return Ok(None);
         };
-        targets.extend(ids);
+        targets.extend(ids.iter().copied());
     }
     targets.sort_unstable();
     targets.dedup();
@@ -243,29 +255,201 @@ pub(crate) fn build_reverse<K: Kernel>(
     }
 }
 
+/// Build reverse reachability for any dense topology backend.
+pub(crate) fn build_reverse_for<A: TargetBackend>(
+    adapter: &A,
+    run: &RunOptions,
+    enabled: bool,
+) -> Result<Option<Reverse>> {
+    if !enabled || run.start_nodes.is_empty() || run.max_paths == Some(0) {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    for external in &run.start_nodes {
+        let start = adapter
+            .resolve_node(external.as_ref())?
+            .with_context(|| format!("unknown start node {external}"))?;
+        let Some(ids) = adapter.possible_start(start, None)? else {
+            return Ok(None);
+        };
+        targets.extend(ids.iter().copied());
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    let count = adapter
+        .dense_node_count()
+        .context("reverse preprocessing requires a dense, enumerable topology")?;
+    if targets.iter().any(|&node| node as usize >= count) {
+        bail!("target node is out of range");
+    }
+    let incoming = if adapter.graph().is_none() {
+        let mut incoming = vec![Vec::new(); count];
+        for src in 0..count {
+            let degree = adapter.out_degree(src as NodeId)?;
+            adapter.for_each_range(src as NodeId, 0, degree, |_, dest| {
+                let sources = incoming
+                    .get_mut(dest as usize)
+                    .context("edge destination outside dense topology")?;
+                sources.push(src as NodeId);
+                Ok(true)
+            })?;
+        }
+        Some(incoming)
+    } else {
+        None
+    };
+    if targets.len() <= 8 && count.saturating_mul(8) <= 128 * 1024 * 1024 {
+        let mut masks = vec![0u64; count];
+        for (index, &target) in targets.iter().enumerate() {
+            let bit = 1u64 << index;
+            let mut queue = vec![target];
+            masks[target as usize] |= bit;
+            let mut head = 0;
+            while let Some(&node) = queue.get(head) {
+                head += 1;
+                for source in adapter
+                    .graph()
+                    .into_iter()
+                    .flat_map(|g| g.repo.incoming(node))
+                    .chain(
+                        incoming
+                            .as_ref()
+                            .into_iter()
+                            .flat_map(|v| v[node as usize].iter().copied()),
+                    )
+                {
+                    if masks[source as usize] & bit == 0 {
+                        masks[source as usize] |= bit;
+                        queue.push(source);
+                    }
+                }
+            }
+        }
+        Ok(Some(Reverse::PerTarget {
+            ids: targets,
+            masks,
+        }))
+    } else {
+        let mut keep = vec![false; count];
+        let mut queue = Vec::new();
+        for target in targets {
+            if !keep[target as usize] {
+                keep[target as usize] = true;
+                queue.push(target);
+            }
+        }
+        let mut head = 0;
+        while let Some(&node) = queue.get(head) {
+            head += 1;
+            for source in adapter
+                .graph()
+                .into_iter()
+                .flat_map(|g| g.repo.incoming(node))
+                .chain(
+                    incoming
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|v| v[node as usize].iter().copied()),
+                )
+            {
+                if !keep[source as usize] {
+                    keep[source as usize] = true;
+                    queue.push(source);
+                }
+            }
+        }
+        Ok(Some(Reverse::Coarse(keep)))
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TargetState<S> {
     pub(crate) state: Option<S>,
     pub(crate) targets: TargetBound,
 }
 
-pub(crate) struct TargetAdapter<'g, 'k, K: Kernel, P> {
-    pub(crate) inner: GraphSearchAdapter<'g, 'k, K, P, <K as Kernel>::State>,
+/// Operations required to apply target refinement to an arbitrary search backend.
+pub(crate) trait TargetBackend: SearchAdapter {
+    fn possible_start(&self, node: NodeId, state: Option<&Self::State>) -> Result<TargetBound>;
+    fn possible_edge(
+        &self,
+        edge: (NodeId, EdgeId, NodeId),
+        states: (Option<&Self::State>, Option<&Self::State>),
+        cache: &Self::Cache,
+        current: &TargetBound,
+    ) -> Result<TargetBound>;
+    fn target_needs_post(&self) -> bool;
+    fn graph(&self) -> Option<&Graph>;
+    fn materialize_target(
+        &self,
+        arena: &[PathEntry<TargetState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path>;
+    fn materialize_lazy(
+        &self,
+        arena: &[PathEntry<super::lazy::LazyState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path>;
+}
+
+impl<'g, K: Kernel, P: Fn(&K::State) -> Result<K::State>> TargetBackend
+    for GraphSearchAdapter<'g, '_, K, P, K::State>
+{
+    fn possible_start(&self, node: NodeId, state: Option<&Self::State>) -> Result<TargetBound> {
+        initial_bound(self.graph, self.kernel, node, state)
+    }
+    fn possible_edge(
+        &self,
+        edge: (NodeId, EdgeId, NodeId),
+        states: (Option<&Self::State>, Option<&Self::State>),
+        cache: &Self::Cache,
+        current: &TargetBound,
+    ) -> Result<TargetBound> {
+        edge_update(self.graph, self.kernel, edge, states, cache, current)
+    }
+    fn target_needs_post(&self) -> bool {
+        self.kernel.targets_depend_on_child_state()
+    }
+    fn graph(&self) -> Option<&Graph> {
+        Some(self.graph)
+    }
+    fn materialize_target(
+        &self,
+        arena: &[PathEntry<TargetState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path> {
+        materialize_path(self.graph, arena, path, history, |entry| {
+            (self.project)(entry.state.as_ref().expect("requested state retained"))
+        })
+    }
+    fn materialize_lazy(
+        &self,
+        arena: &[PathEntry<super::lazy::LazyState<Self::State>>],
+        path: usize,
+        history: bool,
+    ) -> Result<Self::Path> {
+        super::lazy::materialize_graph_lazy(self.graph, arena, path, history)
+    }
+}
+
+pub(crate) struct TargetAdapter<'k, A> {
+    pub(crate) inner: A,
     pub(crate) reverse: Option<&'k Reverse>,
     pub(crate) release: bool,
 }
 
-impl<'g, 'k, K: Kernel, P: Fn(&K::State) -> Result<K::State>> SearchAdapter
-    for TargetAdapter<'g, 'k, K, P>
-{
-    type State = TargetState<K::State>;
-    type Path = GraphPath<'g, K::State>;
-    type Cache = PayloadCache;
+impl<A: TargetBackend> SearchAdapter for TargetAdapter<'_, A> {
+    type State = TargetState<A::State>;
+    type Path = A::Path;
+    type Cache = A::Cache;
     fn resolve_node(&self, id: GraphId<'_>) -> Result<Option<NodeId>> {
         self.inner.resolve_node(id)
     }
     fn initial_state(&self, node: NodeId) -> Result<Self::State> {
-        let initial = initial_bound(self.inner.graph, self.inner.kernel, node, None)?;
+        let initial = self.inner.possible_start(node, None)?;
         if initial.as_ref().is_some_and(|nodes| nodes.is_empty()) {
             return Ok(TargetState {
                 state: None,
@@ -273,7 +457,7 @@ impl<'g, 'k, K: Kernel, P: Fn(&K::State) -> Result<K::State>> SearchAdapter
             });
         }
         let state = self.inner.initial_state(node)?;
-        let next = initial_bound(self.inner.graph, self.inner.kernel, node, Some(&state))?;
+        let next = self.inner.possible_start(node, Some(&state))?;
         Ok(TargetState {
             state: Some(state),
             targets: intersect(&initial, next),
@@ -316,12 +500,11 @@ impl<'g, 'k, K: Kernel, P: Fn(&K::State) -> Result<K::State>> SearchAdapter
             return Ok(None);
         }
         let parent = state.state.as_ref().expect("unexpanded path state");
-        let update = edge_update(
-            self.inner.graph,
-            self.inner.kernel,
+        let update = self.inner.possible_edge(
             (src, edge, dest),
             (Some(parent), None),
             cache,
+            &state.targets,
         )?;
         let bound = match update {
             None => Cow::Borrowed(&state.targets),
@@ -340,13 +523,16 @@ impl<'g, 'k, K: Kernel, P: Fn(&K::State) -> Result<K::State>> SearchAdapter
         let Some((child, stop)) = self.inner.eval_edge(src, edge, dest, parent, cache)? else {
             return Ok(None);
         };
-        let update = edge_update(
-            self.inner.graph,
-            self.inner.kernel,
-            (src, edge, dest),
-            (Some(parent), Some(&child)),
-            cache,
-        )?;
+        let update = if self.inner.target_needs_post() {
+            self.inner.possible_edge(
+                (src, edge, dest),
+                (Some(parent), Some(&child)),
+                cache,
+                bound.as_ref(),
+            )?
+        } else {
+            None
+        };
         let bound = match update {
             None => bound.into_owned(),
             Some(update) => intersect(bound.as_ref(), Some(update)),
@@ -377,9 +563,7 @@ impl<'g, 'k, K: Kernel, P: Fn(&K::State) -> Result<K::State>> SearchAdapter
         path: usize,
         history: bool,
     ) -> Result<Self::Path> {
-        materialize_path(self.inner.graph, arena, path, history, |entry| {
-            (self.inner.project)(entry.state.as_ref().expect("requested state retained"))
-        })
+        self.inner.materialize_target(arena, path, history)
     }
 }
 

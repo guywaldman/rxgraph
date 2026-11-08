@@ -36,7 +36,7 @@ pub mod traversal;
 pub use python::register;
 
 pub use dsl::{DslExpr, DslKernel, Scalar, StateRow, Value};
-pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId};
+pub use graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId, ReachIndex, ReachSpec};
 pub use traversal::{
     ArrowList, ArrowRow, ArrowStruct, BoxedRun, EdgeCtx, EdgeField, Evaluation, FieldValue,
     FirstResult, GraphPath, GraphSearchStream, Kernel, KernelEntry, MemoOptions, MemoizableKernel,

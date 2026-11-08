@@ -227,11 +227,6 @@ impl PyGraph {
         };
 
         if let Some(parquet) = &self.parquet {
-            if optimizations.is_some() {
-                return Err(PyValueError::new_err(
-                    "target optimizations require a graph-native kernel; file-backed kernels are unsupported",
-                ));
-            }
             let Some(kernel) =
                 try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)?
             else {
@@ -239,25 +234,36 @@ impl PyGraph {
                     "file-backed graph search requires a typed native kernel; {name:?} is not registered as typed"
                 )));
             };
-            let result = match parquet.mode {
-                PayloadMode::Eager => kernel.run_eager_cached(&self.inner, &self.typed_cache, run),
-                PayloadMode::Lazy => {
+            let options = typed_optimizations(optimizations)?;
+            let result = match (parquet.mode, options) {
+                (PayloadMode::Eager, None) => {
+                    kernel.run_eager_cached(&self.inner, &self.typed_cache, run)
+                }
+                (PayloadMode::Eager, Some(options)) => {
+                    kernel.run_eager_cached_optimized(&self.inner, &self.typed_cache, run, options)
+                }
+                (PayloadMode::Lazy, None) => {
                     kernel.run_parquet_lazy(&self.inner, parquet.paths.clone(), run)
                 }
+                (PayloadMode::Lazy, Some(options)) => kernel.run_parquet_lazy_optimized(
+                    &self.inner,
+                    parquet.paths.clone(),
+                    run,
+                    options,
+                ),
             }
             .map_err(to_py_runtime_err)?;
             return PySearchResult::from_owned_result(py, result);
         }
 
         if let Some(kernel) = try_build_typed_kernel(name, &params_json).map_err(to_py_value_err)? {
-            if optimizations.is_some() {
-                return Err(PyValueError::new_err(
-                    "target optimizations are unsupported for typed kernels",
-                ));
+            let result = match typed_optimizations(optimizations)? {
+                Some(options) => {
+                    kernel.run_eager_cached_optimized(&self.inner, &self.typed_cache, run, options)
+                }
+                None => kernel.run_eager_cached(&self.inner, &self.typed_cache, run),
             }
-            let result = kernel
-                .run_eager_cached(&self.inner, &self.typed_cache, run)
-                .map_err(to_py_runtime_err)?;
+            .map_err(to_py_runtime_err)?;
             return PySearchResult::from_owned_result(py, result);
         }
 
@@ -318,13 +324,19 @@ impl PyGraph {
         let inner = if let Some(kernel) =
             try_build_typed_kernel(name, &params).map_err(to_py_value_err)?
         {
-            if optimizations.is_some() { return Err(PyValueError::new_err("target optimizations are unsupported for typed kernels")); }
+            let options = typed_optimizations(optimizations)?;
             if let Some(parquet) = &self.parquet
                 && matches!(parquet.mode, PayloadMode::Lazy)
             {
-                kernel.stream_parquet_lazy(graph, parquet.paths.clone(), run)
+                match options {
+                    Some(options) => kernel.stream_parquet_lazy_optimized(graph, parquet.paths.clone(), run, options),
+                    None => kernel.stream_parquet_lazy(graph, parquet.paths.clone(), run),
+                }
             } else {
-                kernel.stream_eager_cached(graph, &self.typed_cache, run)
+                match options {
+                    Some(options) => kernel.stream_eager_cached_optimized(graph, &self.typed_cache, run, options),
+                    None => kernel.stream_eager_cached(graph, &self.typed_cache, run),
+                }
             }
         } else if self.parquet.is_some() {
             return Err(PyValueError::new_err(format!(
@@ -1107,6 +1119,18 @@ fn to_py_value_err(err: anyhow::Error) -> PyErr {
 
 fn to_py_runtime_err(err: anyhow::Error) -> PyErr {
     PyRuntimeError::new_err(format!("{err:#}"))
+}
+
+fn typed_optimizations(
+    options: Option<(TargetOptions, Option<usize>)>,
+) -> PyResult<Option<TargetOptions>> {
+    match options {
+        Some((_, Some(capacity))) if capacity > 0 => Err(PyValueError::new_err(
+            "memoization is unsupported for typed kernels",
+        )),
+        Some((options, _)) => Ok(Some(options)),
+        None => Ok(None),
+    }
 }
 
 fn parse_optimizations(

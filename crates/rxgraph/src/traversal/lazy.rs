@@ -3,15 +3,16 @@ use std::sync::Arc;
 
 use crate::{
     EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, RunOptions, SearchResult,
-    SearchStats, Transition,
+    SearchStats,
 };
 use anyhow::{Context, Result, bail};
 
 use super::{
     TargetOptions,
+    algo::GraphSearchAdapter,
     engine::{PathEntry, SearchAdapter, cursor::GraphCursor},
-    kernel::{EdgeCtx, PayloadCache},
-    targets::{Reverse, TargetBound, advance_bound, build_reverse, initial_bound, intersect},
+    kernel::PayloadCache,
+    targets::{Reverse, TargetBackend, TargetBound, build_reverse, intersect},
 };
 
 #[derive(Clone)]
@@ -42,28 +43,27 @@ pub(crate) struct LazyState<S> {
     start: NodeId,
     path: Option<Arc<Frame>>,
     targets: TargetBound,
-    final_state: Option<S>,
-    history: Option<Vec<S>>,
+    pub(crate) final_state: Option<S>,
+    pub(crate) history: Option<Vec<S>>,
 }
 
-pub(crate) struct LazyAdapter<'g, 'k, K> {
-    pub(crate) graph: &'g Graph,
-    pub(crate) kernel: &'k K,
+pub(crate) struct LazyAdapter<'k, A> {
+    pub(crate) inner: A,
     pub(crate) reverse: Option<&'k Reverse>,
     pub(crate) retain_history: bool,
     pub(crate) release_expanded: bool,
 }
 
-impl<'g, K: Kernel> SearchAdapter for LazyAdapter<'g, '_, K> {
-    type State = LazyState<K::State>;
-    type Path = GraphPath<'g, K::State>;
-    type Cache = PayloadCache;
+impl<A: TargetBackend> SearchAdapter for LazyAdapter<'_, A> {
+    type State = LazyState<A::State>;
+    type Path = A::Path;
+    type Cache = A::Cache;
 
     fn resolve_node(&self, external: GraphId<'_>) -> Result<Option<NodeId>> {
-        Ok(self.graph.repo.internal_node(external))
+        self.inner.resolve_node(external)
     }
     fn initial_state(&self, start: NodeId) -> Result<Self::State> {
-        let targets = initial_bound(self.graph, self.kernel, start, None)?;
+        let targets = self.inner.possible_start(start, None)?;
         Ok(LazyState {
             start,
             path: None,
@@ -73,25 +73,22 @@ impl<'g, K: Kernel> SearchAdapter for LazyAdapter<'g, '_, K> {
         })
     }
     fn dense_node_count(&self) -> Option<usize> {
-        Some(self.graph.node_count())
+        self.inner.dense_node_count()
+    }
+    fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
+        self.inner.prefetch_outgoing(nodes)
     }
     fn out_degree(&self, node: NodeId) -> Result<usize> {
-        Ok(self.graph.repo.outgoing_slice(node).0.len())
+        self.inner.out_degree(node)
     }
-    fn for_each_range<F>(&self, node: NodeId, start: usize, end: usize, mut visit: F) -> Result<()>
+    fn for_each_range<F>(&self, node: NodeId, start: usize, end: usize, visit: F) -> Result<()>
     where
         F: FnMut(EdgeId, NodeId) -> Result<bool>,
     {
-        let (edges, dests) = self.graph.repo.outgoing_slice(node);
-        for (&edge, &dest) in edges[start..end].iter().zip(&dests[start..end]) {
-            if !visit(edge, dest)? {
-                break;
-            }
-        }
-        Ok(())
+        self.inner.for_each_range(node, start, end, visit)
     }
     fn make_cache(&self) -> Self::Cache {
-        PayloadCache::new()
+        self.inner.make_cache()
     }
     fn can_release_expanded_states(&self) -> bool {
         self.release_expanded
@@ -112,14 +109,10 @@ impl<'g, K: Kernel> SearchAdapter for LazyAdapter<'g, '_, K> {
         if targets.as_ref().is_some_and(|t| t.is_empty()) {
             return Ok(None);
         }
-        let targets = advance_bound(
-            self.graph,
-            self.kernel,
-            (src, edge, dest),
-            (None, None),
-            &targets,
-            cache,
-        )?;
+        let update = self
+            .inner
+            .possible_edge((src, edge, dest), (None, None), cache, &targets)?;
+        let targets = intersect(&targets, update);
         if targets.as_ref().is_some_and(|t| t.is_empty()) {
             return Ok(None);
         }
@@ -152,40 +145,39 @@ impl<'g, K: Kernel> SearchAdapter for LazyAdapter<'g, '_, K> {
             cursor = frame.parent.as_deref();
         }
         edges.reverse();
-        let mut exact = self.kernel.initial_state(self.graph, state.start)?;
-        let initial = initial_bound(self.graph, self.kernel, state.start, None)?;
+        let mut exact = self.inner.initial_state(state.start)?;
+        let initial = self.inner.possible_start(state.start, None)?;
         let mut replay_targets = intersect(
             &initial,
-            initial_bound(self.graph, self.kernel, state.start, Some(&exact))?,
+            self.inner.possible_start(state.start, Some(&exact))?,
         );
         let mut history = self.retain_history.then(|| vec![exact.clone()]);
         for (index, frame) in edges.iter().enumerate() {
-            replay_targets = advance_bound(
-                self.graph,
-                self.kernel,
+            let update = self.inner.possible_edge(
                 (frame.src, frame.edge, frame.dest),
                 (Some(&exact), None),
-                &replay_targets,
                 cache,
+                &replay_targets,
             )?;
+            replay_targets = intersect(&replay_targets, update);
             if replay_targets.as_ref().is_some_and(|t| t.is_empty()) {
                 return Ok(None);
             }
-            let cx = EdgeCtx::new(self.graph, frame.src, frame.dest, frame.edge, &exact, cache);
-            let step = self.kernel.transition(&cx)?;
-            let (child, complete) = match step {
-                Transition::Reject => return Ok(None),
-                Transition::Continue(child) => (child, false),
-                Transition::Complete(child) => (child, true),
+            let Some((child, complete)) = self
+                .inner
+                .eval_edge(frame.src, frame.edge, frame.dest, &exact, cache)?
+            else {
+                return Ok(None);
             };
-            replay_targets = advance_bound(
-                self.graph,
-                self.kernel,
-                (frame.src, frame.edge, frame.dest),
-                (Some(&exact), Some(&child)),
-                &replay_targets,
-                cache,
-            )?;
+            if self.inner.target_needs_post() {
+                let update = self.inner.possible_edge(
+                    (frame.src, frame.edge, frame.dest),
+                    (Some(&exact), Some(&child)),
+                    cache,
+                    &replay_targets,
+                )?;
+                replay_targets = intersect(&replay_targets, update);
+            }
             if complete
                 && replay_targets
                     .as_ref()
@@ -222,58 +214,67 @@ impl<'g, K: Kernel> SearchAdapter for LazyAdapter<'g, '_, K> {
     fn materialize(
         &self,
         arena: &[PathEntry<Self::State>],
-        mut path: usize,
+        path: usize,
         history: bool,
     ) -> Result<Self::Path> {
-        let state = arena[path]
-            .state
-            .final_state
-            .as_ref()
-            .expect("completed path has exact state")
-            .clone();
-        let intermediate_states = if history {
-            Some(
-                arena[path]
-                    .state
-                    .history
-                    .as_ref()
-                    .expect("history was retained")
-                    .clone(),
-            )
-        } else {
-            None
-        };
-        let mut nodes = Vec::with_capacity(arena[path].depth + 1);
-        let mut edges = Vec::with_capacity(arena[path].depth);
-        loop {
-            nodes.push(
-                self.graph
-                    .repo
-                    .external_node(arena[path].node)
-                    .context("path references missing node")?,
-            );
-            if let Some(edge) = arena[path].incoming_edge {
-                edges.push(
-                    self.graph
-                        .repo
-                        .external_edge(edge)
-                        .context("path references missing edge")?,
-                );
-            }
-            match arena[path].parent {
-                Some(parent) => path = parent,
-                None => break,
-            }
-        }
-        nodes.reverse();
-        edges.reverse();
-        Ok(GraphPath {
-            nodes,
-            edges,
-            state,
-            intermediate_states,
-        })
+        self.inner.materialize_lazy(arena, path, history)
     }
+}
+
+pub(crate) fn materialize_graph_lazy<'g, S: Clone>(
+    graph: &'g Graph,
+    arena: &[PathEntry<LazyState<S>>],
+    mut path: usize,
+    history: bool,
+) -> Result<GraphPath<'g, S>> {
+    let state = arena[path]
+        .state
+        .final_state
+        .as_ref()
+        .expect("completed path has exact state")
+        .clone();
+    let intermediate_states = if history {
+        Some(
+            arena[path]
+                .state
+                .history
+                .as_ref()
+                .expect("history was retained")
+                .clone(),
+        )
+    } else {
+        None
+    };
+    let mut nodes = Vec::with_capacity(arena[path].depth + 1);
+    let mut edges = Vec::with_capacity(arena[path].depth);
+    loop {
+        nodes.push(
+            graph
+                .repo
+                .external_node(arena[path].node)
+                .context("path references missing node")?,
+        );
+        if let Some(edge) = arena[path].incoming_edge {
+            edges.push(
+                graph
+                    .repo
+                    .external_edge(edge)
+                    .context("path references missing edge")?,
+            );
+        }
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+    nodes.reverse();
+    edges.reverse();
+    Ok(GraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states,
+    })
 }
 
 /// A pull stream for opt-in deferred native kernel evaluation.
@@ -380,8 +381,12 @@ where
             return Some(Err(error));
         }
         let adapter = LazyAdapter {
-            graph: self.graph,
-            kernel: self.kernel.as_ref()?,
+            inner: GraphSearchAdapter {
+                graph: self.graph,
+                kernel: self.kernel.as_ref()?,
+                project: |state: &K::State| Ok(state.clone()),
+                output: std::marker::PhantomData,
+            },
             reverse: self.reverse.as_ref(),
             retain_history: self.retain_history,
             release_expanded: self.options.release_expanded,

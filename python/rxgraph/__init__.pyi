@@ -103,9 +103,9 @@ class Graph:
         legacy named kernel runs. File-backed ``from_parquet`` graphs use typed
         native kernels and do not need ``columns``.
 
-        ``optimizations`` enables target-aware graph-native kernels. Keys are
+        ``optimizations`` enables target-aware native kernels. Keys are
         ``evaluation`` ("incremental" or "lazy"), ``reverse`` and
-        ``release_expanded`` (booleans), and ``memo_capacity`` (a nonnegative integer for memoizable registrations). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires a ``boxed_memoizable_run`` registration.
+        ``release_expanded`` (booleans), and ``memo_capacity`` (a nonnegative integer for memoizable registrations). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires an in-memory graph kernel registered with ``boxed_memoizable_run``.
         """
         ...
     def search_batches(

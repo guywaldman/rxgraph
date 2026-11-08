@@ -7,11 +7,12 @@ use anyhow::Result;
 use arrow::array::{ArrayRef, RecordBatch, UInt64Array};
 use native_fixture::{Budget, State};
 use rxgraph::{
-    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, NodeId, OwnedGraphId, RunOptions,
-    TargetCtx, TargetOptions, Transition, TraversalStrategy,
+    EdgeCtx, Evaluation, Graph, GraphId, GraphPath, Kernel, NodeId, RunOptions, TargetCtx,
+    TargetOptions, Transition, TraversalStrategy,
 };
 use serde_json::json;
 use std::{
+    borrow::Cow,
     hint::black_box,
     sync::{
         Arc,
@@ -94,9 +95,12 @@ impl<const COUNT: bool> Kernel for WithTargets<'_, COUNT> {
         }
         self.inner.transition(cx)
     }
-    fn possible_targets(&self, cx: &TargetCtx<'_, State>) -> Result<Option<Vec<OwnedGraphId>>> {
+    fn possible_targets<'a>(
+        &'a self,
+        cx: &TargetCtx<'_, State>,
+    ) -> Result<Option<Cow<'a, [NodeId]>>> {
         Ok(if matches!(cx, TargetCtx::Start { .. }) {
-            Some(vec![self.target.into()])
+            Some(Cow::Owned(vec![self.target as NodeId]))
         } else {
             None
         })
