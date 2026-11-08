@@ -2,6 +2,18 @@
 use anyhow::{Context, Result};
 use pyo3::prelude::*;
 use rxgraph::{traversal::native, *};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static EXACT_TRANSITIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[pyfunction]
+fn reset_exact_transitions() {
+    EXACT_TRANSITIONS.store(0, Ordering::Relaxed);
+}
+#[pyfunction]
+fn exact_transitions() -> usize {
+    EXACT_TRANSITIONS.load(Ordering::Relaxed)
+}
 
 #[derive(Clone, serde::Serialize)]
 struct Details {
@@ -56,7 +68,17 @@ impl Kernel for Budget {
         Ok(self.initial())
     }
     fn transition(&self, cx: &EdgeCtx<'_, State>) -> Result<Transition<State>> {
+        EXACT_TRANSITIONS.fetch_add(1, Ordering::Relaxed);
         Ok(self.step(cx.state(), cx.edge_u64("cost")?.unwrap(), cx.dest_id()))
+    }
+    fn possible_targets(&self, _: &TargetCtx<'_, State>) -> Result<Option<Vec<OwnedGraphId>>> {
+        Ok(Some(vec![OwnedGraphId::U64(self.target)]))
+    }
+}
+impl MemoizableKernel for Budget {
+    type Key = u64;
+    fn state_key(&self, state: &State) -> u64 {
+        state.spent
     }
 }
 #[derive(Clone)]
@@ -85,8 +107,20 @@ impl TypedKernel for Budget {
     }
 }
 rxgraph::inventory::submit! {rxgraph::KernelEntry {name:"bench_arrow",make:|p|Ok(rxgraph::boxed_run(Budget::from_params(p)?))}}
+rxgraph::inventory::submit! {rxgraph::KernelEntry {name:"bench_memo",make:|p|Ok(rxgraph::boxed_memoizable_run(Budget::from_params(p)?))}}
 rxgraph::inventory::submit! {rxgraph::TypedKernelEntry {name:"bench_typed",make:|p|Ok(rxgraph::boxed_typed_run(Budget::from_params(p)?))}}
 #[pymodule]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    rxgraph::register(m)
+    rxgraph::register(m)?;
+    m.add_function(wrap_pyfunction!(reset_exact_transitions, m)?)?;
+    m.add_function(wrap_pyfunction!(exact_transitions, m)?)?;
+    Ok(())
 }
+
+struct LegacyRunner(BoxedRun);
+impl RunKernel for LegacyRunner {
+    fn run<'g>(&self, graph: &'g Graph, run: RunOptions) -> Result<SearchResult<'g>> {
+        self.0.run(graph, run)
+    }
+}
+rxgraph::inventory::submit! {rxgraph::KernelEntry {name:"bench_legacy",make:|p|Ok(Box::new(LegacyRunner(rxgraph::boxed_run(Budget::from_params(p)?))))}}

@@ -53,6 +53,32 @@ impl Default for RunOptions {
     }
 }
 
+/// Run options with opt-in native graph traversal optimizations.
+#[derive(Debug, Clone)]
+pub struct NativeRunOptions {
+    pub(crate) run: RunOptions,
+    pub(crate) optimizations: Option<super::TargetOptions>,
+}
+
+impl From<RunOptions> for NativeRunOptions {
+    fn from(run: RunOptions) -> Self {
+        Self {
+            run,
+            optimizations: None,
+        }
+    }
+}
+
+impl RunOptions {
+    /// Enables target-aware native graph traversal with the specified settings.
+    pub fn with_optimizations(self, optimizations: super::TargetOptions) -> NativeRunOptions {
+        NativeRunOptions {
+            run: self,
+            optimizations: Some(optimizations),
+        }
+    }
+}
+
 impl Graph {
     /// Runs a configured DSL traversal and materializes matching paths.
     ///
@@ -115,11 +141,15 @@ impl Graph {
     pub fn search_paths_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: impl Into<NativeRunOptions>,
     ) -> Result<SearchResult<'_, K::State>>
     where
         K::State: Send + Sync + Clone,
     {
+        let NativeRunOptions { run, optimizations } = run.into();
+        if let Some(options) = optimizations {
+            return self.search_paths_optimized_with(kernel, run, options);
+        }
         let adapter = GraphSearchAdapter {
             graph: self,
             kernel: &kernel,
@@ -137,14 +167,15 @@ impl Graph {
     pub fn search_first_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        mut run: RunOptions,
+        run: impl Into<NativeRunOptions>,
     ) -> Result<FirstResult<'_, K::State>>
     where
         K::State: Send + Sync + Clone,
     {
-        run.max_paths = Some(1);
-        run.strategy = TraversalStrategy::BreadthFirst;
-        run.parallel = false;
+        let mut run = run.into();
+        run.run.max_paths = Some(1);
+        run.run.strategy = TraversalStrategy::BreadthFirst;
+        run.run.parallel = false;
         Ok(self.search_paths_with(kernel, run)?.into_first())
     }
 
@@ -152,7 +183,7 @@ impl Graph {
     pub fn search_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: impl Into<NativeRunOptions>,
     ) -> Result<SearchResult<'_, K::State>>
     where
         K::State: Send + Sync + Clone,
@@ -229,50 +260,60 @@ where
     fn materialize(
         &self,
         arena: &[PathEntry<Self::State>],
-        mut path: usize,
+        path: usize,
         intermediate_states: bool,
     ) -> Result<Self::Path> {
-        let mut nodes = Vec::with_capacity(arena[path].depth + 1);
-        let mut edges = Vec::with_capacity(arena[path].depth);
-        let state = (self.project)(&arena[path].state)?;
-        let mut states = intermediate_states.then(|| Vec::with_capacity(nodes.capacity()));
-
-        loop {
-            nodes.push(
-                self.graph
-                    .repo
-                    .external_node(arena[path].node)
-                    .context("path references missing node")?,
-            );
-            if let Some(edge) = arena[path].incoming_edge {
-                edges.push(
-                    self.graph
-                        .repo
-                        .external_edge(edge)
-                        .context("path references missing edge")?,
-                );
-            }
-            if let Some(states) = &mut states {
-                states.push((self.project)(&arena[path].state)?);
-            }
-            match arena[path].parent {
-                Some(parent) => path = parent,
-                None => break,
-            }
-        }
-
-        nodes.reverse();
-        edges.reverse();
-        if let Some(states) = &mut states {
-            states.reverse();
-        }
-        Ok(GraphPath {
-            nodes,
-            edges,
-            state,
-            intermediate_states: states,
-        })
+        materialize_path(self.graph, arena, path, intermediate_states, &self.project)
     }
+}
+
+pub(crate) fn materialize_path<'g, S, O>(
+    graph: &'g Graph,
+    arena: &[PathEntry<S>],
+    mut path: usize,
+    intermediate_states: bool,
+    project: impl Fn(&S) -> Result<O>,
+) -> Result<GraphPath<'g, O>> {
+    let mut nodes = Vec::with_capacity(arena[path].depth + 1);
+    let mut edges = Vec::with_capacity(arena[path].depth);
+    let state = project(&arena[path].state)?;
+    let mut states = intermediate_states.then(|| Vec::with_capacity(nodes.capacity()));
+
+    loop {
+        nodes.push(
+            graph
+                .repo
+                .external_node(arena[path].node)
+                .context("path references missing node")?,
+        );
+        if let Some(edge) = arena[path].incoming_edge {
+            edges.push(
+                graph
+                    .repo
+                    .external_edge(edge)
+                    .context("path references missing edge")?,
+            );
+        }
+        if let Some(states) = &mut states {
+            states.push(project(&arena[path].state)?);
+        }
+        match arena[path].parent {
+            Some(parent) => path = parent,
+            None => break,
+        }
+    }
+
+    nodes.reverse();
+    edges.reverse();
+    if let Some(states) = &mut states {
+        states.reverse();
+    }
+    Ok(GraphPath {
+        nodes,
+        edges,
+        state,
+        intermediate_states: states,
+    })
 }
 
 #[cfg(test)]

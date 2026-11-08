@@ -310,6 +310,9 @@ impl<S: Clone, C> Cursor<S, C> {
             };
             if self.bfs_edge == count {
                 self.frontier.pop_front();
+                if !self.cfg.intermediate_states && adapter.can_release_expanded_states() {
+                    adapter.release_expanded_state(&mut self.arena[parent].state);
+                }
                 self.bfs_edge = 0;
                 self.bfs_count = None;
                 self.bfs_prefetched -= 1;

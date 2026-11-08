@@ -1,5 +1,7 @@
-/target
-examples/*/target
+target/
+
+# Generated benchmark results
+/benches/results/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

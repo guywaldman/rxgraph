@@ -85,6 +85,7 @@ class Graph:
         intermediate_states: bool = False,
         progress: bool = False,
         max_visits_per_node: int = 1,
+        optimizations: Mapping[str, Any] | None = None,
     ) -> SearchResult:
         """Run a stateful traversal.
 
@@ -101,6 +102,10 @@ class Graph:
         ``columns`` lists payload columns to load for ``from_lazy`` before a
         legacy named kernel runs. File-backed ``from_parquet`` graphs use typed
         native kernels and do not need ``columns``.
+
+        ``optimizations`` enables target-aware graph-native kernels. Keys are
+        ``evaluation`` ("incremental" or "lazy"), ``reverse`` and
+        ``release_expanded`` (booleans), and ``memo_capacity`` (a nonnegative integer for memoizable registrations). Any mapping enables target bounds; ``memo_capacity=0`` disables caching. Positive capacity requires a ``boxed_memoizable_run`` registration.
         """
         ...
     def search_batches(
@@ -118,6 +123,7 @@ class Graph:
         progress: bool = False,
         max_visits_per_node: int = 1,
         batch_size: int = 1024,
+        optimizations: Mapping[str, Any] | None = None,
     ) -> SearchStream: ...
     def search_paths(
         self,
@@ -137,6 +143,7 @@ class Graph:
         intermediate_states: bool = False,
         progress: bool = False,
         max_visits_per_node: int = 1,
+        optimizations: Mapping[str, Any] | None = None,
     ) -> SearchResult: ...
     def search_first(
         self,
@@ -153,6 +160,7 @@ class Graph:
         intermediate_states: bool = False,
         progress: bool = False,
         max_visits_per_node: int = 1,
+        optimizations: Mapping[str, Any] | None = None,
     ) -> SearchPath | None: ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""

@@ -17,10 +17,10 @@ pub(crate) struct State {
 }
 #[derive(Clone)]
 pub(crate) struct Budget {
-    budget: u64,
-    target: u64,
-    large: bool,
-    cost: EdgeField<u64>,
+    pub(crate) budget: u64,
+    pub(crate) target: u64,
+    pub(crate) large: bool,
+    pub(crate) cost: EdgeField<u64>,
 }
 impl Kernel for Budget {
     type State = State;

@@ -22,26 +22,31 @@ mod algo;
 mod config;
 mod engine;
 mod kernel;
+mod lazy;
+mod memo;
 pub mod native;
 mod ownership;
 mod progress;
 mod registry;
 mod state_encoder;
 mod stream;
+mod targets;
 mod typed;
 
 use crate::{dsl::StateRow, graph::GraphId};
 
-pub use algo::RunOptions;
+pub use algo::{NativeRunOptions, RunOptions};
 pub use config::{TraversalConfig, TraversalConfigBuilder, TraversalStrategy};
 pub use kernel::{EdgeCtx, EdgeField, FieldValue, Kernel, NodeField};
+pub use memo::{MemoOptions, MemoizableKernel, MemoizedGraphSearchStream, MemoizedKernel};
 pub use native::search_native;
 pub use registry::{
-    BoxedRun, BoxedTypedRun, KernelEntry, RunKernel, RunTypedKernel, TypedKernelEntry, boxed_run,
-    boxed_typed_run, build_kernel, build_typed_kernel, inventory, register_kernel,
-    try_build_kernel, try_build_typed_kernel,
+    BoxedRun, BoxedTypedRun, KernelEntry, RunKernel, RunTypedKernel, TypedKernelEntry,
+    boxed_memoizable_run, boxed_run, boxed_typed_run, build_kernel, build_typed_kernel, inventory,
+    register_kernel, try_build_kernel, try_build_typed_kernel,
 };
 pub use stream::{GraphSearchStream, NativeBatchStream, NativeSearchStream};
+pub use targets::{Evaluation, TargetCtx, TargetOptions};
 pub use typed::ParquetPaths;
 pub use typed::{
     ArrowList, ArrowRow, ArrowStruct, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel,

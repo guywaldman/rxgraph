@@ -105,6 +105,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
             Ok(Self::ParallelBfs(ParallelBfs {
                 cursor: Cursor::new(run)?,
                 pending: VecDeque::new(),
+                caches: Vec::new(),
             }))
         } else {
             Ok(Self::Serial(Cursor::new(run)?))
@@ -129,6 +130,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
             Self::ParallelBfs(c) => {
                 c.cursor.close();
                 c.pending = VecDeque::new();
+                c.caches = Vec::new();
             }
         }
     }
@@ -158,6 +160,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
 pub(crate) struct ParallelBfs<S, C> {
     cursor: Cursor<S, C>,
     pending: VecDeque<(usize, EdgeEval<S>)>,
+    caches: Vec<C>,
 }
 impl<S: Clone, C> ParallelBfs<S, C> {
     fn next_batch<A>(&mut self, adapter: &A, size: usize) -> Result<Option<Vec<A::Path>>>
@@ -238,6 +241,9 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 .collect::<Vec<_>>();
             adapter.prefetch_outgoing(&nodes)?;
             let mut edge_total = 0;
+            let mut expanded = Vec::new();
+            let release_states =
+                !c.cfg.intermediate_states && adapter.can_release_expanded_states();
             while edge_total < WORK_QUANTUM {
                 let Some(&parent) = c.frontier.front() else {
                     break;
@@ -259,6 +265,9 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 };
                 if c.bfs_edge == count {
                     c.frontier.pop_front();
+                    if release_states {
+                        expanded.push(parent);
+                    }
                     c.bfs_edge = 0;
                     c.bfs_count = None;
                     continue;
@@ -273,8 +282,9 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 c.bfs_edge = end;
             }
             let parallel = edge_total >= MIN_PAR_EDGES || frontier_count >= MIN_PAR_FRONTIER;
-            let evaluate = |jobs: &[(usize, usize, usize)]| -> Result<EvaluatedChunk<S>> {
-                let cache = adapter.make_cache();
+            let evaluate = |jobs: &[(usize, usize, usize)],
+                            cache: &C|
+             -> Result<EvaluatedChunk<S>> {
                 let mut stats = SearchStats::default();
                 let mut edges = Vec::new();
                 for &(parent, start, end) in jobs {
@@ -286,7 +296,7 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                             (edge, dest),
                             &c.cfg,
                             &mut stats,
-                            &cache,
+                            cache,
                         )? {
                             edges.push((parent, edge));
                         }
@@ -300,15 +310,27 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             };
             let results = if parallel {
                 let chunk = jobs.len().div_ceil(rayon::current_num_threads()).max(1);
+                let count = jobs.len().div_ceil(chunk);
+                self.caches
+                    .resize_with(count.max(self.caches.len()), || adapter.make_cache());
                 jobs.par_chunks(chunk)
-                    .map(evaluate)
+                    .zip(self.caches[..count].par_iter_mut())
+                    .map(|(jobs, cache)| evaluate(jobs, cache))
                     .collect::<Result<Vec<_>>>()?
             } else {
-                vec![evaluate(&jobs)?]
+                vec![evaluate(
+                    &jobs,
+                    c.cache.as_ref().expect("initialized cache"),
+                )?]
             };
             for (edges, stats) in results {
                 self.pending.extend(edges);
                 merge_stats(&mut c.stats, stats);
+            }
+            if release_states {
+                for parent in expanded {
+                    adapter.release_expanded_state(&mut c.arena[parent].state);
+                }
             }
             if let Some(progress) = &mut c.progress {
                 progress.tick(&c.stats);

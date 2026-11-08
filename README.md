@@ -247,6 +247,48 @@ A graph's payload tables cannot be replaced while a stream retains them.
 Performance results and the explicit acceptance gates are documented in
 [`benches/NATIVE_PERFORMANCE.md`](benches/NATIVE_PERFORMANCE.md).
 
+### Target-aware graph kernels
+
+For a named plugin kernel implemented with `rxgraph::Kernel`, pass
+`optimizations` to `search`, `search_first`, or `search_batches`:
+
+```python
+result = graph.search(
+    start_nodes=[1],
+    kernel="my_graph_kernel",
+    params={"target": 42},
+    optimizations={
+        # "incremental" (default), or "lazy" to replay candidate paths.
+        # Try lazy for expensive, deterministic transitions and few candidates;
+        # incremental can be faster when state rejects branches early.
+        "evaluation": "incremental",
+        # Preprocess reverse reachability for known targets (default: False).
+        # Try it when targets are selective enough to offset preprocessing.
+        "reverse": True,
+        # Release expanded BFS states when history is disabled (default: False).
+        # Try it for high BFS memory use; it can increase latency.
+        "release_expanded": False,
+        # Maximum cached transitions; 0 disables caching. A positive value
+        # requires a MemoizableKernel registered with boxed_memoizable_run.
+        # Try it when paths revisit the same edges with equivalent states and
+        # transitions are expensive enough to offset cache overhead.
+        # Start with 4096 entries, then tune using latency and peak memory;
+        # entries include cached states, and older entries are evicted first.
+        "memo_capacity": 0,
+    },
+)
+```
+
+The kernel can implement `possible_targets` to provide conservative bounds on
+where paths can end. Any mapping, including `{}`, enables target-aware
+search - omitting it preserves the existing search.
+
+These options require an in-memory graph kernel registered with `boxed_run` or
+`boxed_memoizable_run`; typed kernels, file-backed graphs, and DSL searches do
+not support them. If a name also has a typed registration, Python selects that
+registration and rejects the options. See the [Rust kernel guide](crates/rxgraph/README.md#target-aware-native-search)
+for the bounds contract and performance tradeoffs.
+
 ## Architecture
 
 The Python package is backed by a Rust core. Internally, `rxgraph` stores node

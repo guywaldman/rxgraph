@@ -48,3 +48,162 @@ def test_compound_native_state_streams(mode, parallel, tmp_path):
     actual[0].state["details"]["values"][0] = 99
     assert actual[1].state["details"]["values"][0] == 7
     assert actual[0].intermediate_states[-1]["details"]["values"][0] == 7
+
+
+def target_graph(rxg):
+    return rxg.Graph.from_edges(
+        [
+            ("a", "b", {"cost": 1}),
+            ("b", "target", {"cost": 1}),
+            ("a", "dead", {"cost": 1}),
+            ("dead", "dead2", {"cost": 1}),
+            ("dead2", "dead3", {"cost": 1}),
+        ]
+    )
+
+
+@pytest.mark.parametrize("strategy", ["dfs", "bfs"])
+@pytest.mark.parametrize("evaluation", ["incremental", "lazy"])
+def test_target_optimizations_eager_and_stream(strategy, evaluation):
+    graph = target_graph(plugin())
+    kwargs = dict(
+        start_nodes=["a"],
+        kernel="bench_arrow",
+        params={"budget": 10, "target": "target"},
+        strategy=strategy,
+        parallel=False,
+        intermediate_states=True,
+    )
+    baseline = graph.search(**kwargs)
+    assert graph.search(**kwargs, optimizations={}).paths == baseline.paths
+    opts = {"evaluation": evaluation, "reverse": True, "release_expanded": True}
+    optimized = graph.search(**kwargs, optimizations=opts)
+    assert optimized.paths == baseline.paths
+    assert optimized.stats.evaluated_edges < baseline.stats.evaluated_edges
+    with graph.search_batches(**kwargs, optimizations=opts, batch_size=1) as stream:
+        assert [p for batch in stream for p in batch] == baseline.paths
+    assert (
+        graph.search_first(
+            **{k: v for k, v in kwargs.items() if k not in ("strategy", "parallel")},
+            optimizations=opts,
+        )
+        == baseline.paths[0]
+    )
+    assert graph.search(**kwargs, max_paths=0, optimizations=opts).paths == []
+    with graph.search_batches(**kwargs, optimizations=opts, batch_size=1) as stream:
+        assert stream.stats.evaluated_edges == 0
+    assert list(stream) == []
+
+
+def test_target_optimizations_validate_and_reject_unsupported():
+    graph = target_graph(plugin())
+    kwargs = dict(
+        start_nodes=["a"], params={"budget": 10, "target": "target"}, parallel=False
+    )
+    with pytest.raises(ValueError, match="named graph-native"):
+        graph.search(start_nodes=["a"], optimizations={})
+    for method in (graph.search, graph.search_batches):
+        with pytest.raises(ValueError, match="typed kernels"):
+            method(kernel="bench_typed", optimizations={}, **kwargs)
+        with pytest.raises((TypeError, ValueError), match="evaluation"):
+            method(
+                kernel="bench_arrow", optimizations={"evaluation": "wrong"}, **kwargs
+            )
+        with pytest.raises(TypeError, match="reverse"):
+            method(kernel="bench_arrow", optimizations={"reverse": 1}, **kwargs)
+        with pytest.raises(ValueError, match="unknown optimization"):
+            method(kernel="bench_arrow", optimizations={"unknown": True}, **kwargs)
+        with pytest.raises((TypeError, ValueError), match="memo_capacity"):
+            method(kernel="bench_memo", optimizations={"memo_capacity": -1}, **kwargs)
+        with pytest.raises(RuntimeError, match="does not support memoization"):
+            method(kernel="bench_arrow", optimizations={"memo_capacity": 5}, **kwargs)
+    with pytest.raises(RuntimeError, match="does not support target optimizations"):
+        graph.search(kernel="bench_legacy", optimizations={}, **kwargs)
+
+
+@pytest.mark.parametrize("evaluation", ["incremental", "lazy"])
+def test_memoizable_registered_kernel(evaluation):
+    graph = target_graph(plugin())
+    kwargs = dict(
+        start_nodes=["a"],
+        kernel="bench_memo",
+        params={"budget": 10, "target": "target"},
+        parallel=False,
+    )
+    expected = graph.search(**kwargs).paths
+    opts = {"evaluation": evaluation, "reverse": True, "memo_capacity": 10}
+    assert graph.search(**kwargs, optimizations=opts).paths == expected
+    with graph.search_batches(**kwargs, optimizations=opts, batch_size=1) as stream:
+        assert [p for batch in stream for p in batch] == expected
+
+
+def test_memoization_reuses_transitions_and_is_scoped_to_each_search():
+    rxg = plugin()
+    graph = rxg.Graph.from_edges(
+        [
+            ("a", "b", {"cost": 1}),
+            ("a", "c", {"cost": 1}),
+            ("b", "join", {"cost": 1}),
+            ("c", "join", {"cost": 1}),
+            ("join", "target", {"cost": 1}),
+        ]
+    )
+    kwargs = dict(
+        start_nodes=["a"],
+        kernel="bench_memo",
+        params={"budget": 10, "target": "target"},
+        parallel=False,
+    )
+    native = rxg._native
+    native.reset_exact_transitions()
+    baseline = graph.search(**kwargs).paths
+    assert native.exact_transitions() == 6
+    for stream in (False, True):
+        native.reset_exact_transitions()
+        options = {"memo_capacity": 10}
+        if stream:
+            with graph.search_batches(
+                **kwargs, optimizations=options, batch_size=1
+            ) as result:
+                paths = [p for batch in result for p in batch]
+        else:
+            paths = graph.search(**kwargs, optimizations=options).paths
+        assert paths == baseline
+        assert native.exact_transitions() == 5
+
+
+def test_dual_registration_retains_typed_dispatch():
+    graph = target_graph(plugin())
+    kwargs = dict(
+        start_nodes=["a"],
+        kernel="weighted_budget",
+        params={"weight_col": "cost", "budget": 10, "target": "target"},
+    )
+    assert graph.search(**kwargs).paths
+    for search in (graph.search, graph.search_batches):
+        with pytest.raises(ValueError, match="typed kernels"):
+            search(**kwargs, optimizations={})
+
+
+@pytest.mark.parametrize("mode", ["eager", "lazy"])
+def test_file_backed_optimization_rejection(mode, tmp_path):
+    rxg = plugin()
+    nodes = pl.DataFrame({"id": [0, 1]}, schema={"id": pl.UInt64})
+    edges = pl.DataFrame(
+        {"id": [0], "src": [0], "dest": [1], "cost": [1]},
+        schema={key: pl.UInt64 for key in ("id", "src", "dest", "cost")},
+    )
+    nodes.write_parquet(tmp_path / "nodes.parquet")
+    edges.write_parquet(tmp_path / "edges.parquet")
+    graph = rxg.Graph.from_parquet(
+        tmp_path / "nodes.parquet", tmp_path / "edges.parquet", payloads=mode
+    )
+    kwargs = dict(
+        start_nodes=[0],
+        kernel="bench_typed",
+        params={"budget": 10, "target": 1},
+        optimizations={},
+    )
+    for search in (graph.search, graph.search_batches):
+        with pytest.raises(ValueError, match="file-backed|typed kernels"):
+            search(**kwargs)
