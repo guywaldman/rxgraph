@@ -10,7 +10,7 @@
 //! enumeration lives in [`Graph::search`](Self::search), implemented by the
 //! traversal module.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, anyhow};
 use arrow::record_batch::RecordBatch;
@@ -25,6 +25,26 @@ pub struct Graph {
 }
 
 impl Graph {
+    /// Returns graph-local derived data for `(T, key)`, computing it on first use.
+    ///
+    /// Calls for the same key and type share one successful initialization;
+    /// callers on other threads wait for the in-progress initializer. Errors
+    /// are not cached and a later call may retry. Errors are shared through a
+    /// wrapper; inspect the source chain to access the original error type.
+    /// Initializers for different keys can run independently. Do not
+    /// recursively initialize the same key.
+    ///
+    /// Entries persist for this graph's topology lifetime, including after
+    /// [`Graph::set_payloads`]. Include payload versions, projection fields,
+    /// and any other dependencies in `key` to avoid reusing stale data.
+    pub fn cached<T: Send + Sync + 'static>(
+        &self,
+        key: &str,
+        init: impl FnOnce() -> Result<T>,
+    ) -> Result<Arc<T>> {
+        self.repo.derived_cache.get(key, init)
+    }
+
     /// Builds a graph from Arrow node and edge tables.
     ///
     /// Required columns:

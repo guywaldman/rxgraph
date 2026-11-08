@@ -24,6 +24,29 @@ use crate::RunOptions;
 
 type StoreRef<'a, N, E> = &'a dyn GraphStore<Node = N, Edge = E>;
 
+impl Graph {
+    /// Read any in-memory node payload by internal ID.
+    pub fn node_at(&self, id: NodeId) -> Result<super::ArrowRow<'_>> {
+        if id as usize >= self.node_count() {
+            anyhow::bail!("node row {id} is out of range");
+        }
+        Ok(super::ArrowRow::new(self.node_payloads(), id as usize))
+    }
+
+    /// Read any in-memory edge payload by internal ID.
+    pub fn edge_at(&self, id: EdgeId) -> Result<super::ArrowRow<'_>> {
+        if id as usize >= self.edge_count() {
+            anyhow::bail!("edge row {id} is out of range");
+        }
+        Ok(super::ArrowRow::new(self.edge_payloads(), id as usize))
+    }
+
+    /// Return the external ID for an internal node ID.
+    pub fn external_node_at(&self, id: NodeId) -> Option<GraphId<'_>> {
+        self.repo.external_node(id)
+    }
+}
+
 /// A row-lazy graph storage backend.
 ///
 /// Implementations own the topology/payload loading policy. The traversal
@@ -109,6 +132,26 @@ impl<'a, N, E> StartCtx<'a, N, E> {
         self.node
     }
 
+    /// The backing graph, when this store has one.
+    pub fn graph(&self) -> Option<&'a Graph> {
+        self.store.graph()
+    }
+
+    /// Read any node payload by internal ID. Lazy stores load it on demand.
+    pub fn node_at(&self, id: NodeId) -> Result<&'a N> {
+        self.store.node(id)
+    }
+
+    /// Read any edge payload by internal ID. Lazy stores load it on demand.
+    pub fn edge_at(&self, id: EdgeId) -> Result<&'a E> {
+        self.store.edge(id)
+    }
+
+    /// External ID for any node, when the store exposes one.
+    pub fn external_node_at(&self, id: NodeId) -> Result<Option<GraphId<'a>>> {
+        self.store.external_node(id)
+    }
+
     /// External node ID, if available.
     pub fn external_id(&self) -> Result<Option<GraphId<'a>>> {
         self.store.external_node(self.node)
@@ -182,6 +225,26 @@ impl<'store, 'state, N, E, S> EdgeCtx<'store, 'state, N, E, S> {
     /// Internal edge row ID.
     pub fn edge_id(&self) -> EdgeId {
         self.edge
+    }
+
+    /// The backing graph, when this store has one.
+    pub fn graph(&self) -> Option<&'store Graph> {
+        self.store.graph()
+    }
+
+    /// Read any node payload by internal ID. Lazy stores load it on demand.
+    pub fn node_at(&self, id: NodeId) -> Result<&'store N> {
+        self.store.node(id)
+    }
+
+    /// Read any edge payload by internal ID. Lazy stores load it on demand.
+    pub fn edge_at(&self, id: EdgeId) -> Result<&'store E> {
+        self.store.edge(id)
+    }
+
+    /// External ID for any node, when the store exposes one.
+    pub fn external_node_at(&self, id: NodeId) -> Result<Option<GraphId<'store>>> {
+        self.store.external_node(id)
     }
 
     /// External source node ID, if available.
