@@ -25,7 +25,7 @@ use arrow::{
         StringArray, StringViewArray, StructArray, UInt8Array, UInt16Array, UInt32Array,
         UInt64Array,
     },
-    datatypes::{DataType, Field, FieldRef, Schema},
+    datatypes::{DataType, Field, FieldRef, Schema, SchemaRef},
 };
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ParquetRecordBatchReaderBuilder, RowSelection,
@@ -49,9 +49,27 @@ impl<'a> ArrowRow<'a> {
         Self { batch, row }
     }
 
+    /// Whether `col` exists in this projected batch.
+    pub fn has(&self, col: &str) -> bool {
+        self.batch.schema_ref().fields().find(col).is_some()
+    }
+
+    /// The projected schema, including payload aliases.
+    pub fn schema(&self) -> &SchemaRef {
+        self.batch.schema_ref()
+    }
+
     /// Reads `col` as `u64`, accepting lossless integer coercions.
     pub fn u64(&self, col: &str) -> Result<Option<u64>> {
         read_u64(self.column(col)?.as_ref(), self.row, col)
+    }
+
+    /// Reads `col` as `u64`; absent or null columns return `None`.
+    pub fn opt_u64(&self, col: &str) -> Result<Option<u64>> {
+        match self.optional_column(col) {
+            Some(array) => read_u64(array.as_ref(), self.row, col),
+            None => Ok(None),
+        }
     }
 
     /// Reads `col` as `i64`, accepting lossless integer coercions.
@@ -69,9 +87,25 @@ impl<'a> ArrowRow<'a> {
         read_bool(self.column(col)?.as_ref(), self.row, col)
     }
 
+    /// Reads `col` as `bool`; absent or null columns return `None`.
+    pub fn opt_bool(&self, col: &str) -> Result<Option<bool>> {
+        match self.optional_column(col) {
+            Some(array) => read_bool(array.as_ref(), self.row, col),
+            None => Ok(None),
+        }
+    }
+
     /// Reads `col` as an owned string.
     pub fn string(&self, col: &str) -> Result<Option<String>> {
         read_string(self.column(col)?.as_ref(), self.row, col)
+    }
+
+    /// Reads `col` as a string; absent or null columns return `None`.
+    pub fn opt_string(&self, col: &str) -> Result<Option<String>> {
+        match self.optional_column(col) {
+            Some(array) => read_string(array.as_ref(), self.row, col),
+            None => Ok(None),
+        }
     }
 
     /// Reads `col` as a DSL value, including nested list and struct values.
@@ -90,6 +124,14 @@ impl<'a> ArrowRow<'a> {
         read_list(self.column(col)?.as_ref(), self.row, col)
     }
 
+    /// Reads `col` as an Arrow list; absent or null columns return `None`.
+    pub fn opt_list_items(&self, col: &str) -> Result<Option<ArrowList>> {
+        match self.optional_column(col) {
+            Some(array) => read_list(array.as_ref(), self.row, col),
+            None => Ok(None),
+        }
+    }
+
     /// Reads `col` as a struct value, preserving Arrow field order.
     pub fn struct_fields(&self, col: &str) -> Result<Option<Vec<(String, Value)>>> {
         self.value(col)?.into_struct()
@@ -98,6 +140,14 @@ impl<'a> ArrowRow<'a> {
     /// Reads `col` as a typed Arrow struct row view.
     pub fn struct_(&self, col: &str) -> Result<Option<ArrowStruct<'_>>> {
         read_struct(self.column(col)?.as_ref(), self.row, col)
+    }
+
+    /// Reads `col` as an Arrow struct; absent or null columns return `None`.
+    pub fn opt_struct(&self, col: &str) -> Result<Option<ArrowStruct<'_>>> {
+        match self.optional_column(col) {
+            Some(array) => read_struct(array.as_ref(), self.row, col),
+            None => Ok(None),
+        }
     }
 
     /// Reads `col` as a custom struct decoded from [`ArrowStruct`].
@@ -111,10 +161,18 @@ impl<'a> ArrowRow<'a> {
     fn column(&self, col: &str) -> Result<&ArrayRef> {
         let index = self
             .batch
-            .schema()
+            .schema_ref()
             .index_of(col)
             .with_context(|| format!("missing payload column {col:?}"))?;
         Ok(self.batch.column(index))
+    }
+
+    fn optional_column(&self, col: &str) -> Option<&ArrayRef> {
+        self.batch
+            .schema_ref()
+            .fields()
+            .find(col)
+            .map(|(index, _)| self.batch.column(index))
     }
 }
 
@@ -125,6 +183,11 @@ pub struct ArrowStruct<'a> {
 }
 
 impl<'a> ArrowStruct<'a> {
+    /// Whether this struct has `field`.
+    pub fn has(&self, field: &str) -> bool {
+        self.array.fields().find(field).is_some()
+    }
+
     /// Reads `field` as `u64`, accepting lossless integer coercions.
     pub fn u64(&self, field: &str) -> Result<Option<u64>> {
         read_u64(self.field(field)?.as_ref(), self.row, field)
