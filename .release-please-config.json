@@ -29,6 +29,11 @@
           "type": "toml",
           "path": "Cargo.lock",
           "jsonpath": "$.package[?(@.name.value==\"rxgraph-python\")].version"
+        },
+        {
+          "type": "toml",
+          "path": "benches/native-plugin/Cargo.lock",
+          "jsonpath": "$.package[?(@.name.value==\"rxgraph\")].version"
         }
       ]
     }
