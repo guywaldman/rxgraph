@@ -2,15 +2,14 @@
 use std::sync::Arc;
 
 use crate::{
-    EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, RunOptions, SearchResult,
-    SearchStats,
+    EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, SearchResult, SearchStats,
 };
 use anyhow::{Context, Result, bail};
 
 use super::{
     TargetOptions,
     algo::GraphSearchAdapter,
-    engine::{PathEntry, SearchAdapter, cursor::GraphCursor},
+    engine::{PathEntry, RunConfig, SearchAdapter, cursor::GraphCursor},
     kernel::PayloadCache,
     targets::{Reverse, TargetBackend, TargetBound, build_reverse, intersect},
 };
@@ -282,7 +281,7 @@ pub(crate) struct LazyGraphSearchStream<'g, K: Kernel> {
     graph: &'g Graph,
     kernel: Option<K>,
     cursor: GraphCursor<LazyState<K::State>, PayloadCache>,
-    reverse_run: Option<RunOptions>,
+    reverse_run: Option<RunConfig>,
     options: TargetOptions,
     reverse: Option<Reverse>,
     initialized: bool,
@@ -297,7 +296,7 @@ impl Graph {
     pub(crate) fn search_batches_lazy_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         batch_size: usize,
         options: TargetOptions,
     ) -> Result<LazyGraphSearchStream<'_, K>>
@@ -327,7 +326,7 @@ impl Graph {
     pub(crate) fn search_paths_lazy_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         options: TargetOptions,
     ) -> Result<SearchResult<'_, K::State>>
     where

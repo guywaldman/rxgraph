@@ -6,13 +6,13 @@ use crate::{
 use pyo3::{
     Borrowed,
     conversion::IntoPyObjectExt,
-    exceptions::{PyRuntimeError, PyTypeError, PyValueError},
+    exceptions::{PyRuntimeError, PyTimeoutError, PyTypeError, PyValueError},
     prelude::*,
     types::{PyAny, PyDict, PyList, PyString, PyType},
 };
 use pyo3_arrow::PyTable;
 use rayon::ThreadPoolBuilder;
-use std::{path::PathBuf, sync::Arc, thread};
+use std::{path::PathBuf, sync::Arc, thread, time::Duration};
 mod stream;
 use stream::PySearchStream;
 
@@ -177,6 +177,9 @@ impl PyGraph {
         if let Some(max_paths) = traversal.max_paths {
             builder = builder.with_max_paths(max_paths);
         }
+        if let Some(timeout) = traversal.timeout {
+            builder = builder.with_timeout(timeout);
+        }
         builder = builder.with_max_visits_per_node(traversal.max_visits_per_node);
 
         PySearchResult::from_result(
@@ -196,7 +199,7 @@ impl PyGraph {
     /// calling this; no ID remapping happens here.
     ///
     /// Result marshalling is identical to the DSL `search` path.
-    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1, optimizations = None))]
+    #[pyo3(signature = (name, params, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1, optimizations = None, timeout = None))]
     #[allow(clippy::too_many_arguments)]
     fn search_kernel(
         &self,
@@ -212,6 +215,7 @@ impl PyGraph {
         progress: bool,
         max_visits_per_node: usize,
         optimizations: Option<&Bound<'_, PyAny>>,
+        timeout: Option<f64>,
     ) -> PyResult<PySearchResult> {
         let optimizations = parse_optimizations(optimizations)?;
         let params_json = py_dict_to_json(params)?;
@@ -219,6 +223,7 @@ impl PyGraph {
             start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
             max_depth,
             max_paths,
+            timeout: parse_timeout(timeout)?,
             strategy: parse_strategy(strategy)?,
             max_visits_per_node,
             parallel,
@@ -283,7 +288,7 @@ impl PyGraph {
         )))
     }
 
-    #[pyo3(signature = (name, params, start_nodes, max_depth=None, max_paths=None, strategy="dfs", parallel=true, intermediate_states=false, progress=false, max_visits_per_node=1, batch_size=1024, optimizations=None))]
+    #[pyo3(signature = (name, params, start_nodes, max_depth=None, max_paths=None, strategy="dfs", parallel=true, intermediate_states=false, progress=false, max_visits_per_node=1, batch_size=1024, optimizations=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn search_kernel_batches(
         &self,
@@ -299,6 +304,7 @@ impl PyGraph {
         max_visits_per_node: usize,
         batch_size: usize,
         optimizations: Option<&Bound<'_, PyAny>>,
+        timeout: Option<f64>,
     ) -> PyResult<PySearchStream> {
         let optimizations = parse_optimizations(optimizations)?;
         if batch_size == 0 {
@@ -314,6 +320,7 @@ impl PyGraph {
             start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
             max_depth,
             max_paths,
+            timeout: parse_timeout(timeout)?,
             strategy: parse_strategy(strategy)?,
             parallel,
             intermediate_states,
@@ -623,6 +630,7 @@ struct PyTraversal {
     start_nodes: Vec<OwnedGraphId>,
     max_depth: Option<usize>,
     max_paths: Option<usize>,
+    timeout: Option<Duration>,
     strategy: TraversalStrategy,
     parallel: bool,
     intermediate_states: bool,
@@ -633,7 +641,7 @@ struct PyTraversal {
 #[pymethods]
 impl PyTraversal {
     #[new]
-    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1))]
+    #[pyo3(signature = (kernel, start_nodes, max_depth = None, max_paths = None, strategy = "dfs", parallel = true, intermediate_states = false, progress = false, max_visits_per_node = 1, timeout = None))]
     // Internal and mirrors the Python keyword API, so OK to have a lot of variables
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -646,6 +654,7 @@ impl PyTraversal {
         intermediate_states: bool,
         progress: bool,
         max_visits_per_node: usize,
+        timeout: Option<f64>,
     ) -> PyResult<Self> {
         let strategy = parse_strategy(strategy)?;
 
@@ -654,6 +663,7 @@ impl PyTraversal {
             start_nodes: start_nodes.into_iter().map(|id| id.0).collect(),
             max_depth,
             max_paths,
+            timeout: parse_timeout(timeout)?,
             strategy,
             parallel,
             intermediate_states,
@@ -1041,6 +1051,13 @@ fn py_to_value(value: &Bound<'_, PyAny>) -> PyResult<Value> {
     )))
 }
 
+fn parse_timeout(seconds: Option<f64>) -> PyResult<Option<Duration>> {
+    seconds
+        .map(Duration::try_from_secs_f64)
+        .transpose()
+        .map_err(|err| PyValueError::new_err(format!("invalid timeout in seconds: {err}")))
+}
+
 fn parse_strategy(strategy: &str) -> PyResult<TraversalStrategy> {
     match strategy {
         "dfs" => Ok(TraversalStrategy::DepthFirst),
@@ -1118,7 +1135,11 @@ fn to_py_value_err(err: anyhow::Error) -> PyErr {
 }
 
 fn to_py_runtime_err(err: anyhow::Error) -> PyErr {
-    PyRuntimeError::new_err(format!("{err:#}"))
+    if err.is::<crate::SearchTimeout>() {
+        PyTimeoutError::new_err(err.to_string())
+    } else {
+        PyRuntimeError::new_err(format!("{err:#}"))
+    }
 }
 
 fn typed_optimizations(

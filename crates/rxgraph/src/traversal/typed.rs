@@ -34,7 +34,9 @@ use parquet::arrow::arrow_reader::{
 use crate::{
     dsl::{StateRow, Value, arrow_value},
     graph::{EdgeId, Graph, GraphId, GraphRepo, NodeId, OwnedGraphId},
-    traversal::{RunOptions, SearchStats, native, ownership::Owner},
+    traversal::{
+        SearchStats, TargetOptions, engine::RunConfig, native, ownership::Owner, timeout::Deadline,
+    },
 };
 
 /// A projected Arrow row handed to `TryFrom<ArrowRow<'_>>`.
@@ -768,6 +770,7 @@ impl TypedPayloadCache {
         &self,
         graph: &Graph,
         kernel: &K,
+        deadline: Deadline,
     ) -> Result<Arc<DecodedPayloads<K::Node, K::Edge>>>
     where
         K: TypedKernel + 'static,
@@ -775,7 +778,7 @@ impl TypedPayloadCache {
         K::Edge: 'static,
     {
         let slot = self.payload_slot(kernel)?;
-        cached_payloads(&slot, graph, kernel)
+        cached_payloads(&slot, graph, kernel, deadline)
     }
 
     fn payload_slot<K>(&self, kernel: &K) -> Result<PayloadSlot<K::Node, K::Edge>>
@@ -812,15 +815,17 @@ fn cached_payloads<K: TypedKernel>(
     slot: &PayloadSlot<K::Node, K::Edge>,
     graph: &Graph,
     kernel: &K,
+    deadline: Deadline,
 ) -> Result<Arc<DecodedPayloads<K::Node, K::Edge>>> {
+    deadline.check()?;
     if let Some(payloads) = slot.get() {
         return Ok(Arc::clone(payloads));
     }
     let node_batch = project_batch(graph.node_payloads(), &kernel.node_fields())?;
     let edge_batch = project_batch(graph.edge_payloads(), &kernel.edge_fields())?;
     let payloads = Arc::new(DecodedPayloads {
-        nodes: decode_all::<K::Node>(&node_batch)?.into(),
-        edges: decode_all::<K::Edge>(&edge_batch)?.into(),
+        nodes: decode_all::<K::Node>(&node_batch, deadline)?.into(),
+        edges: decode_all::<K::Edge>(&edge_batch, deadline)?.into(),
     });
     Ok(Arc::clone(slot.get_or_init(|| payloads)))
 }
@@ -834,11 +839,13 @@ where
     K: TypedKernel,
     K::State: serde::Serialize,
 {
+    let (run, optimizations) = run.into().start();
+    run.deadline.check()?;
     let node_batch = project_batch(graph.node_payloads(), &kernel.node_fields())?;
     let edge_batch = project_batch(graph.edge_payloads(), &kernel.edge_fields())?;
-    let nodes = decode_all::<K::Node>(&node_batch)?;
-    let edges = decode_all::<K::Edge>(&edge_batch)?;
-    run_typed_payloads(graph, kernel, &nodes, &edges, run)
+    let nodes = decode_all::<K::Node>(&node_batch, run.deadline)?;
+    let edges = decode_all::<K::Edge>(&edge_batch, run.deadline)?;
+    run_typed_payloads(graph, kernel, &nodes, &edges, run, optimizations)
 }
 
 pub(crate) fn run_typed_eager_cached<K>(
@@ -853,8 +860,16 @@ where
     K::Edge: 'static,
     K::State: serde::Serialize,
 {
-    let payloads = cache.payloads(graph, &kernel)?;
-    run_typed_payloads(graph, kernel, &payloads.nodes, &payloads.edges, run)
+    let (run, optimizations) = run.into().start();
+    let payloads = cache.payloads(graph, &kernel, run.deadline)?;
+    run_typed_payloads(
+        graph,
+        kernel,
+        &payloads.nodes,
+        &payloads.edges,
+        run,
+        optimizations,
+    )
 }
 
 fn run_typed_payloads<K>(
@@ -862,7 +877,8 @@ fn run_typed_payloads<K>(
     kernel: K,
     nodes: &[K::Node],
     edges: &[K::Edge],
-    run: impl Into<super::NativeRunOptions>,
+    run: RunConfig,
+    optimizations: Option<TargetOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: TypedKernel,
@@ -870,7 +886,7 @@ where
 {
     let store = native::EagerGraphStore::new(graph, nodes, edges)?;
     let adapter = TypedKernelAdapter::new(kernel);
-    search_owned(&store, &adapter, run)
+    search_owned(&store, &adapter, run, optimizations)
 }
 
 pub(crate) fn run_typed_parquet_lazy<K>(
@@ -883,6 +899,8 @@ where
     K: TypedKernel,
     K::State: serde::Serialize,
 {
+    let (run, optimizations) = run.into().start();
+    run.deadline.check()?;
     let store = ParquetGraphStore::<K::Node, K::Edge>::new(
         graph,
         paths,
@@ -890,7 +908,7 @@ where
         kernel.edge_fields(),
     )?;
     let adapter = TypedKernelAdapter::new(kernel);
-    let mut owned = search_owned(&store, &adapter, run)?;
+    let mut owned = search_owned(&store, &adapter, run, optimizations)?;
     owned.stats.materialized_node_payloads = store.loaded_node_count();
     owned.stats.materialized_edge_payloads = store.loaded_edge_count();
     let io = store.io_stats();
@@ -904,7 +922,8 @@ where
 fn search_owned<K, G>(
     store: &G,
     kernel: &K,
-    run: impl Into<super::NativeRunOptions>,
+    run: RunConfig,
+    optimizations: Option<TargetOptions>,
 ) -> Result<OwnedSearchResult>
 where
     K: native::Kernel,
@@ -918,7 +937,6 @@ where
         materialize_target: materialize_owned_target::<G, K::State>,
         materialize_lazy: materialize_owned_lazy::<G, K::State>,
     };
-    let super::NativeRunOptions { run, optimizations } = run.into();
     let result = if let Some(options) = optimizations {
         let reverse = super::targets::build_reverse_for(&adapter, &run, options.reverse)?;
         match options.evaluation {
@@ -1172,12 +1190,15 @@ fn parquet_schema(path: &Path) -> Result<std::sync::Arc<Schema>> {
     Ok(builder.schema().clone())
 }
 
-fn decode_all<T>(batch: &RecordBatch) -> Result<Vec<T>>
+fn decode_all<T>(batch: &RecordBatch, deadline: Deadline) -> Result<Vec<T>>
 where
     T: for<'row> TryFrom<ArrowRow<'row>, Error = anyhow::Error>,
 {
     (0..batch.num_rows())
-        .map(|row| T::try_from(ArrowRow::new(batch, row)))
+        .map(|row| {
+            deadline.check_every(row)?;
+            T::try_from(ArrowRow::new(batch, row))
+        })
         .collect()
 }
 
@@ -1779,7 +1800,7 @@ struct TypedStream<K: TypedKernel, G> {
     store: G,
     kernel: TypedKernelAdapter<K>,
     cursor: TypedCursor<K::State>,
-    preparation: Option<RunOptions>,
+    preparation: Option<RunConfig>,
     reverse: Option<super::targets::Reverse>,
     options: Option<super::TargetOptions>,
     retain_history: bool,
@@ -1793,7 +1814,7 @@ enum TypedCursor<S> {
 }
 
 impl<S: Clone> TypedCursor<S> {
-    fn new(run: RunOptions, options: Option<super::TargetOptions>) -> Result<Self> {
+    fn new(run: RunConfig, options: Option<super::TargetOptions>) -> Result<Self> {
         Ok(match options.map(|o| o.evaluation) {
             None => Self::Direct(super::engine::cursor::Cursor::new(run)?),
             Some(super::Evaluation::Incremental) => {
@@ -1888,12 +1909,13 @@ where
     K::State: serde::Serialize + Send,
 {
     let slot = cache.payload_slot(&kernel)?;
-    let super::NativeRunOptions { run, optimizations } = run.into();
+    let (run, optimizations) = run.into().start();
+    let deadline = run.deadline;
     let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
     let retain_history = run.intermediate_states;
     let cursor = TypedCursor::new(run, optimizations)?;
     Ok(super::stream::deferred(move || {
-        let payloads = cached_payloads(&slot, &graph, &kernel)?;
+        let payloads = cached_payloads(&slot, &graph, &kernel, deadline)?;
         let store = native::EagerGraphStore::shared(
             graph,
             Arc::clone(&payloads.nodes),
@@ -1924,11 +1946,13 @@ where
     K::Edge: Send + Sync + 'static,
     K::State: serde::Serialize + Send,
 {
-    let super::NativeRunOptions { run, optimizations } = run.into();
+    let (run, optimizations) = run.into().start();
+    let deadline = run.deadline;
     let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
     let retain_history = run.intermediate_states;
     let cursor = TypedCursor::new(run, optimizations)?;
     Ok(super::stream::deferred(move || {
+        deadline.check()?;
         let store = ParquetGraphStore::<K::Node, K::Edge>::from_owner(
             Owner::Shared(graph),
             paths,

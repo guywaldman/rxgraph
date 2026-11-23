@@ -42,11 +42,11 @@ pub use traversal::{
     FirstResult, GraphPath, GraphSearchStream, Kernel, KernelEntry, MemoOptions, MemoizableKernel,
     MemoizedGraphSearchStream, MemoizedKernel, NativeBatchStream, NativeRunOptions,
     NativeSearchStream, NodeField, OwnedGraphPath, OwnedSearchResult, ParquetPaths, PathsResult,
-    PayloadField, RunKernel, RunOptions, SearchResult, SearchStats, TargetCtx, TargetOptions,
-    Transition, TraversalConfig, TraversalConfigBuilder, TraversalStrategy, TypedKernel,
-    TypedKernelEntry, TypedPayloadCache, boxed_memoizable_run, boxed_run, boxed_typed_run,
-    build_kernel, build_typed_kernel, register_kernel, search_native, try_build_kernel,
-    try_build_typed_kernel,
+    PayloadField, RunKernel, RunOptions, SearchResult, SearchStats, SearchTimeout, TargetCtx,
+    TargetOptions, Transition, TraversalConfig, TraversalConfigBuilder, TraversalStrategy,
+    TypedKernel, TypedKernelEntry, TypedPayloadCache, boxed_memoizable_run, boxed_run,
+    boxed_typed_run, build_kernel, build_typed_kernel, register_kernel, search_native,
+    try_build_kernel, try_build_typed_kernel,
 };
 
 // Re-exported so plugin crates can register kernels without their own dependency.

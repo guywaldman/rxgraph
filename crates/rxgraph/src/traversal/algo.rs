@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{marker::PhantomData, time::Duration};
 
 use anyhow::{Context, Result};
 
@@ -7,7 +7,7 @@ use crate::{
     traversal::{
         EdgeCtx, FirstResult, GraphPath, Kernel, SearchResult, Transition,
         config::{TraversalConfig, TraversalStrategy},
-        engine::{self, PathEntry, SearchAdapter},
+        engine::{self, PathEntry, RunConfig, SearchAdapter},
         kernel::PayloadCache,
     },
 };
@@ -26,6 +26,9 @@ pub struct RunOptions {
     /// Maximum returned path count. Treated as a soft early-stop limit under
     /// parallel traversal; the returned vector is truncated exactly.
     pub max_paths: Option<usize>,
+    /// Wall-clock budget from the start of the search, including time between stream pulls.
+    /// Expiry returns [`super::SearchTimeout`]. The default is unlimited.
+    pub timeout: Option<Duration>,
     /// Search order.
     pub strategy: TraversalStrategy,
     /// Maximum occurrences of any node inside one path. Must be at least one.
@@ -44,6 +47,7 @@ impl Default for RunOptions {
             start_nodes: Vec::new(),
             max_depth: None,
             max_paths: None,
+            timeout: None,
             strategy: TraversalStrategy::default(),
             max_visits_per_node: 1,
             parallel: true,
@@ -69,6 +73,12 @@ impl From<RunOptions> for NativeRunOptions {
     }
 }
 
+impl NativeRunOptions {
+    pub(super) fn start(self) -> (RunConfig, Option<super::TargetOptions>) {
+        (self.run.into(), self.optimizations)
+    }
+}
+
 impl RunOptions {
     /// Enables target-aware native graph traversal with the specified settings.
     pub fn with_optimizations(self, optimizations: super::TargetOptions) -> NativeRunOptions {
@@ -91,23 +101,26 @@ impl Graph {
             start_nodes,
             max_depth,
             max_paths,
+            timeout,
             strategy,
             max_visits_per_node,
             parallel,
             intermediate_states,
             progress,
         } = config;
-        let kernel = kernel.bind(self)?;
-        let run = RunOptions {
+        let run = RunConfig::from(RunOptions {
             start_nodes,
             max_depth,
             max_paths,
+            timeout,
             strategy,
             max_visits_per_node,
             parallel,
             intermediate_states,
             progress,
-        };
+        });
+        run.deadline.check()?;
+        let kernel = kernel.bind(self)?;
         let adapter = GraphSearchAdapter {
             graph: self,
             kernel: &kernel,
@@ -146,7 +159,7 @@ impl Graph {
     where
         K::State: Send + Sync + Clone,
     {
-        let NativeRunOptions { run, optimizations } = run.into();
+        let (run, optimizations) = run.into().start();
         if let Some(options) = optimizations {
             return self.search_paths_optimized_with(kernel, run, options);
         }

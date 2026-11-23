@@ -1,4 +1,5 @@
 import gc
+import time
 
 import polars as pl
 import pytest
@@ -64,6 +65,37 @@ def test_close_keeps_delivered_results(graph):
     assert stream.stats.evaluated_edges == count
     assert first[0].nodes == [0, 1, 3]
     assert first[0].state == {"spent": 2}
+
+
+def test_timeout_in_typed_search_and_stream(graph):
+    kwargs = options(optimizations={"reverse": True})
+    with pytest.raises(TimeoutError):
+        graph.search(**kwargs, timeout=0)
+    with graph.search_batches(**kwargs, timeout=0) as stream:
+        with pytest.raises(TimeoutError):
+            next(stream)
+        assert list(stream) == []
+        assert stream.stats.evaluated_edges == 0
+    assert graph.search(**kwargs, timeout=1.5).paths == graph.search(**kwargs).paths
+
+
+def test_stream_deadline_spans_pulls(graph):
+    with (
+        graph.search_batches(**options(), batch_size=1, timeout=0.2) as stream,
+        graph.search_batches(
+            **options(max_paths=1), batch_size=1, timeout=0.2
+        ) as capped,
+    ):
+        first = next(stream)
+        assert next(capped) == first
+        count = stream.stats.evaluated_edges
+        time.sleep(0.21)
+        with pytest.raises(TimeoutError):
+            next(stream)
+        assert list(stream) == []
+        assert list(capped) == []
+        assert stream.stats.evaluated_edges == count
+        assert first[0].nodes == [0, 1, 3]
 
 
 def test_stream_retains_graph_and_stats(graph):

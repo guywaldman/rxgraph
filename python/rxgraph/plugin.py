@@ -270,6 +270,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             progress: bool = False,
             max_visits_per_node: int = 1,
             optimizations: Mapping[str, Any] | None = None,
+            timeout: float | None = None,
         ) -> "SearchResult":
             """Run a stateful traversal.
 
@@ -296,6 +297,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 use typed native kernels and do not need this.
             :param max_depth: Maximum accepted-edge depth per path.
             :param max_paths: Stop the search once this many paths have been returned.
+            :param timeout: Optional time limit in seconds. Raises TimeoutError on expiry.
             :param strategy: ``"dfs"`` or ``"bfs"``.
             :param parallel: ``True``/``False`` or one of ``"on"``/``"off"``/``"auto"``.
             :param intermediate_states: Whether to include per-node state history on returned paths (false by default).
@@ -327,13 +329,14 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                     progress=progress,
                     max_visits_per_node=max_visits_per_node,
                     optimizations=optimizations,
+                    timeout=timeout,
                 )
 
             if optimizations is not None:
                 raise ValueError(
                     "target optimizations require a named graph-native kernel"
                 )
-            stop = _default_stop(stop, max_paths)
+            stop = _default_stop(stop, max_paths, timeout)
             kernel_obj = Kernel(
                 visit,
                 next_state,
@@ -351,6 +354,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 intermediate_states,
                 progress,
                 max_visits_per_node,
+                timeout,
             )
 
             inner = self._inner.search(traversal._to_inner(self))
@@ -374,8 +378,12 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             max_visits_per_node: int = 1,
             batch_size: int = 1024,
             optimizations: Mapping[str, Any] | None = None,
+            timeout: float | None = None,
         ) -> "SearchStream":
             """Pull batches from a named native kernel. No work runs between pulls.
+
+            The optional timeout is in seconds from stream creation, including time
+            between pulls. Expiry raises TimeoutError and closes the stream.
 
             Batches contain at most ``batch_size`` paths. Use a context manager
             or ``close()`` to release an unfinished search. DSL streaming is not
@@ -396,7 +404,6 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 raise TypeError("search_batches requires a named native kernel")
             translated_params = self._translate_params(params or {})
             self._ensure_payload_columns(columns)
-            extra = self._optimization_args(optimizations)
             inner = self._inner.search_kernel_batches(
                 kernel,
                 translated_params,
@@ -409,7 +416,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 progress,
                 max_visits_per_node,
                 batch_size,
-                *extra,
+                **_search_kwargs(timeout, optimizations),
             )
             return SearchStream(inner, self._id_to_label, self._edge_id_to_label)
 
@@ -431,8 +438,9 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             progress: bool = False,
             max_visits_per_node: int = 1,
             optimizations: Mapping[str, Any] | None = None,
+            timeout: float | None = None,
         ) -> "SearchPath | None":
-            """Return the canonical shallowest path in stable input order."""
+            """Return the canonical shallowest path, or raise TimeoutError on expiry."""
             result = self.search(
                 start_nodes=start_nodes,
                 visit=visit,
@@ -450,6 +458,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 progress=progress,
                 max_visits_per_node=max_visits_per_node,
                 optimizations=optimizations,
+                timeout=timeout,
             )
             return result.paths[0] if result.paths else None
 
@@ -475,6 +484,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             progress: bool,
             max_visits_per_node: int = 1,
             optimizations: Mapping[str, Any] | None = None,
+            timeout: float | None = None,
         ) -> "SearchResult":
             if any(arg is not None for arg in (visit, next_state, stop, initial_state)):
                 raise ValueError(
@@ -486,7 +496,6 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             self._ensure_payload_columns(columns)
             start_node_ids = [self.node_id(node) for node in start_nodes]
 
-            extra = self._optimization_args(optimizations)
             inner = self._inner.search_kernel(
                 name,
                 translated_params,
@@ -498,25 +507,11 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 intermediate_states,
                 progress,
                 max_visits_per_node,
-                *extra,
+                **_search_kwargs(timeout, optimizations),
             )
             return SearchResult._from_inner(
                 inner, self._id_to_label, self._edge_id_to_label
             )
-
-        @staticmethod
-        def _optimization_args(
-            optimizations: Mapping[str, Any] | None,
-        ) -> tuple[dict[str, Any], ...]:
-            if optimizations is None:
-                return ()
-            if not isinstance(optimizations, Mapping):
-                raise TypeError("optimizations must be a mapping")
-            if not _supports_optimizations:
-                raise NotImplementedError(
-                    "this native backend does not support target optimizations; rebuild the plugin"
-                )
-            return (dict(optimizations),)
 
         def _translate_params(self, params: Mapping[str, Any]) -> dict[str, Any]:
             """Translate node-label-valued params to engine IDs.
@@ -722,6 +717,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             intermediate_states: bool = False,
             progress: bool = False,
             max_visits_per_node: int = 1,
+            timeout: float | None = None,
         ) -> None:
             """Create a reusable traversal configuration.
 
@@ -729,6 +725,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             :param start_nodes: Node IDs or labels where traversal begins.
             :param max_depth: Maximum accepted-edge depth per path.
             :param max_paths: Maximum number of returned paths.
+            :param timeout: Optional time limit in seconds for each search.
             :param strategy: ``"dfs"`` or ``"bfs"``.
             :param parallel: ``True``/``False`` or one of ``"on"``/``"off"``/``"auto"``.
             :param intermediate_states: Include per-node state history on returned paths.
@@ -741,6 +738,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             self.start_nodes = list(start_nodes)
             self.max_depth = max_depth
             self.max_paths = max_paths
+            self.timeout = timeout
             self.strategy = strategy
             self.parallel = _parallel_bool(parallel)
             self.intermediate_states = intermediate_states
@@ -758,6 +756,7 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
                 self.intermediate_states,
                 self.progress,
                 self.max_visits_per_node,
+                **_search_kwargs(self.timeout),
             )
 
     @dataclass(slots=True)
@@ -897,11 +896,28 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
             return False
         raise ValueError("parallel must be a bool, or one of 'on', 'off', 'auto'")
 
-    def _default_stop(stop: Any | None, max_paths: int | None) -> Any:
+    def _search_kwargs(
+        timeout: float | None, optimizations: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        # Older plugin binaries accept only the original traversal arguments.
+        kwargs: dict[str, Any] = {} if timeout is None else {"timeout": timeout}
+        if optimizations is not None:
+            if not isinstance(optimizations, Mapping):
+                raise TypeError("optimizations must be a mapping")
+            if not _supports_optimizations:
+                raise NotImplementedError(
+                    "this native backend does not support target optimizations; rebuild the plugin"
+                )
+            kwargs["optimizations"] = dict(optimizations)
+        return kwargs
+
+    def _default_stop(
+        stop: Any | None, max_paths: int | None, timeout: float | None
+    ) -> Any:
         if stop is not None:
             return stop
-        if max_paths is None:
-            raise TypeError("search() requires 'stop' or 'max_paths'")
+        if max_paths is None and timeout is None:
+            raise TypeError("search() requires 'stop', 'max_paths', or 'timeout'")
         return DEFAULT_SEARCH_STOP
 
     def _inner_kernel(kernel: Kernel | _rxgraph.Kernel) -> _rxgraph.Kernel:

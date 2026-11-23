@@ -5,6 +5,7 @@
 //! to pass into [`Graph::search`](crate::graph::Graph::search).
 
 use crate::{dsl::DslKernel, graph::OwnedGraphId};
+use std::time::Duration;
 
 /// Search order used by a traversal.
 #[derive(Debug, Clone, Copy, Default)]
@@ -32,6 +33,8 @@ pub struct TraversalConfig {
     /// Parallel traversal treats this as a soft early-stop limit internally and
     /// truncates the returned path vector exactly.
     pub max_paths: Option<usize>,
+    /// Wall-clock budget for each search. Expiry returns [`super::SearchTimeout`].
+    pub timeout: Option<Duration>,
     /// Search order.
     pub strategy: TraversalStrategy,
     /// Maximum occurrences of any node inside one path.
@@ -75,6 +78,7 @@ pub struct TraversalConfigBuilder {
     start_nodes: Vec<OwnedGraphId>,
     max_depth: Option<usize>,
     max_paths: Option<usize>,
+    timeout: Option<Duration>,
     strategy: TraversalStrategy,
     max_visits_per_node: usize,
     parallel: bool,
@@ -90,6 +94,7 @@ impl TraversalConfigBuilder {
             start_nodes: Vec::new(),
             max_depth: None,
             max_paths: None,
+            timeout: None,
             strategy: TraversalStrategy::DepthFirst,
             max_visits_per_node: 1,
             parallel: true,
@@ -122,6 +127,12 @@ impl TraversalConfigBuilder {
     /// traversal, some in-flight work may finish after the limit is reached.
     pub fn with_max_paths(mut self, paths: usize) -> Self {
         self.max_paths = Some(paths);
+        self
+    }
+
+    /// Limits traversal time. A zero duration expires immediately.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
         self
     }
 
@@ -173,6 +184,7 @@ impl TraversalConfigBuilder {
             start_nodes: self.start_nodes,
             max_depth: self.max_depth,
             max_paths: self.max_paths,
+            timeout: self.timeout,
             strategy: self.strategy,
             max_visits_per_node: self.max_visits_per_node,
             parallel: self.parallel,

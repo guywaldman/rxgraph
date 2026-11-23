@@ -397,11 +397,29 @@ def test_search_defaults_stop_when_max_paths_is_set() -> None:
     assert result.paths[0].nodes == ["a", "b"]
 
 
-def test_search_requires_stop_or_max_paths() -> None:
+def test_search_requires_stop_or_a_limit() -> None:
     graph = rxg.Graph.from_edges([("a", "b")])
 
-    with pytest.raises(TypeError, match="requires 'stop' or 'max_paths'"):
+    with pytest.raises(TypeError, match="requires 'stop', 'max_paths', or 'timeout'"):
         graph.search(start_nodes=["a"])
+
+
+@pytest.mark.parametrize("method", ["search", "search_paths", "search_first"])
+def test_search_timeout(method: str) -> None:
+    graph = rxg.Graph.from_edges([("a", "b")])
+    search = getattr(graph, method)
+    with pytest.raises(TimeoutError, match="search timed out"):
+        search(start_nodes=["a"], timeout=0)
+    result = search(start_nodes=["a"], timeout=1.5)
+    path = result if method == "search_first" else result.paths[0]
+    assert path.nodes == ["a", "b"]
+
+
+@pytest.mark.parametrize("timeout", [-0.1, float("nan"), float("inf"), 1e300])
+def test_invalid_timeout(timeout: float) -> None:
+    graph = rxg.Graph.from_edges([("a", "b")])
+    with pytest.raises(ValueError, match="timeout"):
+        graph.search(start_nodes=["a"], timeout=timeout)
 
 
 def test_kernel_defaults_accept_and_never_stop() -> None:

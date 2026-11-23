@@ -50,13 +50,13 @@ impl ActiveVisits for Visits {
 }
 
 impl<S: Clone, C> Cursor<S, C> {
-    pub(crate) fn new(run: RunOptions) -> Result<Self> {
+    pub(crate) fn new(run: RunConfig) -> Result<Self> {
         if run.max_visits_per_node == 0 {
             bail!("max_visits_per_node must be at least 1");
         }
         let progress = Some(Progress::new(run.progress));
         Ok(Self {
-            cfg: RunConfig::from_run(run),
+            cfg: run,
             arena: Vec::new(),
             frames: Vec::new(),
             frontier: VecDeque::new(),
@@ -148,23 +148,47 @@ impl<S: Clone, C> Cursor<S, C> {
         adapter: &A,
         limit: usize,
     ) -> Result<Vec<A::Path>> {
+        let deadline = self.cfg.deadline;
+        deadline.check()?;
         self.initialize(adapter)?;
-        let result = if self.done {
-            Ok(Vec::new())
-        } else if matches!(self.cfg.strategy, TraversalStrategy::DepthFirst) {
-            self.advance_dfs(adapter, limit)
+        let limit = self.batch_limit(limit);
+        let paths = if self.done {
+            Vec::new()
         } else {
-            self.advance_bfs(adapter, limit)
+            // Specialize once per work chunk to keep timeout checks out of untimed edge loops.
+            match (self.cfg.strategy, deadline.enabled()) {
+                (TraversalStrategy::DepthFirst, false) => {
+                    self.advance_dfs::<_, false>(adapter, limit)?
+                }
+                (TraversalStrategy::DepthFirst, true) => {
+                    self.advance_dfs::<_, true>(adapter, limit)?
+                }
+                (TraversalStrategy::BreadthFirst, false) => {
+                    self.advance_bfs::<_, false>(adapter, limit)?
+                }
+                (TraversalStrategy::BreadthFirst, true) => {
+                    self.advance_bfs::<_, true>(adapter, limit)?
+                }
+            }
         };
+        deadline.check()?;
+        if self.at_limit() {
+            self.done = true;
+        }
         if let Some(progress) = &mut self.progress {
             progress.tick(&self.stats);
         }
-        result
+        Ok(paths)
     }
     fn at_limit(&self) -> bool {
         self.cfg
             .max_paths
             .is_some_and(|n| self.stats.stopped_paths >= n)
+    }
+    fn batch_limit(&self, requested: usize) -> usize {
+        self.cfg.max_paths.map_or(requested, |max| {
+            requested.min(max.saturating_sub(self.stats.stopped_paths))
+        })
     }
     fn accept<A: SearchAdapter<State = S, Cache = C>>(
         &mut self,
@@ -187,17 +211,18 @@ impl<S: Clone, C> Cursor<S, C> {
             Ok(Some(child))
         }
     }
-    fn advance_dfs<A: SearchAdapter<State = S, Cache = C>>(
+    fn advance_dfs<A: SearchAdapter<State = S, Cache = C>, const TIMED: bool>(
         &mut self,
         adapter: &A,
         limit: usize,
     ) -> Result<Vec<A::Path>> {
         let mut paths = Vec::new();
         let mut work = 0;
+        let mut checkpoint = if TIMED { 1 } else { WORK_QUANTUM };
         while work < WORK_QUANTUM && paths.len() < limit {
-            if self.at_limit() {
-                self.done = true;
-                break;
+            if TIMED && work == checkpoint {
+                self.cfg.deadline.check()?;
+                checkpoint = WORK_QUANTUM.min(work + Deadline::POLL_INTERVAL);
             }
             if self.frames.is_empty() && !self.start(adapter)? {
                 self.done = true;
@@ -213,12 +238,12 @@ impl<S: Clone, C> Cursor<S, C> {
                 continue;
             }
             let start = frame.next_edge;
-            let end = frame.edge_count.min(start + WORK_QUANTUM - work);
+            let end = frame.edge_count.min(start + (checkpoint - work));
             let node = self.arena[parent].node;
             let mut accepted = None;
+            let mut consumed = 0;
             adapter.for_each_range(node, start, end, |edge, dest| {
-                work += 1;
-                self.frames.last_mut().expect("active frame").next_edge += 1;
+                consumed += 1;
                 if self.visits.count(dest) >= self.cfg.max_visits_per_node {
                     self.stats.skipped_revisits += 1;
                     return Ok(true);
@@ -246,8 +271,10 @@ impl<S: Clone, C> Cursor<S, C> {
                     },
                     &mut paths,
                 )?;
-                Ok(accepted.is_none() && paths.len() < limit && !self.at_limit())
+                Ok(accepted.is_none() && paths.len() < limit)
             })?;
+            work += consumed;
+            self.frames.last_mut().expect("active frame").next_edge += consumed;
             if let Some(child) = accepted {
                 let dest = self.arena[child].node;
                 self.visits.increment(dest);
@@ -265,17 +292,18 @@ impl<S: Clone, C> Cursor<S, C> {
         }
         Ok(paths)
     }
-    fn advance_bfs<A: SearchAdapter<State = S, Cache = C>>(
+    fn advance_bfs<A: SearchAdapter<State = S, Cache = C>, const TIMED: bool>(
         &mut self,
         adapter: &A,
         limit: usize,
     ) -> Result<Vec<A::Path>> {
         let mut paths = Vec::new();
         let mut work = 0;
+        let mut checkpoint = if TIMED { 1 } else { WORK_QUANTUM };
         while work < WORK_QUANTUM && paths.len() < limit {
-            if self.at_limit() {
-                self.done = true;
-                break;
+            if TIMED && work == checkpoint {
+                self.cfg.deadline.check()?;
+                checkpoint = WORK_QUANTUM.min(work + Deadline::POLL_INTERVAL);
             }
             let Some(&parent) = self.frontier.front() else {
                 self.done = true;
@@ -283,6 +311,11 @@ impl<S: Clone, C> Cursor<S, C> {
             };
             if self.bfs_prefetched == 0 {
                 let depth = self.arena[parent].depth;
+                // A BFS frontier has no shallower entries after this one.
+                if depth >= self.cfg.max_depth {
+                    self.done = true;
+                    break;
+                }
                 let nodes = self
                     .frontier
                     .iter()
@@ -291,19 +324,13 @@ impl<S: Clone, C> Cursor<S, C> {
                     .map(|&p| self.arena[p].node)
                     .collect::<Vec<_>>();
                 self.bfs_prefetched = nodes.len();
-                if depth < self.cfg.max_depth {
-                    adapter.prefetch_outgoing(&nodes)?;
-                }
+                adapter.prefetch_outgoing(&nodes)?;
             }
             let node = self.arena[parent].node;
             let count = match self.bfs_count {
                 Some(count) => count,
                 None => {
-                    let count = if self.arena[parent].depth >= self.cfg.max_depth {
-                        0
-                    } else {
-                        adapter.out_degree(node)?
-                    };
+                    let count = adapter.out_degree(node)?;
                     self.bfs_count = Some(count);
                     count
                 }
@@ -319,16 +346,16 @@ impl<S: Clone, C> Cursor<S, C> {
                 work += 1;
                 continue;
             }
-            let end = count.min(self.bfs_edge + WORK_QUANTUM - work);
+            let end = count.min(self.bfs_edge + (checkpoint - work));
+            let mut consumed = 0;
             adapter.for_each_range(node, self.bfs_edge, end, |edge, dest| {
-                work += 1;
-                self.bfs_edge += 1;
+                consumed += 1;
                 let edge = eval_arena_edge(
                     adapter,
                     &self.arena,
                     parent,
                     (edge, dest),
-                    &self.cfg,
+                    self.cfg.max_visits_per_node,
                     &mut self.stats,
                     self.cache.as_ref().expect("initialized cache"),
                 )?;
@@ -337,8 +364,10 @@ impl<S: Clone, C> Cursor<S, C> {
                 {
                     self.frontier.push_back(child);
                 }
-                Ok(paths.len() < limit && !self.at_limit())
+                Ok(paths.len() < limit)
             })?;
+            work += consumed;
+            self.bfs_edge += consumed;
         }
         Ok(paths)
     }
