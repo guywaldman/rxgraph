@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/guywaldman/rxgraph/compare/v0.18.0...v0.18.1) (2026-11-23)
+
+
+### Performance Improvements
+
+* reduce native search latency and traversal memory ([#52](https://github.com/guywaldman/rxgraph/issues/52)) ([cb85586](https://github.com/guywaldman/rxgraph/commit/cb855861ca9627d5b9c6473a00e650419fb78097))
+
 ## [0.18.0](https://github.com/guywaldman/rxgraph/compare/v0.17.0...v0.18.0) (2026-11-23)
 
 
