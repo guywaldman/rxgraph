@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.18.0](https://github.com/guywaldman/rxgraph/compare/v0.17.0...v0.18.0) (2026-11-23)
+
+
+### Features
+
+* add optional search timeouts ([#50](https://github.com/guywaldman/rxgraph/issues/50)) ([eba786b](https://github.com/guywaldman/rxgraph/commit/eba786b7a0aa61617926592fa12b366070b0cf2c))
+
+
+### Bug Fixes
+
+* **release:** sync the benchmark plugin lockfile ([53660b5](https://github.com/guywaldman/rxgraph/commit/53660b55c241eef382a31844d625bc22139016d0))
+
 ## [0.17.0](https://github.com/guywaldman/rxgraph/compare/v0.16.0...v0.17.0) (2026-11-08)
 
 
