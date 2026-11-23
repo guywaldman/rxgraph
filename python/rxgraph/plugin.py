@@ -387,7 +387,8 @@ def export_api(namespace: dict[str, Any], native_module: Any) -> None:
 
             Batches contain at most ``batch_size`` paths. Use a context manager
             or ``close()`` to release an unfinished search. DSL streaming is not
-            supported yet. Typed stores retain their serial execution behavior.
+            supported yet. Eager typed kernels honor ``parallel``. Lazy Parquet
+            stores use serial traversal.
             ``optimizations`` has the same graph-native options as :meth:`search`.
             """
             if not _supports_streaming:

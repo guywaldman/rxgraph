@@ -19,6 +19,7 @@ include = [
 ]
 
 [dependencies]
+ahash.workspace = true
 anyhow.workspace = true
 arrow.workspace = true
 arrow-schema.workspace = true

@@ -407,9 +407,18 @@ pub struct FirstResult<'a, N, E, S> {
 /// full topology, and the supplied payload slices are already materialized.
 pub struct EagerGraphStore<'a, N, E> {
     graph: Owner<'a, Graph>,
-    nodes: Owner<'a, [N]>,
-    edges: Owner<'a, [E]>,
+    payloads: EagerPayloads<'a, N, E>,
     outgoing: OutgoingRows,
+}
+
+pub(crate) struct DecodedPayloads<N, E> {
+    pub(crate) nodes: Vec<N>,
+    pub(crate) edges: Vec<E>,
+}
+
+enum EagerPayloads<'a, N, E> {
+    Borrowed { nodes: &'a [N], edges: &'a [E] },
+    Shared(Arc<DecodedPayloads<N, E>>),
 }
 
 // Only callers requesting the row-shaped GraphStore API need to build this
@@ -455,19 +464,17 @@ impl<'a, N, E> EagerGraphStore<'a, N, E> {
 
         Ok(Self {
             graph: Owner::Borrowed(graph),
-            nodes: Owner::Borrowed(nodes),
-            edges: Owner::Borrowed(edges),
+            payloads: EagerPayloads::Borrowed { nodes, edges },
             outgoing: OutgoingRows::default(),
         })
     }
 }
 
 impl<N: 'static, E: 'static> EagerGraphStore<'static, N, E> {
-    pub(crate) fn shared(graph: Arc<Graph>, nodes: Arc<[N]>, edges: Arc<[E]>) -> Self {
+    pub(crate) fn shared(graph: Arc<Graph>, payloads: Arc<DecodedPayloads<N, E>>) -> Self {
         Self {
             graph: Owner::Shared(graph),
-            nodes: Owner::Shared(nodes),
-            edges: Owner::Shared(edges),
+            payloads: EagerPayloads::Shared(payloads),
             outgoing: OutgoingRows::default(),
         }
     }
@@ -510,13 +517,21 @@ impl<N, E> GraphStore for EagerGraphStore<'_, N, E> {
     }
 
     fn node(&self, id: NodeId) -> Result<&Self::Node> {
-        self.nodes
+        let nodes = match &self.payloads {
+            EagerPayloads::Borrowed { nodes, .. } => *nodes,
+            EagerPayloads::Shared(payloads) => &payloads.nodes,
+        };
+        nodes
             .get(id as usize)
             .with_context(|| format!("node row {id} is out of range"))
     }
 
     fn edge(&self, id: EdgeId) -> Result<&Self::Edge> {
-        self.edges
+        let edges = match &self.payloads {
+            EagerPayloads::Borrowed { edges, .. } => *edges,
+            EagerPayloads::Shared(payloads) => &payloads.edges,
+        };
+        edges
             .get(id as usize)
             .with_context(|| format!("edge row {id} is out of range"))
     }

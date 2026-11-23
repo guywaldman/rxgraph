@@ -243,8 +243,9 @@ Use the context manager when breaking early. `stats` is cumulative and remains
 readable after close.
 
 Serial DFS/BFS ordering and the global `max_paths` limit are preserved. Parallel
-ordering is unspecified. Typed eager and lazy Parquet stores currently execute
-serially, as they do with `search`. DSL streaming is deferred. Custom native
+ordering is unspecified. Eager typed kernels can decode large payloads and
+traverse in parallel. Lazy Parquet kernels use serial traversal, as they do
+with `search`. DSL streaming is deferred. Custom native
 runners must implement the optional streaming capability; standard plugin wrappers
 provide it automatically when rebuilt against this version.
 

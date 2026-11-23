@@ -171,10 +171,10 @@ impl<S: Clone, C> Cursor<S, C> {
                     self.advance_dfs::<_, true>(adapter, limit)?
                 }
                 (TraversalStrategy::BreadthFirst, false) => {
-                    self.advance_bfs::<_, false>(adapter, limit)?
+                    self.advance_bfs::<_, false>(adapter, limit, WORK_QUANTUM)?
                 }
                 (TraversalStrategy::BreadthFirst, true) => {
-                    self.advance_bfs::<_, true>(adapter, limit)?
+                    self.advance_bfs::<_, true>(adapter, limit, WORK_QUANTUM)?
                 }
             }
         };
@@ -328,15 +328,16 @@ impl<S: Clone, C> Cursor<S, C> {
         &mut self,
         adapter: &A,
         limit: usize,
+        work_limit: usize,
     ) -> Result<Vec<A::Path>> {
         let mut paths = Vec::new();
         let mut work = 0;
-        let mut checkpoint = if TIMED { 1 } else { WORK_QUANTUM };
+        let mut checkpoint = if TIMED { 1 } else { work_limit };
         let prefetches = adapter.prefetches_outgoing();
-        while work < WORK_QUANTUM && paths.len() < limit {
+        while work < work_limit && paths.len() < limit {
             if TIMED && work == checkpoint {
                 self.cfg.deadline.check()?;
-                checkpoint = WORK_QUANTUM.min(work + Deadline::POLL_INTERVAL);
+                checkpoint = work_limit.min(work + Deadline::POLL_INTERVAL);
             }
             let Some(&parent) = self.frontier.front() else {
                 self.done = true;
@@ -353,7 +354,7 @@ impl<S: Clone, C> Cursor<S, C> {
                     let nodes = self
                         .frontier
                         .iter()
-                        .take(WORK_QUANTUM)
+                        .take(work_limit)
                         .take_while(|&&p| self.arena[p].depth == depth)
                         .map(|&p| self.arena[p].node)
                         .collect::<Vec<_>>();

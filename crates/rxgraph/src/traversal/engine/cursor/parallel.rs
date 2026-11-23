@@ -1,5 +1,8 @@
 use super::*;
-type EvaluatedChunk<S> = (Vec<(usize, EdgeEval<S>)>, SearchStats);
+type EvaluatedEdge<S> = (usize, EdgeEval<S>);
+type EvaluatedChunk<S> = (Vec<EvaluatedEdge<S>>, SearchStats);
+const SMALL_PATH_REQUEST: usize = 8;
+const EARLY_PATH_PROBE: usize = 64;
 
 /// Parallel DFS keeps one active stack and scratch cache per worker across pulls.
 pub(crate) struct ParallelDfs<S, C> {
@@ -43,41 +46,53 @@ impl<S: Clone, C> ParallelDfs<S, C> {
             let remaining = self
                 .max_paths
                 .map_or(size, |n| n.saturating_sub(self.emitted).min(size));
-            let active = self.workers.iter().filter(|w| !w.done).count();
-            if active == 0 || remaining == 0 {
+            if remaining == 0 {
                 return Ok(None);
             }
-            let mut index = 0;
-            let jobs = self
-                .workers
-                .iter_mut()
-                .filter(|w| !w.done)
-                .map(|w| {
-                    let quota = remaining / active + usize::from(index < remaining % active);
-                    index += 1;
-                    (w, quota)
-                })
-                .collect::<Vec<_>>();
-            let results = jobs
-                .into_par_iter()
-                .map(|(worker, quota)| {
-                    if quota == 0 {
-                        return Ok(Vec::new());
-                    }
-                    let before = worker.stats.evaluated_edges;
-                    let result = worker.advance(adapter, quota);
-                    worker.stats.parallel_edges += worker.stats.evaluated_edges - before;
-                    result
-                })
-                .collect::<Result<Vec<_>>>();
-            self.stats = SearchStats::default();
-            for worker in &self.workers {
-                merge_stats(&mut self.stats, worker.stats);
-            }
+            let paths = if remaining == 1 {
+                // The first active worker would receive the only nonzero quota.
+                let Some(worker) = self.workers.iter_mut().find(|w| !w.done) else {
+                    return Ok(None);
+                };
+                let before = worker.stats;
+                let result = worker.advance(adapter, remaining);
+                merge_stats_since(&mut self.stats, worker.stats, before);
+                result
+            } else {
+                let active = self.workers.iter().filter(|w| !w.done).count();
+                if active == 0 {
+                    return Ok(None);
+                }
+                let jobs = self
+                    .workers
+                    .iter_mut()
+                    .filter(|w| !w.done)
+                    .take(remaining)
+                    .enumerate()
+                    .map(|(index, worker)| {
+                        let quota = remaining / active + usize::from(index < remaining % active);
+                        (worker, quota)
+                    })
+                    .collect::<Vec<_>>();
+                let results = jobs
+                    .into_par_iter()
+                    .map(|(worker, quota)| {
+                        let before = worker.stats.evaluated_edges;
+                        let result = worker.advance(adapter, quota);
+                        worker.stats.parallel_edges += worker.stats.evaluated_edges - before;
+                        result
+                    })
+                    .collect::<Result<Vec<_>>>();
+                self.stats = SearchStats::default();
+                for worker in &self.workers {
+                    merge_stats(&mut self.stats, worker.stats);
+                }
+                results.map(|results| results.into_iter().flatten().collect::<Vec<_>>())
+            };
             if let Some(progress) = &mut self.progress {
                 progress.tick(&self.stats);
             }
-            let paths = results?.into_iter().flatten().collect::<Vec<_>>();
+            let paths = paths?;
             self.emitted += paths.len();
             if !paths.is_empty() {
                 return Ok(Some(paths));
@@ -107,6 +122,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
                 pending: VecDeque::new(),
                 expanded: Vec::new(),
                 caches: Vec::new(),
+                probed_depth: None,
             }))
         } else {
             Ok(Self::Serial(Cursor::new(run)?))
@@ -164,11 +180,13 @@ impl<S: Clone, C> GraphCursor<S, C> {
 
 pub(crate) struct ParallelBfs<S, C> {
     cursor: Cursor<S, C>,
-    pending: VecDeque<(usize, EdgeEval<S>)>,
+    // Drain worker-owned buffers in frontier order across pulls.
+    pending: VecDeque<std::vec::IntoIter<EvaluatedEdge<S>>>,
     /// Evaluated parents retain their frontier references until the pending
     /// transitions are materialized or linked into the next frontier.
     expanded: Vec<usize>,
     caches: Vec<C>,
+    probed_depth: Option<usize>,
 }
 impl<S: Clone, C> ParallelBfs<S, C> {
     fn next_batch<A, const TIMED: bool>(
@@ -202,11 +220,19 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 c.done = true;
                 break;
             }
-            while let Some((parent, edge)) = self.pending.pop_front() {
-                deadline.check_every(self.pending.len())?;
-                if let Some(child) = c.accept::<_, true>(adapter, parent, edge, &mut paths)? {
-                    c.frontier.push_back(child);
-                } else if paths.len() >= size {
+            while let Some(chunk) = self.pending.front_mut() {
+                for (i, (parent, edge)) in chunk.by_ref().enumerate() {
+                    deadline.check_every(i)?;
+                    if let Some(child) = c.accept::<_, true>(adapter, parent, edge, &mut paths)? {
+                        c.frontier.push_back(child);
+                    } else if paths.len() >= size {
+                        break;
+                    }
+                }
+                if chunk.as_slice().is_empty() {
+                    self.pending.pop_front();
+                }
+                if paths.len() >= size {
                     break;
                 }
             }
@@ -238,8 +264,20 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                     frontier_edges += adapter.out_degree(c.arena[parent].node)?;
                 }
             }
-            if c.frontier.len() < MIN_PAR_FRONTIER && frontier_edges < MIN_PAR_EDGES {
-                paths = c.advance_bfs::<_, TIMED>(adapter, size)?;
+            let small_frontier =
+                c.frontier.len() < MIN_PAR_FRONTIER && frontier_edges < MIN_PAR_EDGES;
+            let probe =
+                !small_frontier && size <= SMALL_PATH_REQUEST && self.probed_depth != Some(depth);
+            if small_frontier || probe {
+                // A short serial pass can satisfy a small pull without a full
+                // speculative parallel batch. Keep parallelism for the rest of the layer.
+                let work_limit = if probe {
+                    self.probed_depth = Some(depth);
+                    EARLY_PATH_PROBE
+                } else {
+                    WORK_QUANTUM
+                };
+                paths = c.advance_bfs::<_, TIMED>(adapter, size, work_limit)?;
                 if let Some(progress) = &mut c.progress {
                     progress.tick(&c.stats);
                 }
@@ -264,7 +302,8 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             let mut edge_total = 0;
             let release_states =
                 !c.cfg.intermediate_states && adapter.can_release_expanded_states();
-            let mut job_size = WORK_QUANTUM.div_ceil(rayon::current_num_threads());
+            let threads = rayon::current_num_threads();
+            let mut job_size = WORK_QUANTUM.div_ceil(threads);
             if TIMED {
                 job_size = job_size.min(Deadline::POLL_INTERVAL);
             }
@@ -333,11 +372,26 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 Ok((edges, stats))
             };
             let results = if parallel {
-                let chunk = jobs.len().div_ceil(rayon::current_num_threads()).max(1);
-                let count = jobs.len().div_ceil(chunk);
+                // Split on cumulative edge counts to balance uneven node degrees.
+                let mut chunks = Vec::with_capacity(threads);
+                let per_worker = edge_total.div_ceil(threads);
+                let mut chunk_start = 0;
+                let mut assigned = 0;
+                for (i, &(_, start, end)) in jobs.iter().enumerate() {
+                    assigned += end - start;
+                    if assigned >= (chunks.len() + 1) * per_worker {
+                        chunks.push(&jobs[chunk_start..=i]);
+                        chunk_start = i + 1;
+                    }
+                }
+                if chunk_start < jobs.len() {
+                    chunks.push(&jobs[chunk_start..]);
+                }
+                let count = chunks.len();
                 self.caches
                     .resize_with(count.max(self.caches.len()), || adapter.make_cache());
-                jobs.par_chunks(chunk)
+                chunks
+                    .into_par_iter()
                     .zip(self.caches[..count].par_iter_mut())
                     .map(|(jobs, cache)| evaluate(jobs, cache))
                     .collect::<Result<Vec<_>>>()?
@@ -348,7 +402,9 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 )?]
             };
             for (edges, stats) in results {
-                self.pending.extend(edges);
+                if !edges.is_empty() {
+                    self.pending.push_back(edges.into_iter());
+                }
                 merge_stats(&mut c.stats, stats);
             }
             if release_states {
@@ -382,6 +438,7 @@ mod tests {
     // One continuing branch and one wide dead-end layer per depth.
     struct Branches {
         loops: bool,
+        stop_at: NodeId,
     }
 
     impl SearchAdapter for Branches {
@@ -438,7 +495,7 @@ mod tests {
             state: &usize,
             _: &(),
         ) -> Result<Option<(usize, bool)>> {
-            Ok(Some((state + 1, dest == DEPTH)))
+            Ok(Some((state + 1, dest == self.stop_at)))
         }
         fn materialize(
             &self,
@@ -473,7 +530,13 @@ mod tests {
                 };
                 let mut cursor = GraphCursor::new(run.into())?;
                 let paths = cursor
-                    .next_batch(&Branches { loops: false }, 1)?
+                    .next_batch(
+                        &Branches {
+                            loops: false,
+                            stop_at: DEPTH,
+                        },
+                        1,
+                    )?
                     .expect("spine reaches target");
                 let expected = (0..=DEPTH)
                     .map(|node| (node, node as usize))
@@ -505,7 +568,10 @@ mod tests {
             ..Default::default()
         };
         let mut cursor = GraphCursor::new(run.into())?;
-        let adapter = Branches { loops: true };
+        let adapter = Branches {
+            loops: true,
+            stop_at: DEPTH,
+        };
         for (shallow_loop, deep_loop) in
             [(false, false), (false, true), (true, false), (true, true)]
         {
@@ -521,5 +587,63 @@ mod tests {
         assert!(cursor.next_batch(&adapter, 1)?.is_none());
         assert_eq!(cursor.stats().skipped_revisits, 3);
         Ok(())
+    }
+
+    #[test]
+    fn first_bfs_path_does_not_evaluate_a_full_parallel_batch() -> Result<()> {
+        let run = RunOptions {
+            start_nodes: vec![0.into(); MIN_PAR_FRONTIER],
+            max_paths: Some(1),
+            strategy: TraversalStrategy::BreadthFirst,
+            parallel: true,
+            intermediate_states: true,
+            ..Default::default()
+        };
+        let mut cursor = GraphCursor::new(run.into())?;
+        let adapter = Branches {
+            loops: false,
+            stop_at: 1,
+        };
+        assert_eq!(
+            cursor.next_batch(&adapter, 1)?,
+            Some(vec![vec![(0, 0), (1, 1)]])
+        );
+        assert_eq!(cursor.stats().evaluated_edges, 1);
+        assert!(cursor.next_batch(&adapter, 1)?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn single_path_dfs_pull_keeps_worker_progress_and_stats() -> Result<()> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        pool.install(|| {
+            let run = RunOptions {
+                start_nodes: vec![0.into(); 3],
+                strategy: TraversalStrategy::DepthFirst,
+                parallel: true,
+                intermediate_states: true,
+                ..Default::default()
+            };
+            let mut cursor = GraphCursor::new(run.into())?;
+            let adapter = Branches {
+                loops: false,
+                stop_at: 1,
+            };
+            let path = vec![(0, 0), (1, 1)];
+            assert_eq!(
+                cursor.next_batch(&adapter, 2)?,
+                Some(vec![path.clone(), path.clone()])
+            );
+            assert_eq!(cursor.stats().parallel_edges, 2);
+            assert_eq!(cursor.next_batch(&adapter, 1)?, Some(vec![path]));
+            assert!(cursor.next_batch(&adapter, 1)?.is_none());
+            let stats = cursor.stats();
+            assert_eq!(stats.start_nodes, 3);
+            assert_eq!(stats.stopped_paths, 3);
+            assert_eq!(stats.evaluated_edges, 3 * (FANOUT + 1));
+            assert_eq!(stats.parallel_edges, 2);
+            assert_eq!(stats.max_depth, 1);
+            Ok(())
+        })
     }
 }

@@ -126,7 +126,7 @@ pub(crate) struct RunConfig {
     strategy: TraversalStrategy,
     max_visits_per_node: usize,
     pub(super) intermediate_states: bool,
-    parallel: bool,
+    pub(super) parallel: bool,
     progress: bool,
 }
 
@@ -323,19 +323,27 @@ fn can_visit_arena<S>(
 }
 
 fn merge_stats(into: &mut SearchStats, from: SearchStats) {
-    into.start_nodes += from.start_nodes;
-    into.path_entries += from.path_entries;
-    into.evaluated_edges += from.evaluated_edges;
-    into.parallel_edges += from.parallel_edges;
-    into.accepted_edges += from.accepted_edges;
-    into.rejected_edges += from.rejected_edges;
-    into.skipped_revisits += from.skipped_revisits;
-    into.stopped_paths += from.stopped_paths;
+    merge_stats_since(into, from, SearchStats::default());
+}
+
+fn merge_stats_since(into: &mut SearchStats, from: SearchStats, before: SearchStats) {
+    into.start_nodes += from.start_nodes - before.start_nodes;
+    into.path_entries += from.path_entries - before.path_entries;
+    into.evaluated_edges += from.evaluated_edges - before.evaluated_edges;
+    into.parallel_edges += from.parallel_edges - before.parallel_edges;
+    into.accepted_edges += from.accepted_edges - before.accepted_edges;
+    into.rejected_edges += from.rejected_edges - before.rejected_edges;
+    into.skipped_revisits += from.skipped_revisits - before.skipped_revisits;
+    into.stopped_paths += from.stopped_paths - before.stopped_paths;
     into.max_depth = into.max_depth.max(from.max_depth);
-    into.materialized_node_payloads += from.materialized_node_payloads;
-    into.materialized_edge_payloads += from.materialized_edge_payloads;
-    into.lazy_payload_read_calls += from.lazy_payload_read_calls;
-    into.lazy_payload_requested_rows += from.lazy_payload_requested_rows;
-    into.lazy_payload_selected_rows += from.lazy_payload_selected_rows;
-    into.lazy_payload_row_groups += from.lazy_payload_row_groups;
+    into.materialized_node_payloads +=
+        from.materialized_node_payloads - before.materialized_node_payloads;
+    into.materialized_edge_payloads +=
+        from.materialized_edge_payloads - before.materialized_edge_payloads;
+    into.lazy_payload_read_calls += from.lazy_payload_read_calls - before.lazy_payload_read_calls;
+    into.lazy_payload_requested_rows +=
+        from.lazy_payload_requested_rows - before.lazy_payload_requested_rows;
+    into.lazy_payload_selected_rows +=
+        from.lazy_payload_selected_rows - before.lazy_payload_selected_rows;
+    into.lazy_payload_row_groups += from.lazy_payload_row_groups - before.lazy_payload_row_groups;
 }

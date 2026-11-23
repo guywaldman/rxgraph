@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    hash::{BuildHasher, BuildHasherDefault, Hash, Hasher, RandomState},
+    hash::{BuildHasherDefault, Hash, Hasher},
     marker::PhantomData,
     sync::{
         Arc, Mutex,
@@ -11,6 +11,7 @@ use std::{
     },
 };
 
+use ahash::RandomState;
 use anyhow::{Result, anyhow, bail};
 
 use crate::{

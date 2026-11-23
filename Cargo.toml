@@ -9,6 +9,7 @@ rust-version = "1.85"
 repository = "https://github.com/guywaldman/rxgraph"
 
 [workspace.dependencies]
+ahash = { version = "~0.8.12", default-features = false }
 anyhow = "~1.0.102"
 arrow = "~58.3.0"
 arrow-schema = "~58.3.0"
