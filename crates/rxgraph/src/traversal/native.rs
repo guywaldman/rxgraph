@@ -82,9 +82,20 @@ pub trait GraphStore {
     /// Outgoing topology for `src`.
     fn outgoing(&self, src: NodeId) -> Result<&[OutgoingEdge]>;
 
+    /// Borrow edge and destination columns in the same order as `outgoing`.
+    /// The slices must have equal lengths. Return `None` to use `outgoing`.
+    fn outgoing_columns(&self, _src: NodeId) -> Option<(&[EdgeId], &[NodeId])> {
+        None
+    }
+
     /// Optional hook for stores that can batch-load outgoing topology.
     fn prefetch_outgoing(&self, _nodes: &[NodeId]) -> Result<()> {
         Ok(())
+    }
+
+    /// Return false when prefetching outgoing nodes would do no work.
+    fn prefetches_outgoing(&self) -> bool {
+        true
     }
 
     /// Native node payload for `id`.
@@ -396,9 +407,41 @@ pub struct FirstResult<'a, N, E, S> {
 /// full topology, and the supplied payload slices are already materialized.
 pub struct EagerGraphStore<'a, N, E> {
     graph: Owner<'a, Graph>,
-    nodes: Owner<'a, [N]>,
-    edges: Owner<'a, [E]>,
-    outgoing: Vec<OnceLock<Vec<OutgoingEdge>>>,
+    payloads: EagerPayloads<'a, N, E>,
+    outgoing: OutgoingRows,
+}
+
+pub(crate) struct DecodedPayloads<N, E> {
+    pub(crate) nodes: Vec<N>,
+    pub(crate) edges: Vec<E>,
+}
+
+enum EagerPayloads<'a, N, E> {
+    Borrowed { nodes: &'a [N], edges: &'a [E] },
+    Shared(Arc<DecodedPayloads<N, E>>),
+}
+
+// Only callers requesting the row-shaped GraphStore API need to build this
+// cache. The traversal reads the existing CSR columns directly.
+#[derive(Default)]
+pub(crate) struct OutgoingRows(OnceLock<Vec<OnceLock<Vec<OutgoingEdge>>>>);
+
+impl OutgoingRows {
+    pub(crate) fn get(&self, graph: &Graph, src: NodeId) -> Result<&[OutgoingEdge]> {
+        let index = src as usize;
+        anyhow::ensure!(index < graph.node_count(), "node row {src} is out of range");
+        let slots = self
+            .0
+            .get_or_init(|| (0..graph.node_count()).map(|_| OnceLock::new()).collect());
+        Ok(slots[index].get_or_init(|| {
+            let (edges, dests) = graph.repo.outgoing_slice(src);
+            edges
+                .iter()
+                .zip(dests)
+                .map(|(&edge, &dest)| OutgoingEdge { edge, dest })
+                .collect()
+        }))
+    }
 }
 
 impl<'a, N, E> EagerGraphStore<'a, N, E> {
@@ -421,21 +464,18 @@ impl<'a, N, E> EagerGraphStore<'a, N, E> {
 
         Ok(Self {
             graph: Owner::Borrowed(graph),
-            nodes: Owner::Borrowed(nodes),
-            edges: Owner::Borrowed(edges),
-            outgoing: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
+            payloads: EagerPayloads::Borrowed { nodes, edges },
+            outgoing: OutgoingRows::default(),
         })
     }
 }
 
 impl<N: 'static, E: 'static> EagerGraphStore<'static, N, E> {
-    pub(crate) fn shared(graph: Arc<Graph>, nodes: Arc<[N]>, edges: Arc<[E]>) -> Self {
-        let outgoing = (0..graph.node_count()).map(|_| OnceLock::new()).collect();
+    pub(crate) fn shared(graph: Arc<Graph>, payloads: Arc<DecodedPayloads<N, E>>) -> Self {
         Self {
             graph: Owner::Shared(graph),
-            nodes: Owner::Shared(nodes),
-            edges: Owner::Shared(edges),
-            outgoing,
+            payloads: EagerPayloads::Shared(payloads),
+            outgoing: OutgoingRows::default(),
         }
     }
 }
@@ -465,30 +505,33 @@ impl<N, E> GraphStore for EagerGraphStore<'_, N, E> {
     }
 
     fn outgoing(&self, src: NodeId) -> Result<&[OutgoingEdge]> {
-        let slot = self
-            .outgoing
-            .get(src as usize)
-            .with_context(|| format!("node row {src} is out of range"))?;
-        Ok(slot
-            .get_or_init(|| {
-                let (edges, dests) = self.graph.repo.outgoing_slice(src);
-                edges
-                    .iter()
-                    .zip(dests)
-                    .map(|(&edge, &dest)| OutgoingEdge { edge, dest })
-                    .collect()
-            })
-            .as_slice())
+        self.outgoing.get(&self.graph, src)
+    }
+
+    fn outgoing_columns(&self, src: NodeId) -> Option<(&[EdgeId], &[NodeId])> {
+        ((src as usize) < self.graph.node_count()).then(|| self.graph.repo.outgoing_slice(src))
+    }
+
+    fn prefetches_outgoing(&self) -> bool {
+        false
     }
 
     fn node(&self, id: NodeId) -> Result<&Self::Node> {
-        self.nodes
+        let nodes = match &self.payloads {
+            EagerPayloads::Borrowed { nodes, .. } => *nodes,
+            EagerPayloads::Shared(payloads) => &payloads.nodes,
+        };
+        nodes
             .get(id as usize)
             .with_context(|| format!("node row {id} is out of range"))
     }
 
     fn edge(&self, id: EdgeId) -> Result<&Self::Edge> {
-        self.edges
+        let edges = match &self.payloads {
+            EagerPayloads::Borrowed { edges, .. } => *edges,
+            EagerPayloads::Shared(payloads) => &payloads.edges,
+        };
+        edges
             .get(id as usize)
             .with_context(|| format!("edge row {id} is out of range"))
     }
@@ -629,6 +672,10 @@ where
         self.store.prefetch_outgoing(nodes)
     }
 
+    fn prefetches_outgoing(&self) -> bool {
+        self.store.prefetches_outgoing()
+    }
+
     fn dense_node_count(&self) -> Option<usize> {
         self.store.dense_node_count()
     }
@@ -648,6 +695,14 @@ where
     where
         V: FnMut(EdgeId, NodeId) -> Result<bool>,
     {
+        if let Some((edges, dests)) = self.store.outgoing_columns(node) {
+            for (&edge, &dest) in edges[start..end].iter().zip(&dests[start..end]) {
+                if !visit(edge, dest)? {
+                    break;
+                }
+            }
+            return Ok(());
+        }
         for &OutgoingEdge { edge, dest } in &self.store.outgoing(node)?[start..end] {
             if !visit(edge, dest)? {
                 break;
@@ -777,7 +832,7 @@ pub(crate) fn materialize_native_lazy<'store, G: GraphStore, S: Clone>(
     mut path: usize,
     intermediate_states: bool,
 ) -> Result<Path<'store, G::Node, G::Edge, S>> {
-    let completed = &arena[path].state;
+    let completed = arena[path].state();
     let final_state = completed
         .final_state
         .as_ref()
@@ -846,7 +901,7 @@ fn materialize_native_projected<'store, G: GraphStore, S: Clone, T>(
     intermediate_states: bool,
     project: impl Fn(&T) -> &S,
 ) -> Result<Path<'store, G::Node, G::Edge, S>> {
-    let final_state = project(&arena[path].state).clone();
+    let final_state = project(arena[path].state()).clone();
     let mut node_ids = Vec::with_capacity(arena[path].depth + 1);
     let mut edge_ids = Vec::with_capacity(arena[path].depth);
     let mut states = intermediate_states.then(|| Vec::with_capacity(node_ids.capacity()));
@@ -857,7 +912,7 @@ fn materialize_native_projected<'store, G: GraphStore, S: Clone, T>(
             edge_ids.push(edge);
         }
         if let Some(states) = &mut states {
-            states.push(project(&arena[path].state).clone());
+            states.push(project(arena[path].state()).clone());
         }
         match arena[path].parent {
             Some(parent) => path = parent,
@@ -1359,6 +1414,11 @@ mod tests {
         )
         .unwrap();
 
+        assert!(store.outgoing.0.get().is_none());
+        assert_eq!(
+            store.outgoing(0).unwrap(),
+            [OutgoingEdge { edge: 0, dest: 1 }]
+        );
         assert_eq!(
             result.paths[0]
                 .nodes

@@ -155,6 +155,35 @@ fn cache_is_fresh_per_search_and_fifo_eviction_recomputes() -> Result<()> {
 }
 
 #[test]
+fn shared_memoization_checks_equality_across_shards() -> Result<()> {
+    let graph = graph()?;
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build()?;
+    pool.install(|| -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let kernel = TestKernel {
+            calls: Arc::clone(&calls),
+            divergent: true,
+        };
+        let run = RunOptions {
+            start_nodes: vec![0_u64.into(); 1024],
+            max_depth: Some(5),
+            max_visits_per_node: 2,
+            strategy: TraversalStrategy::BreadthFirst,
+            intermediate_states: true,
+            ..Default::default()
+        };
+        let expected = graph.search_paths_with(kernel.clone(), run.clone())?;
+        let baseline_calls = calls.swap(0, Ordering::Relaxed);
+        let actual = graph.search_paths_with(kernel.memoized(257), run)?;
+        assert_eq!(rows(actual.paths), rows(expected.paths));
+        assert!(actual.stats.parallel_edges > 0);
+        assert!(actual.stats.skipped_revisits > 0);
+        assert!(calls.load(Ordering::Relaxed) < baseline_calls);
+        Ok(())
+    })
+}
+
+#[test]
 fn serial_limits_and_multiple_visits_match_the_baseline() -> Result<()> {
     let graph = graph()?;
     let calls = Arc::new(AtomicUsize::new(0));

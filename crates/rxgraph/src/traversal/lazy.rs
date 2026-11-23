@@ -74,6 +74,9 @@ impl<A: TargetBackend> SearchAdapter for LazyAdapter<'_, A> {
     fn dense_node_count(&self) -> Option<usize> {
         self.inner.dense_node_count()
     }
+    fn prefetches_outgoing(&self) -> bool {
+        self.inner.prefetches_outgoing()
+    }
     fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
         self.inner.prefetch_outgoing(nodes)
     }
@@ -91,10 +94,6 @@ impl<A: TargetBackend> SearchAdapter for LazyAdapter<'_, A> {
     }
     fn can_release_expanded_states(&self) -> bool {
         self.release_expanded
-    }
-    fn release_expanded_state(&self, state: &mut Self::State) {
-        state.path = None;
-        state.targets = None;
     }
     fn eval_edge(
         &self,
@@ -227,7 +226,7 @@ pub(crate) fn materialize_graph_lazy<'g, S: Clone>(
     history: bool,
 ) -> Result<GraphPath<'g, S>> {
     let state = arena[path]
-        .state
+        .state()
         .final_state
         .as_ref()
         .expect("completed path has exact state")
@@ -235,7 +234,7 @@ pub(crate) fn materialize_graph_lazy<'g, S: Clone>(
     let intermediate_states = if history {
         Some(
             arena[path]
-                .state
+                .state()
                 .history
                 .as_ref()
                 .expect("history was retained")

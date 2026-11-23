@@ -435,6 +435,9 @@ impl<A: TargetBackend> SearchAdapter for TargetAdapter<'_, A> {
     fn dense_node_count(&self) -> Option<usize> {
         self.inner.dense_node_count()
     }
+    fn prefetches_outgoing(&self) -> bool {
+        self.inner.prefetches_outgoing()
+    }
     fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
         self.inner.prefetch_outgoing(nodes)
     }
@@ -452,10 +455,6 @@ impl<A: TargetBackend> SearchAdapter for TargetAdapter<'_, A> {
     }
     fn can_release_expanded_states(&self) -> bool {
         self.release
-    }
-    fn release_expanded_state(&self, state: &mut Self::State) {
-        state.state = None;
-        state.targets = None;
     }
     fn eval_edge(
         &self,

@@ -336,6 +336,40 @@ fn check_parallel_searches(graph: Arc<Graph>) -> Result<()> {
     Ok(())
 }
 
+fn check_eager_parallel_traversal(graph: Arc<Graph>) -> Result<()> {
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    pool.install(|| {
+        let kernel = boxed_typed_run(Kernel::new(true));
+        let cache = TypedPayloadCache::default();
+        let serial = RunOptions {
+            start_nodes: vec![100_u64.into(); 1024],
+            intermediate_states: true,
+            ..run()
+        };
+        let baseline = kernel.run_eager_cached(&graph, &cache, serial.clone())?;
+        let parallel = RunOptions {
+            parallel: true,
+            ..serial
+        };
+        let completed = kernel.run_eager_cached(&graph, &cache, parallel.clone())?;
+        assert!(completed.stats.parallel_edges > 0);
+        let mut stream = kernel.stream_eager_cached(graph, &cache, parallel)?;
+        let mut streamed = Vec::new();
+        while let Some(batch) = stream.next_batch(1024)? {
+            streamed.extend(batch.paths);
+        }
+        assert!(stream.stats().parallel_edges > 0);
+        let expected = snapshot(&baseline.paths);
+        assert_eq!(snapshot(&completed.paths), expected);
+        assert_eq!(snapshot(&streamed), expected);
+        assert_eq!(
+            format!("{:?}", completed.paths[0].intermediate_states),
+            format!("{:?}", baseline.paths[0].intermediate_states)
+        );
+        Ok(())
+    })
+}
+
 fn write_parquet(path: &Path, batch: &RecordBatch) -> Result<()> {
     let mut writer = ArrowWriter::try_new(File::create(path)?, batch.schema(), None)?;
     writer.write(batch)?;
@@ -349,7 +383,8 @@ fn registered_typed_kernel_reuses_index_for_eager_and_file_backed_searches() -> 
     let concurrent = Arc::new(Graph::new(nodes.clone(), edges.clone())?);
     check_parallel_searches(concurrent)?;
     let eager = Arc::new(Graph::new(nodes.clone(), edges.clone())?);
-    check_graph(eager, None)?;
+    check_graph(Arc::clone(&eager), None)?;
+    check_eager_parallel_traversal(eager)?;
     let id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
     let dir = std::env::temp_dir();
     let paths = ParquetPaths {

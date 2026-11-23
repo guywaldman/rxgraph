@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    hash::Hash,
+    hash::{BuildHasherDefault, Hash, Hasher},
     marker::PhantomData,
     sync::{
         Arc, Mutex,
@@ -11,6 +11,7 @@ use std::{
     },
 };
 
+use ahash::RandomState;
 use anyhow::{Result, anyhow, bail};
 
 use crate::{
@@ -48,23 +49,35 @@ pub trait MemoizableKernel: Kernel {
     }
 }
 
-/// A bounded cache around a deterministic kernel. The cache is shared across
-/// workers, so a cache hit takes a lock. It is scoped to this wrapper's lifetime.
+/// A bounded cache around a deterministic kernel. Cache shards are shared
+/// across workers and scoped to this wrapper's lifetime.
 pub struct MemoizedKernel<K: MemoizableKernel> {
     kernel: K,
     capacity: usize,
-    entries: Mutex<Entries<K::Key, K::State>>,
+    hash_builder: RandomState,
+    shards: Vec<MemoShard<K::Key, K::State>>,
+}
+
+struct MemoShard<K, S> {
+    capacity: usize,
+    entries: Mutex<Entries<K, S>>,
 }
 
 impl<K: MemoizableKernel> MemoizedKernel<K> {
     fn new(kernel: K, capacity: usize) -> Self {
+        // Keep small caches in fewer shards so they can hold a useful hot set.
+        let count = (capacity / 64).clamp(1, 32).next_power_of_two();
+        let shards = (0..count)
+            .map(|i| MemoShard {
+                capacity: capacity / count + usize::from(i < capacity % count),
+                entries: Mutex::new(Entries::new()),
+            })
+            .collect();
         Self {
             kernel,
             capacity,
-            entries: Mutex::new(Entries {
-                values: HashMap::new(),
-                order: VecDeque::new(),
-            }),
+            hash_builder: RandomState::new(),
+            shards,
         }
     }
 }
@@ -83,9 +96,15 @@ impl<K: MemoizableKernel> Kernel for MemoizedKernel<K> {
         if self.capacity == 0 {
             return self.kernel.transition(cx);
         }
-        let key = (cx.edge(), self.kernel.state_key(cx.state()));
+        let key = MemoKey::new(
+            cx.edge(),
+            self.kernel.state_key(cx.state()),
+            &self.hash_builder,
+        );
+        // Leave the high and low bits available to the hash table's own probes.
+        let shard = &self.shards[((key.hash >> 32) as usize) & (self.shards.len() - 1)];
         {
-            let entries = self
+            let entries = shard
                 .entries
                 .lock()
                 .map_err(|_| anyhow!("memo cache poisoned"))?;
@@ -103,13 +122,13 @@ impl<K: MemoizableKernel> Kernel for MemoizedKernel<K> {
             crate::Transition::Continue(state) => Some((state.clone(), false)),
             crate::Transition::Complete(state) => Some((state.clone(), true)),
         };
-        let mut entries = self
+        let mut entries = shard
             .entries
             .lock()
             .map_err(|_| anyhow!("memo cache poisoned"))?;
         // Another worker may have computed this key while the lock was released.
         if !entries.values.contains_key(&key) {
-            if entries.order.len() == self.capacity {
+            if entries.order.len() == shard.capacity {
                 let oldest = entries.order.pop_front().expect("full cache has entries");
                 entries.values.remove(&oldest);
             }
@@ -184,14 +203,65 @@ impl Budget {
     }
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct MemoKey<K> {
+    hash: u64,
+    edge: EdgeId,
+    state: K,
+}
+
+impl<K: Hash> MemoKey<K> {
+    fn new(edge: EdgeId, state: K, hash_builder: &RandomState) -> Self {
+        Self {
+            hash: hash_builder.hash_one((edge, &state)),
+            edge,
+            state,
+        }
+    }
+}
+
+impl<K> Hash for MemoKey<K> {
+    fn hash<H: Hasher>(&self, hasher: &mut H) {
+        hasher.write_u64(self.hash);
+    }
+}
+
+/// Keys already carry a randomized hash, shared by lookup, insertion and eviction.
+#[derive(Default)]
+struct Prehashed(u64);
+
+impl Hasher for Prehashed {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, _: &[u8]) {
+        unreachable!("memo key must write exactly one u64");
+    }
+
+    fn write_u64(&mut self, hash: u64) {
+        self.0 = hash;
+    }
+}
+
 struct Entries<K, S> {
-    values: HashMap<(EdgeId, K), Option<(S, bool)>>,
-    order: VecDeque<(EdgeId, K)>,
+    values: HashMap<MemoKey<K>, Option<(S, bool)>, BuildHasherDefault<Prehashed>>,
+    order: VecDeque<MemoKey<K>>,
+}
+
+impl<K, S> Entries<K, S> {
+    fn new() -> Self {
+        Self {
+            values: HashMap::default(),
+            order: VecDeque::new(),
+        }
+    }
 }
 
 pub(crate) struct MemoCache<C, K, S> {
     inner: C,
     entries: RefCell<Entries<K, S>>,
+    hash_builder: RandomState,
     budget: Arc<Budget>,
 }
 
@@ -220,6 +290,9 @@ where
     fn dense_node_count(&self) -> Option<usize> {
         self.inner.dense_node_count()
     }
+    fn prefetches_outgoing(&self) -> bool {
+        self.inner.prefetches_outgoing()
+    }
     fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
         self.inner.prefetch_outgoing(nodes)
     }
@@ -235,18 +308,13 @@ where
     fn make_cache(&self) -> Self::Cache {
         MemoCache {
             inner: self.inner.make_cache(),
-            entries: RefCell::new(Entries {
-                values: HashMap::new(),
-                order: VecDeque::new(),
-            }),
+            entries: RefCell::new(Entries::new()),
+            hash_builder: RandomState::new(),
             budget: Arc::clone(&self.budget),
         }
     }
     fn can_release_expanded_states(&self) -> bool {
         self.release_expanded
-    }
-    fn release_expanded_state(&self, state: &mut Self::State) {
-        *state = None;
     }
     fn eval_edge(
         &self,
@@ -263,7 +331,7 @@ where
                 .eval_edge(src, edge, dest, state, &cache.inner)
                 .map(|result| result.map(|(state, stop)| (Some(state), stop)));
         }
-        let key = (edge, self.kernel.state_key(state));
+        let key = MemoKey::new(edge, self.kernel.state_key(state), &cache.hash_builder);
         if let Some(result) = cache.entries.borrow().values.get(&key) {
             return Ok(result.clone().map(|(state, stop)| (Some(state), stop)));
         }

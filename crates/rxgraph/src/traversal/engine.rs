@@ -32,6 +32,9 @@ pub(crate) trait SearchAdapter {
     fn dense_node_count(&self) -> Option<usize> {
         None
     }
+    fn prefetches_outgoing(&self) -> bool {
+        false
+    }
     fn prefetch_outgoing(&self, _nodes: &[NodeId]) -> Result<()> {
         Ok(())
     }
@@ -41,10 +44,8 @@ pub(crate) trait SearchAdapter {
         F: FnMut(EdgeId, NodeId) -> Result<bool>;
     fn make_cache(&self) -> Self::Cache;
     fn can_release_expanded_states(&self) -> bool {
-        false
+        true
     }
-    /// Called after BFS finishes expanding a path whose history is not needed.
-    fn release_expanded_state(&self, _state: &mut Self::State) {}
     fn eval_edge(
         &self,
         src: NodeId,
@@ -67,8 +68,16 @@ pub(crate) struct PathEntry<S> {
     pub(crate) incoming_edge: Option<EdgeId>,
     pub(crate) parent: Option<usize>,
     pub(crate) depth: usize,
-    pub(crate) state: S,
+    state: Option<S>,
     visits: VisitFingerprint,
+}
+
+impl<S> PathEntry<S> {
+    pub(crate) fn state(&self) -> &S {
+        self.state
+            .as_ref()
+            .expect("active path or requested history")
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,7 +126,7 @@ pub(crate) struct RunConfig {
     strategy: TraversalStrategy,
     max_visits_per_node: usize,
     pub(super) intermediate_states: bool,
-    parallel: bool,
+    pub(super) parallel: bool,
     progress: bool,
 }
 
@@ -142,34 +151,10 @@ struct DfsFrame {
     edge_count: usize,
 }
 
-trait ActiveVisits {
-    fn count(&self, node: NodeId) -> usize;
-    fn increment(&mut self, node: NodeId);
-    fn decrement(&mut self, node: NodeId);
-}
-
-struct DenseVisits(Vec<usize>);
-
-impl ActiveVisits for DenseVisits {
-    #[inline]
-    fn count(&self, node: NodeId) -> usize {
-        self.0[node as usize]
-    }
-
-    #[inline]
-    fn increment(&mut self, node: NodeId) {
-        self.0[node as usize] += 1;
-    }
-
-    #[inline]
-    fn decrement(&mut self, node: NodeId) {
-        self.0[node as usize] -= 1;
-    }
-}
-
+#[derive(Default)]
 struct SparseVisits(VisitCounts);
 
-impl ActiveVisits for SparseVisits {
+impl SparseVisits {
     #[inline]
     fn count(&self, node: NodeId) -> usize {
         self.0.get(&node).copied().unwrap_or(0)
@@ -250,7 +235,7 @@ where
             incoming_edge: None,
             parent: None,
             depth: 0,
-            state: adapter.initial_state(node)?,
+            state: Some(adapter.initial_state(node)?),
             visits: VisitFingerprint::for_node(node),
         });
         stats.start_nodes += 1;
@@ -280,7 +265,7 @@ where
 
     stats.evaluated_edges += 1;
     let src = arena[parent].node;
-    let Some((state, stop)) = adapter.eval_edge(src, edge, dest, &arena[parent].state, cache)?
+    let Some((state, stop)) = adapter.eval_edge(src, edge, dest, arena[parent].state(), cache)?
     else {
         stats.rejected_edges += 1;
         return Ok(None);
@@ -294,19 +279,17 @@ where
     }))
 }
 
-fn push_entry<S>(arena: &mut Vec<PathEntry<S>>, parent: usize, edge: EdgeEval<S>) -> usize {
-    let child = arena.len();
+fn child_entry<S>(arena: &[PathEntry<S>], parent: usize, edge: EdgeEval<S>) -> PathEntry<S> {
     let mut visits = arena[parent].visits;
     visits.insert(edge.dest);
-    arena.push(PathEntry {
+    PathEntry {
         node: edge.dest,
         incoming_edge: Some(edge.edge),
         parent: Some(parent),
         depth: arena[parent].depth + 1,
-        state: edge.state,
+        state: Some(edge.state),
         visits,
-    });
-    child
+    }
 }
 
 fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
@@ -340,19 +323,27 @@ fn can_visit_arena<S>(
 }
 
 fn merge_stats(into: &mut SearchStats, from: SearchStats) {
-    into.start_nodes += from.start_nodes;
-    into.path_entries += from.path_entries;
-    into.evaluated_edges += from.evaluated_edges;
-    into.parallel_edges += from.parallel_edges;
-    into.accepted_edges += from.accepted_edges;
-    into.rejected_edges += from.rejected_edges;
-    into.skipped_revisits += from.skipped_revisits;
-    into.stopped_paths += from.stopped_paths;
+    merge_stats_since(into, from, SearchStats::default());
+}
+
+fn merge_stats_since(into: &mut SearchStats, from: SearchStats, before: SearchStats) {
+    into.start_nodes += from.start_nodes - before.start_nodes;
+    into.path_entries += from.path_entries - before.path_entries;
+    into.evaluated_edges += from.evaluated_edges - before.evaluated_edges;
+    into.parallel_edges += from.parallel_edges - before.parallel_edges;
+    into.accepted_edges += from.accepted_edges - before.accepted_edges;
+    into.rejected_edges += from.rejected_edges - before.rejected_edges;
+    into.skipped_revisits += from.skipped_revisits - before.skipped_revisits;
+    into.stopped_paths += from.stopped_paths - before.stopped_paths;
     into.max_depth = into.max_depth.max(from.max_depth);
-    into.materialized_node_payloads += from.materialized_node_payloads;
-    into.materialized_edge_payloads += from.materialized_edge_payloads;
-    into.lazy_payload_read_calls += from.lazy_payload_read_calls;
-    into.lazy_payload_requested_rows += from.lazy_payload_requested_rows;
-    into.lazy_payload_selected_rows += from.lazy_payload_selected_rows;
-    into.lazy_payload_row_groups += from.lazy_payload_row_groups;
+    into.materialized_node_payloads +=
+        from.materialized_node_payloads - before.materialized_node_payloads;
+    into.materialized_edge_payloads +=
+        from.materialized_edge_payloads - before.materialized_edge_payloads;
+    into.lazy_payload_read_calls += from.lazy_payload_read_calls - before.lazy_payload_read_calls;
+    into.lazy_payload_requested_rows +=
+        from.lazy_payload_requested_rows - before.lazy_payload_requested_rows;
+    into.lazy_payload_selected_rows +=
+        from.lazy_payload_selected_rows - before.lazy_payload_selected_rows;
+    into.lazy_payload_row_groups += from.lazy_payload_row_groups - before.lazy_payload_row_groups;
 }
