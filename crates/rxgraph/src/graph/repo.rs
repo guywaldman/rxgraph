@@ -400,9 +400,9 @@ impl Repo {
             check(src)?;
             let start = self.csr_offsets[src] as usize;
             let end = self.csr_offsets[src + 1] as usize;
-            for index in start..end {
-                check(index + 1)?;
-                let dest = self.csr_dests[index] as usize;
+            for (offset, &dest) in self.csr_dests[start..end].iter().enumerate() {
+                check(start + offset + 1)?;
+                let dest = dest as usize;
                 let pos = cursor[dest] as usize;
                 srcs[pos] = src as NodeId;
                 cursor[dest] += 1;
