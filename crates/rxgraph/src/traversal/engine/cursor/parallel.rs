@@ -105,6 +105,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
             Ok(Self::ParallelBfs(ParallelBfs {
                 cursor: Cursor::new(run)?,
                 pending: VecDeque::new(),
+                expanded: Vec::new(),
                 caches: Vec::new(),
             }))
         } else {
@@ -130,6 +131,7 @@ impl<S: Clone, C> GraphCursor<S, C> {
             Self::ParallelBfs(c) => {
                 c.cursor.close();
                 c.pending = VecDeque::new();
+                c.expanded = Vec::new();
                 c.caches = Vec::new();
             }
         }
@@ -163,6 +165,9 @@ impl<S: Clone, C> GraphCursor<S, C> {
 pub(crate) struct ParallelBfs<S, C> {
     cursor: Cursor<S, C>,
     pending: VecDeque<(usize, EdgeEval<S>)>,
+    /// Evaluated parents retain their frontier references until the pending
+    /// transitions are materialized or linked into the next frontier.
+    expanded: Vec<usize>,
     caches: Vec<C>,
 }
 impl<S: Clone, C> ParallelBfs<S, C> {
@@ -199,10 +204,15 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             }
             while let Some((parent, edge)) = self.pending.pop_front() {
                 deadline.check_every(self.pending.len())?;
-                if let Some(child) = c.accept(adapter, parent, edge, &mut paths)? {
+                if let Some(child) = c.accept::<_, true>(adapter, parent, edge, &mut paths)? {
                     c.frontier.push_back(child);
                 } else if paths.len() >= size {
                     break;
+                }
+            }
+            if self.pending.is_empty() {
+                for parent in self.expanded.drain(..) {
+                    c.bfs_slots.release(&mut c.arena, parent);
                 }
             }
             if !paths.is_empty() {
@@ -241,23 +251,24 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             c.bfs_prefetched = 0;
             let mut jobs = Vec::new();
             let frontier_count = c.frontier.len();
-            let nodes = c
-                .frontier
-                .iter()
-                .take(WORK_QUANTUM)
-                .take_while(|&&p| c.arena[p].depth == depth)
-                .map(|&p| c.arena[p].node)
-                .collect::<Vec<_>>();
-            adapter.prefetch_outgoing(&nodes)?;
+            if adapter.prefetches_outgoing() {
+                let nodes = c
+                    .frontier
+                    .iter()
+                    .take(WORK_QUANTUM)
+                    .take_while(|&&p| c.arena[p].depth == depth)
+                    .map(|&p| c.arena[p].node)
+                    .collect::<Vec<_>>();
+                adapter.prefetch_outgoing(&nodes)?;
+            }
             let mut edge_total = 0;
-            let mut expanded = Vec::new();
             let release_states =
                 !c.cfg.intermediate_states && adapter.can_release_expanded_states();
             let mut job_size = WORK_QUANTUM.div_ceil(rayon::current_num_threads());
             if TIMED {
                 job_size = job_size.min(Deadline::POLL_INTERVAL);
             }
-            while edge_total < WORK_QUANTUM {
+            while edge_total < WORK_QUANTUM && self.expanded.len() < WORK_QUANTUM {
                 let Some(&parent) = c.frontier.front() else {
                     break;
                 };
@@ -273,11 +284,9 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                     }
                 };
                 if c.bfs_edge == count {
-                    deadline.check_every(c.frontier.len())?;
+                    deadline.check_every(self.expanded.len())?;
                     c.frontier.pop_front();
-                    if release_states {
-                        expanded.push(parent);
-                    }
+                    self.expanded.push(parent);
                     c.bfs_edge = 0;
                     c.bfs_count = None;
                     continue;
@@ -343,8 +352,8 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 merge_stats(&mut c.stats, stats);
             }
             if release_states {
-                for parent in expanded {
-                    adapter.release_expanded_state(&mut c.arena[parent].state);
+                for &parent in &self.expanded {
+                    c.arena[parent].state = None;
                 }
             }
             if let Some(progress) = &mut c.progress {
@@ -360,5 +369,157 @@ impl<S: Clone, C> ParallelBfs<S, C> {
         } else {
             Ok(Some(paths))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEPTH: NodeId = 48;
+    const FANOUT: usize = MIN_PAR_FRONTIER;
+
+    // One continuing branch and one wide dead-end layer per depth.
+    struct Branches {
+        loops: bool,
+    }
+
+    impl SearchAdapter for Branches {
+        type State = usize;
+        type Path = Vec<(NodeId, usize)>;
+        type Cache = ();
+
+        fn resolve_node(&self, _: GraphId<'_>) -> Result<Option<NodeId>> {
+            Ok(Some(0))
+        }
+        fn initial_state(&self, _: NodeId) -> Result<usize> {
+            Ok(0)
+        }
+        fn out_degree(&self, node: NodeId) -> Result<usize> {
+            Ok(if node >= DEPTH {
+                0
+            } else if self.loops {
+                1 + usize::from(matches!(node, 8 | 30))
+            } else {
+                FANOUT + 1
+            })
+        }
+        fn for_each_range<F>(
+            &self,
+            node: NodeId,
+            start: usize,
+            end: usize,
+            mut visit: F,
+        ) -> Result<()>
+        where
+            F: FnMut(EdgeId, NodeId) -> Result<bool>,
+        {
+            for index in start..end {
+                let dest = if index == 0 {
+                    node + 1
+                } else if self.loops {
+                    node
+                } else {
+                    DEPTH + index as NodeId
+                };
+                let edge = node * (FANOUT + 1) as EdgeId + index as EdgeId;
+                if !visit(edge, dest)? {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        fn make_cache(&self) {}
+        fn eval_edge(
+            &self,
+            _: NodeId,
+            _: EdgeId,
+            dest: NodeId,
+            state: &usize,
+            _: &(),
+        ) -> Result<Option<(usize, bool)>> {
+            Ok(Some((state + 1, dest == DEPTH)))
+        }
+        fn materialize(
+            &self,
+            arena: &[PathEntry<usize>],
+            mut path: usize,
+            history: bool,
+        ) -> Result<Self::Path> {
+            assert!(history);
+            let mut result = Vec::new();
+            loop {
+                let entry = &arena[path];
+                result.push((entry.node, *entry.state()));
+                let Some(parent) = entry.parent else { break };
+                path = parent;
+            }
+            result.reverse();
+            Ok(result)
+        }
+    }
+
+    #[test]
+    fn bfs_reuses_slots_for_finished_branches() -> Result<()> {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+        pool.install(|| {
+            for parallel in [false, true] {
+                let run = RunOptions {
+                    start_nodes: vec![0.into()],
+                    strategy: TraversalStrategy::BreadthFirst,
+                    parallel,
+                    intermediate_states: true,
+                    ..Default::default()
+                };
+                let mut cursor = GraphCursor::new(run.into())?;
+                let paths = cursor
+                    .next_batch(&Branches { loops: false }, 1)?
+                    .expect("spine reaches target");
+                let expected = (0..=DEPTH)
+                    .map(|node| (node, node as usize))
+                    .collect::<Vec<_>>();
+                assert_eq!(paths, vec![expected]);
+                let cursor = match &cursor {
+                    GraphCursor::Serial(cursor) => cursor,
+                    GraphCursor::ParallelBfs(bfs) => &bfs.cursor,
+                    GraphCursor::ParallelDfs(_) => unreachable!(),
+                };
+                if parallel {
+                    assert!(cursor.stats.parallel_edges > 0);
+                }
+                assert!(cursor.stats.path_entries > FANOUT * (DEPTH as usize - 1));
+                assert!(cursor.arena.len() <= 2 * FANOUT + DEPTH as usize + 1);
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn dfs_tracks_repeated_nodes_across_the_scan_threshold() -> Result<()> {
+        let run = RunOptions {
+            start_nodes: vec![0.into()],
+            max_visits_per_node: 2,
+            strategy: TraversalStrategy::DepthFirst,
+            parallel: false,
+            intermediate_states: true,
+            ..Default::default()
+        };
+        let mut cursor = GraphCursor::new(run.into())?;
+        let adapter = Branches { loops: true };
+        for (shallow_loop, deep_loop) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let mut expected = Vec::new();
+            for node in 0..=DEPTH {
+                expected.push((node, expected.len()));
+                if (shallow_loop && node == 8) || (deep_loop && node == 30) {
+                    expected.push((node, expected.len()));
+                }
+            }
+            assert_eq!(cursor.next_batch(&adapter, 1)?, Some(vec![expected]));
+        }
+        assert!(cursor.next_batch(&adapter, 1)?.is_none());
+        assert_eq!(cursor.stats().skipped_revisits, 3);
+        Ok(())
     }
 }

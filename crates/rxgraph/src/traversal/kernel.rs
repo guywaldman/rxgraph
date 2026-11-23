@@ -162,33 +162,28 @@ impl PayloadCache {
         }
     }
 
-    /// Returns a reader for node column `col`, binding and caching on first use.
-    fn node_reader(&self, batch: &RecordBatch, col: &str) -> Result<ColumnReader> {
-        Self::reader(&self.node, batch, col)
+    fn node_value(&self, batch: &RecordBatch, col: &str, row: usize) -> Result<Value> {
+        Self::value(&self.node, batch, col, row)
     }
 
-    /// Returns a reader for edge column `col`, binding and caching on first use.
-    fn edge_reader(&self, batch: &RecordBatch, col: &str) -> Result<ColumnReader> {
-        Self::reader(&self.edge, batch, col)
+    fn edge_value(&self, batch: &RecordBatch, col: &str, row: usize) -> Result<Value> {
+        Self::value(&self.edge, batch, col, row)
     }
 
-    /// Looks up `col` in `map`, binding and inserting it if absent.
-    ///
-    /// Borrow scopes are kept disjoint: an immutable borrow checks for a hit, a
-    /// mutable borrow inserts a miss, and the returned clone is produced after
-    /// every borrow has been dropped, so no borrow is ever held across a call
-    /// that could re-enter the cache.
-    fn reader(
+    /// Read through the cached reader in place so a hit avoids cloning Arrow arrays.
+    fn value(
         map: &RefCell<HashMap<String, ColumnReader>>,
         batch: &RecordBatch,
         col: &str,
-    ) -> Result<ColumnReader> {
+        row: usize,
+    ) -> Result<Value> {
         if let Some(reader) = map.borrow().get(col) {
-            return Ok(reader.clone());
+            return reader.value(row);
         }
         let reader = ColumnReader::bind(batch, col)?;
-        map.borrow_mut().insert(col.to_string(), reader.clone());
-        Ok(reader)
+        let result = reader.value(row);
+        map.borrow_mut().insert(col.to_string(), reader);
+        result
     }
 }
 
@@ -343,22 +338,19 @@ impl<'a, S> EdgeCtx<'a, S> {
     /// Reads node payload column `col` for the source node.
     pub fn src_value(&self, col: &str) -> Result<Value> {
         self.cache
-            .node_reader(self.graph.repo.node_batch(), col)?
-            .value(self.src as usize)
+            .node_value(self.graph.repo.node_batch(), col, self.src as usize)
     }
 
     /// Reads node payload column `col` for the destination node.
     pub fn dest_value(&self, col: &str) -> Result<Value> {
         self.cache
-            .node_reader(self.graph.repo.node_batch(), col)?
-            .value(self.dest as usize)
+            .node_value(self.graph.repo.node_batch(), col, self.dest as usize)
     }
 
     /// Reads edge payload column `col` for the current edge.
     pub fn edge_value(&self, col: &str) -> Result<Value> {
         self.cache
-            .edge_reader(self.graph.repo.edge_batch(), col)?
-            .value(self.edge as usize)
+            .edge_value(self.graph.repo.edge_batch(), col, self.edge as usize)
     }
 
     /// Source node payload `col` as `u64`.

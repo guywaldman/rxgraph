@@ -289,7 +289,7 @@ pub(crate) fn materialize_path<'g, S, O>(
 ) -> Result<GraphPath<'g, O>> {
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
-    let state = project(&arena[path].state)?;
+    let state = project(arena[path].state())?;
     let mut states = intermediate_states.then(|| Vec::with_capacity(nodes.capacity()));
 
     loop {
@@ -308,7 +308,7 @@ pub(crate) fn materialize_path<'g, S, O>(
             );
         }
         if let Some(states) = &mut states {
-            states.push(project(&arena[path].state)?);
+            states.push(project(arena[path].state())?);
         }
         match arena[path].parent {
             Some(parent) => path = parent,

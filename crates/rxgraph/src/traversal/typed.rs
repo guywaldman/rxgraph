@@ -994,7 +994,7 @@ fn materialize_owned_lazy<G: native::GraphStore, S: serde::Serialize>(
     mut path: usize,
     intermediate_states: bool,
 ) -> Result<OwnedGraphPath> {
-    let completed = &arena[path].state;
+    let completed = arena[path].state();
     let state = super::registry::encode_state(
         completed
             .final_state
@@ -1056,7 +1056,7 @@ fn materialize_owned_projected<G: native::GraphStore, S: serde::Serialize, T>(
     intermediate_states: bool,
     project: impl Fn(&T) -> &S,
 ) -> Result<OwnedGraphPath> {
-    let state = super::registry::encode_state(project(&arena[path].state))?;
+    let state = super::registry::encode_state(project(arena[path].state()))?;
     let mut nodes = Vec::with_capacity(arena[path].depth + 1);
     let mut edges = Vec::with_capacity(arena[path].depth);
     let mut history = intermediate_states.then(|| Vec::with_capacity(arena[path].depth + 1));
@@ -1080,7 +1080,7 @@ fn materialize_owned_projected<G: native::GraphStore, S: serde::Serialize, T>(
             );
         }
         if let Some(history) = &mut history {
-            history.push(super::registry::encode_state(project(&entry.state))?);
+            history.push(super::registry::encode_state(project(entry.state()))?);
         }
         match entry.parent {
             Some(parent) => path = parent,
@@ -1574,7 +1574,7 @@ struct ParquetGraphStore<'a, N, E> {
     edge_fields: Vec<PayloadField>,
     nodes: Vec<OnceLock<Result<N, String>>>,
     edges: Vec<OnceLock<Result<E, String>>>,
-    outgoing: Vec<OnceLock<Vec<native::OutgoingEdge>>>,
+    outgoing: native::OutgoingRows,
 }
 
 impl<'a, N, E> ParquetGraphStore<'a, N, E> {
@@ -1596,7 +1596,7 @@ impl<'a, N, E> ParquetGraphStore<'a, N, E> {
         Ok(Self {
             nodes: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
             edges: (0..graph.edge_count()).map(|_| OnceLock::new()).collect(),
-            outgoing: (0..graph.node_count()).map(|_| OnceLock::new()).collect(),
+            outgoing: native::OutgoingRows::default(),
             graph,
             loaded_nodes: AtomicUsize::new(0),
             loaded_edges: AtomicUsize::new(0),
@@ -1716,36 +1716,26 @@ where
     }
 
     fn outgoing(&self, src: NodeId) -> Result<&[native::OutgoingEdge]> {
-        let slot = self
-            .outgoing
-            .get(src as usize)
-            .with_context(|| format!("node row {src} is out of range"))?;
-        Ok(slot
-            .get_or_init(|| {
-                let (edges, dests) = self.graph.repo.outgoing_slice(src);
-                edges
-                    .iter()
-                    .zip(dests)
-                    .map(|(&edge, &dest)| native::OutgoingEdge { edge, dest })
-                    .collect()
-            })
-            .as_slice())
+        self.outgoing.get(&self.graph, src)
+    }
+
+    fn outgoing_columns(&self, src: NodeId) -> Option<(&[EdgeId], &[NodeId])> {
+        ((src as usize) < self.graph.node_count()).then(|| self.graph.repo.outgoing_slice(src))
     }
 
     fn prefetch_outgoing(&self, nodes: &[NodeId]) -> Result<()> {
         let mut node_rows = Vec::new();
         let mut edge_rows = Vec::new();
         for &node in nodes {
+            let (edges, dests) = self
+                .outgoing_columns(node)
+                .with_context(|| format!("node row {node} is out of range"))?;
             if !self.node_fields.is_empty() {
                 node_rows.push(node as usize);
+                node_rows.extend(dests.iter().map(|&dest| dest as usize));
             }
-            for &native::OutgoingEdge { edge, dest } in self.outgoing(node)? {
-                if !self.edge_fields.is_empty() {
-                    edge_rows.push(edge as usize);
-                }
-                if !self.node_fields.is_empty() {
-                    node_rows.push(dest as usize);
-                }
+            if !self.edge_fields.is_empty() {
+                edge_rows.extend(edges.iter().map(|&edge| edge as usize));
             }
         }
         self.fill_nodes(node_rows)?;

@@ -248,8 +248,12 @@ serially, as they do with `search`. DSL streaming is deferred. Custom native
 runners must implement the optional streaming capability; standard plugin wrappers
 provide it automatically when rebuilt against this version.
 
-Streaming bounds retained output, not BFS frontier size or payload-cache memory.
-A graph's payload tables cannot be replaced while a stream retains them.
+For a stream, the traversal retains the active DFS stack or the BFS frontier
+and its shared path prefixes. Standard BFS releases expanded states when
+`intermediate_states` is off. Graph storage, typed payload caches, reverse
+indexes, and optional transition memo entries have separate memory costs.
+Consume batches as they arrive to bound retained results. A graph's payload
+tables cannot be replaced while a stream retains them.
 `batch_size=1` favors latency; the default is 1024 to amortize Python overhead.
 Performance results and the explicit acceptance gates are documented in
 [`benches/NATIVE_PERFORMANCE.md`](benches/NATIVE_PERFORMANCE.md).
@@ -280,7 +284,7 @@ result = graph.search(
         # Try it when paths revisit the same edges with equivalent states and
         # transitions are expensive enough to offset cache overhead.
         # Start with 4096 entries, then tune using latency and peak memory;
-        # entries include cached states, and older entries are evicted first.
+        # entries include cached states, and each cache shard evicts its oldest entry first.
         "memo_capacity": 0,
     },
 )

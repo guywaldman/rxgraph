@@ -2,49 +2,62 @@
 use super::*;
 
 const WORK_QUANTUM: usize = 8192;
+const DFS_SCAN_DEPTH: usize = 24;
 
 pub(crate) struct Cursor<S, C> {
     cfg: RunConfig,
     arena: Vec<PathEntry<S>>,
     frames: Vec<DfsFrame>,
     frontier: VecDeque<usize>,
+    bfs_slots: BfsSlots,
     bfs_edge: usize,
     bfs_count: Option<usize>,
     bfs_prefetched: usize,
     progress: Option<Progress>,
     next_start: usize,
-    visits: Visits,
+    visits: Option<SparseVisits>,
     cache: Option<C>,
     initialized: bool,
     done: bool,
     pub(crate) stats: SearchStats,
 }
 
-enum Visits {
-    Bits(Vec<u64>),
-    Dense(DenseVisits),
-    Sparse(SparseVisits),
+/// The frontier and each child entry hold one reference to a path slot.
+/// Released slots form a freelist through their former parent links.
+#[derive(Default)]
+struct BfsSlots {
+    owners: Vec<usize>,
+    free: Option<usize>,
 }
-impl ActiveVisits for Visits {
-    fn count(&self, n: NodeId) -> usize {
-        match self {
-            Self::Bits(v) => usize::from(v[n as usize / 64] & (1 << (n % 64)) != 0),
-            Self::Dense(v) => v.count(n),
-            Self::Sparse(v) => v.count(n),
+
+impl BfsSlots {
+    fn insert<S>(&mut self, arena: &mut Vec<PathEntry<S>>, entry: PathEntry<S>) -> usize {
+        let parent = entry.parent.expect("BFS continuation has a parent");
+        self.owners[parent] += 1;
+        if let Some(slot) = self.free {
+            self.free = arena[slot].parent;
+            arena[slot] = entry;
+            self.owners[slot] = 1;
+            slot
+        } else {
+            let slot = arena.len();
+            arena.push(entry);
+            self.owners.push(1);
+            slot
         }
     }
-    fn increment(&mut self, n: NodeId) {
-        match self {
-            Self::Bits(v) => v[n as usize / 64] |= 1 << (n % 64),
-            Self::Dense(v) => v.increment(n),
-            Self::Sparse(v) => v.increment(n),
-        }
-    }
-    fn decrement(&mut self, n: NodeId) {
-        match self {
-            Self::Bits(v) => v[n as usize / 64] &= !(1 << (n % 64)),
-            Self::Dense(v) => v.decrement(n),
-            Self::Sparse(v) => v.decrement(n),
+
+    fn release<S>(&mut self, arena: &mut [PathEntry<S>], mut path: usize) {
+        loop {
+            self.owners[path] -= 1;
+            if self.owners[path] != 0 {
+                break;
+            }
+            arena[path].state = None;
+            let parent = std::mem::replace(&mut arena[path].parent, self.free);
+            self.free = Some(path);
+            let Some(parent) = parent else { break };
+            path = parent;
         }
     }
 }
@@ -60,12 +73,13 @@ impl<S: Clone, C> Cursor<S, C> {
             arena: Vec::new(),
             frames: Vec::new(),
             frontier: VecDeque::new(),
+            bfs_slots: BfsSlots::default(),
             bfs_edge: 0,
             bfs_count: None,
             bfs_prefetched: 0,
             progress,
             next_start: 0,
-            visits: Visits::Sparse(SparseVisits(HashMap::new())),
+            visits: None,
             cache: None,
             initialized: false,
             done: false,
@@ -80,7 +94,8 @@ impl<S: Clone, C> Cursor<S, C> {
         self.arena = Vec::new();
         self.frames = Vec::new();
         self.frontier = VecDeque::new();
-        self.visits = Visits::Sparse(SparseVisits(HashMap::new()));
+        self.bfs_slots = BfsSlots::default();
+        self.visits = None;
         self.cache = None;
         self.cfg.start_nodes = Vec::new();
     }
@@ -94,16 +109,9 @@ impl<S: Clone, C> Cursor<S, C> {
             self.done = true;
             return Ok(());
         }
-        if matches!(self.cfg.strategy, TraversalStrategy::DepthFirst) {
-            if let Some(n) = adapter.dense_node_count() {
-                self.visits = if self.cfg.max_visits_per_node == 1 {
-                    Visits::Bits(vec![0; n.div_ceil(64)])
-                } else {
-                    Visits::Dense(DenseVisits(vec![0; n]))
-                };
-            }
-        } else {
+        if matches!(self.cfg.strategy, TraversalStrategy::BreadthFirst) {
             let (arena, frontier, stats) = initial_arena(adapter, &self.cfg)?;
+            self.bfs_slots.owners = vec![1; arena.len()];
             self.arena = arena;
             self.frontier = frontier;
             self.stats = stats;
@@ -123,7 +131,7 @@ impl<S: Clone, C> Cursor<S, C> {
             incoming_edge: None,
             parent: None,
             depth: 0,
-            state: adapter.initial_state(node)?,
+            state: Some(adapter.initial_state(node)?),
             visits: VisitFingerprint::for_node(node),
         });
         if self.cfg.max_depth > 0 {
@@ -137,7 +145,6 @@ impl<S: Clone, C> Cursor<S, C> {
                 adapter.out_degree(node)?
             },
         });
-        self.visits.increment(node);
         self.stats.start_nodes += 1;
         self.stats.path_entries += 1;
         Ok(true)
@@ -190,18 +197,27 @@ impl<S: Clone, C> Cursor<S, C> {
             requested.min(max.saturating_sub(self.stats.stopped_paths))
         })
     }
-    fn accept<A: SearchAdapter<State = S, Cache = C>>(
+    fn accept<A: SearchAdapter<State = S, Cache = C>, const BFS: bool>(
         &mut self,
         adapter: &A,
         parent: usize,
         edge: EdgeEval<S>,
         paths: &mut Vec<A::Path>,
     ) -> Result<Option<usize>> {
-        let stop = edge.stop;
-        let child = push_entry(&mut self.arena, parent, edge);
+        let depth = self.arena[parent].depth + 1;
         self.stats.accepted_edges += 1;
         self.stats.path_entries += 1;
-        self.stats.max_depth = self.stats.max_depth.max(self.arena[child].depth);
+        self.stats.max_depth = self.stats.max_depth.max(depth);
+        if !edge.stop && depth >= self.cfg.max_depth {
+            return Ok(None);
+        }
+        let stop = edge.stop;
+        let entry = child_entry(&self.arena, parent, edge);
+        if BFS && !stop {
+            return Ok(Some(self.bfs_slots.insert(&mut self.arena, entry)));
+        }
+        let child = self.arena.len();
+        self.arena.push(entry);
         if stop {
             paths.push(adapter.materialize(&self.arena, child, self.cfg.intermediate_states)?);
             self.stats.stopped_paths += 1;
@@ -233,7 +249,12 @@ impl<S: Clone, C> Cursor<S, C> {
             if frame.next_edge == frame.edge_count {
                 self.frames.pop();
                 let entry = self.arena.pop().expect("active entry");
-                self.visits.decrement(entry.node);
+                if let Some(visits) = &mut self.visits {
+                    visits.decrement(entry.node);
+                    if self.arena.len() <= DFS_SCAN_DEPTH / 2 {
+                        self.visits = None;
+                    }
+                }
                 work += 1;
                 continue;
             }
@@ -244,7 +265,13 @@ impl<S: Clone, C> Cursor<S, C> {
             let mut consumed = 0;
             adapter.for_each_range(node, start, end, |edge, dest| {
                 consumed += 1;
-                if self.visits.count(dest) >= self.cfg.max_visits_per_node {
+                let can_visit = match &self.visits {
+                    Some(visits) => visits.count(dest) < self.cfg.max_visits_per_node,
+                    None => {
+                        can_visit_arena(&self.arena, parent, dest, self.cfg.max_visits_per_node)
+                    }
+                };
+                if !can_visit {
                     self.stats.skipped_revisits += 1;
                     return Ok(true);
                 }
@@ -253,14 +280,14 @@ impl<S: Clone, C> Cursor<S, C> {
                     node,
                     edge,
                     dest,
-                    &self.arena[parent].state,
+                    self.arena[parent].state(),
                     self.cache.as_ref().expect("initialized cache"),
                 )?
                 else {
                     self.stats.rejected_edges += 1;
                     return Ok(true);
                 };
-                accepted = self.accept(
+                accepted = self.accept::<_, false>(
                     adapter,
                     parent,
                     EdgeEval {
@@ -277,16 +304,21 @@ impl<S: Clone, C> Cursor<S, C> {
             self.frames.last_mut().expect("active frame").next_edge += consumed;
             if let Some(child) = accepted {
                 let dest = self.arena[child].node;
-                self.visits.increment(dest);
-                let edge_count = if self.arena[child].depth >= self.cfg.max_depth {
-                    0
-                } else {
-                    adapter.prefetch_outgoing(&[dest])?;
-                    adapter.out_degree(dest)?
-                };
+                if let Some(visits) = &mut self.visits {
+                    visits.increment(dest);
+                } else if self.arena.len() > DFS_SCAN_DEPTH {
+                    // Shallow searches use the path fingerprint and skip the map entirely.
+                    // Track only active ancestors once scanning paths becomes expensive.
+                    let mut visits = SparseVisits::default();
+                    for entry in &self.arena {
+                        visits.increment(entry.node);
+                    }
+                    self.visits = Some(visits);
+                }
+                adapter.prefetch_outgoing(&[dest])?;
                 self.frames.push(DfsFrame {
                     next_edge: 0,
-                    edge_count,
+                    edge_count: adapter.out_degree(dest)?,
                 });
             }
         }
@@ -300,6 +332,7 @@ impl<S: Clone, C> Cursor<S, C> {
         let mut paths = Vec::new();
         let mut work = 0;
         let mut checkpoint = if TIMED { 1 } else { WORK_QUANTUM };
+        let prefetches = adapter.prefetches_outgoing();
         while work < WORK_QUANTUM && paths.len() < limit {
             if TIMED && work == checkpoint {
                 self.cfg.deadline.check()?;
@@ -316,15 +349,17 @@ impl<S: Clone, C> Cursor<S, C> {
                     self.done = true;
                     break;
                 }
-                let nodes = self
-                    .frontier
-                    .iter()
-                    .take(WORK_QUANTUM)
-                    .take_while(|&&p| self.arena[p].depth == depth)
-                    .map(|&p| self.arena[p].node)
-                    .collect::<Vec<_>>();
-                self.bfs_prefetched = nodes.len();
-                adapter.prefetch_outgoing(&nodes)?;
+                if prefetches {
+                    let nodes = self
+                        .frontier
+                        .iter()
+                        .take(WORK_QUANTUM)
+                        .take_while(|&&p| self.arena[p].depth == depth)
+                        .map(|&p| self.arena[p].node)
+                        .collect::<Vec<_>>();
+                    self.bfs_prefetched = nodes.len();
+                    adapter.prefetch_outgoing(&nodes)?;
+                }
             }
             let node = self.arena[parent].node;
             let count = match self.bfs_count {
@@ -338,11 +373,12 @@ impl<S: Clone, C> Cursor<S, C> {
             if self.bfs_edge == count {
                 self.frontier.pop_front();
                 if !self.cfg.intermediate_states && adapter.can_release_expanded_states() {
-                    adapter.release_expanded_state(&mut self.arena[parent].state);
+                    self.arena[parent].state = None;
                 }
+                self.bfs_slots.release(&mut self.arena, parent);
                 self.bfs_edge = 0;
                 self.bfs_count = None;
-                self.bfs_prefetched -= 1;
+                self.bfs_prefetched -= usize::from(prefetches);
                 work += 1;
                 continue;
             }
@@ -360,7 +396,8 @@ impl<S: Clone, C> Cursor<S, C> {
                     self.cache.as_ref().expect("initialized cache"),
                 )?;
                 if let Some(edge) = edge
-                    && let Some(child) = self.accept(adapter, parent, edge, &mut paths)?
+                    && let Some(child) =
+                        self.accept::<_, true>(adapter, parent, edge, &mut paths)?
                 {
                     self.frontier.push_back(child);
                 }
