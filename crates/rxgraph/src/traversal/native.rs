@@ -511,7 +511,7 @@ where
         materialize_target: materialize_native_target::<G, K::State>,
         materialize_lazy: materialize_native_lazy::<G, K::State>,
     };
-    let super::NativeRunOptions { run, optimizations } = run.into();
+    let (run, optimizations) = run.into().start();
     let result = if let Some(options) = optimizations {
         let reverse = super::targets::build_reverse_for(&adapter, &run, options.reverse)?;
         match options.evaluation {
@@ -634,6 +634,13 @@ where
     }
 
     fn out_degree(&self, node: NodeId) -> Result<usize> {
+        // Graph-backed stores already have the degree in their CSR offsets.
+        // Asking for a whole outgoing slice can materialize it just to get its length.
+        if let Some(graph) = self.store.graph()
+            && (node as usize) < graph.node_count()
+        {
+            return Ok(graph.repo.out_degree(node));
+        }
         Ok(self.store.outgoing(node)?.len())
     }
 

@@ -148,6 +148,11 @@ assert path.state == {"spent": 11}
 Search supports DFS or BFS ordering, optional Rayon-backed parallel traversal,
 depth/path limits, and optional intermediate state materialization.
 
+Pass `timeout=0.25` to give the native search 250 ms. The default, `None`, allows
+unlimited time. Zero expires immediately. On expiry, the search raises
+Python's built-in `TimeoutError`. The engine checks elapsed time between
+blocks of work, so an in-flight kernel call or I/O can finish first.
+
 Search kernels evaluate supported Polars scalar, list, and struct expressions
 natively in Rust. List and struct columns/state can be read and updated inside
 `visit`, `next_state`, and `stop`. Polars JSON list literals are intentionally
@@ -230,6 +235,8 @@ with graph.search_batches(
 The example assumes `graph` comes from a plugin registering `hop_budget`.
 Batches contain at most `batch_size` paths and may be smaller. No traversal runs
 between pulls. Typed decoding and lazy file setup happen on the first pull.
+The timeout starts at stream creation and includes time between pulls. A pull
+that raises `TimeoutError` closes the stream.
 Closing releases the session's graph references and lazy caches; paths already
 returned remain usable. Shared eager decode caches stay available for later searches.
 Use the context manager when breaking early. `stats` is cumulative and remains

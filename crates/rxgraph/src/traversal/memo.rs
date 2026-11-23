@@ -322,7 +322,7 @@ impl Graph {
             budget: Budget::new(options.capacity),
             release_expanded: options.release_expanded,
         };
-        let result = engine::search(&adapter, run)?;
+        let result = engine::search(&adapter, run.into())?;
         Ok(SearchResult {
             paths: result.paths,
             stats: result.stats,
@@ -348,7 +348,7 @@ impl Graph {
         Ok(MemoizedGraphSearchStream {
             graph: self,
             kernel,
-            cursor: GraphCursor::new(run)?,
+            cursor: GraphCursor::new(run.into())?,
             batch_size,
             budget: Budget::new(options.capacity),
             release_expanded: options.release_expanded,

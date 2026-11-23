@@ -2,7 +2,10 @@
 use super::{
     OwnedGraphPath, OwnedSearchResult,
     algo::GraphSearchAdapter,
-    engine::cursor::{Cursor, GraphCursor},
+    engine::{
+        RunConfig,
+        cursor::{Cursor, GraphCursor},
+    },
     kernel::PayloadCache,
     native::{self, NativeSearchAdapter},
 };
@@ -46,7 +49,7 @@ impl Graph {
         if batch_size == 0 {
             bail!("batch_size must be at least 1");
         }
-        let NativeRunOptions { run, optimizations } = run.into();
+        let (run, optimizations) = run.into().start();
         if let Some(options) = optimizations {
             return Ok(GraphSearchStream {
                 inner: GraphStreamInner::Optimized(
@@ -127,7 +130,7 @@ pub struct NativeSearchStream<
     kernel: K,
     cursor: NativeCursor<K::State>,
     batch_size: usize,
-    preparation: Option<RunOptions>,
+    preparation: Option<RunConfig>,
     reverse: Option<super::targets::Reverse>,
     options: Option<super::TargetOptions>,
     retain_history: bool,
@@ -150,7 +153,7 @@ impl<'s, K: native::Kernel, G: native::GraphStore<Node = K::Node, Edge = K::Edge
         if batch_size == 0 {
             bail!("batch_size must be at least 1");
         }
-        let NativeRunOptions { run, optimizations } = run.into();
+        let (run, optimizations) = run.into().start();
         let preparation = optimizations.filter(|o| o.reverse).map(|_| run.clone());
         let retain_history = run.intermediate_states;
         let cursor = match optimizations.map(|o| o.evaluation) {
@@ -302,7 +305,7 @@ where
         graph,
         kernel,
         encode,
-        cursor: GraphCursor::new(run)?,
+        cursor: GraphCursor::new(run.into())?,
     }))
 }
 
@@ -418,7 +421,7 @@ where
         encode: Arc<F>,
         cursor: OptimizedCursor<K::State>,
         options: super::TargetOptions,
-        preparation: Option<RunOptions>,
+        preparation: Option<RunConfig>,
         reverse: Option<Reverse>,
         retain_history: bool,
     }
@@ -504,6 +507,7 @@ where
             self.preparation = None;
         }
     }
+    let run = RunConfig::from(run);
     let preparation = (options.reverse && run.max_paths != Some(0)).then(|| run.clone());
     let retain_history = run.intermediate_states;
     let cursor = match options.evaluation {

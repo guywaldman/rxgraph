@@ -10,7 +10,7 @@ pub(crate) struct ParallelDfs<S, C> {
     progress: Option<Progress>,
 }
 impl<S: Clone, C> ParallelDfs<S, C> {
-    fn new(mut run: RunOptions) -> Result<Self> {
+    fn new(mut run: RunConfig) -> Result<Self> {
         let max_paths = run.max_paths;
         let progress = Some(Progress::new(run.progress));
         let starts = std::mem::take(&mut run.start_nodes);
@@ -92,7 +92,7 @@ pub(crate) enum GraphCursor<S, C> {
     ParallelBfs(ParallelBfs<S, C>),
 }
 impl<S: Clone, C> GraphCursor<S, C> {
-    pub(crate) fn new(run: RunOptions) -> Result<Self> {
+    pub(crate) fn new(run: RunConfig) -> Result<Self> {
         if run.max_visits_per_node == 0 {
             bail!("max_visits_per_node must be at least 1");
         }
@@ -148,7 +148,10 @@ impl<S: Clone, C> GraphCursor<S, C> {
         let result = match self {
             Self::Serial(c) => c.next_batch(adapter, size),
             Self::ParallelDfs(c) => c.next_batch(adapter, size),
-            Self::ParallelBfs(c) => c.next_batch(adapter, size),
+            Self::ParallelBfs(c) if c.cursor.cfg.deadline.enabled() => {
+                c.next_batch::<_, true>(adapter, size)
+            }
+            Self::ParallelBfs(c) => c.next_batch::<_, false>(adapter, size),
         };
         if result.is_err() || matches!(result, Ok(None)) {
             self.close();
@@ -163,7 +166,11 @@ pub(crate) struct ParallelBfs<S, C> {
     caches: Vec<C>,
 }
 impl<S: Clone, C> ParallelBfs<S, C> {
-    fn next_batch<A>(&mut self, adapter: &A, size: usize) -> Result<Option<Vec<A::Path>>>
+    fn next_batch<A, const TIMED: bool>(
+        &mut self,
+        adapter: &A,
+        size: usize,
+    ) -> Result<Option<Vec<A::Path>>>
     where
         A: SearchAdapter<State = S, Cache = C> + Sync,
         S: Send + Sync,
@@ -173,31 +180,29 @@ impl<S: Clone, C> ParallelBfs<S, C> {
         if self.cursor.done {
             return Ok(None);
         }
+        // The untimed instantiation removes all polling from the Rayon jobs.
+        let deadline = if TIMED {
+            self.cursor.cfg.deadline
+        } else {
+            Deadline::NONE
+        };
+        deadline.check()?;
         self.cursor.initialize(adapter)?;
         let c = &mut self.cursor;
+        let size = c.batch_limit(size);
         let mut paths = Vec::new();
         loop {
-            if c.done || c.cfg.max_paths.is_some_and(|n| c.stats.stopped_paths >= n) {
+            deadline.check()?;
+            if c.done || size == 0 {
                 c.done = true;
                 break;
             }
             while let Some((parent, edge)) = self.pending.pop_front() {
-                let stop = edge.stop;
-                let child = push_entry(&mut c.arena, parent, edge);
-                c.stats.accepted_edges += 1;
-                c.stats.path_entries += 1;
-                c.stats.max_depth = c.stats.max_depth.max(c.arena[child].depth);
-                if stop {
-                    paths.push(adapter.materialize(&c.arena, child, c.cfg.intermediate_states)?);
-                    c.stats.stopped_paths += 1;
-                    c.arena.pop();
-                    if paths.len() >= size
-                        || c.cfg.max_paths.is_some_and(|n| c.stats.stopped_paths >= n)
-                    {
-                        break;
-                    }
-                } else {
+                deadline.check_every(self.pending.len())?;
+                if let Some(child) = c.accept(adapter, parent, edge, &mut paths)? {
                     c.frontier.push_back(child);
+                } else if paths.len() >= size {
+                    break;
                 }
             }
             if !paths.is_empty() {
@@ -210,6 +215,10 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             // Small frontiers use the same direct cursor as serial search. Recheck
             // after each bounded chunk so growing frontiers can still use workers.
             let depth = c.arena[first].depth;
+            if depth >= c.cfg.max_depth {
+                c.done = true;
+                break;
+            }
             let mut frontier_edges = 0;
             if c.frontier.len() < MIN_PAR_FRONTIER {
                 for &parent in &c.frontier {
@@ -220,7 +229,7 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 }
             }
             if c.frontier.len() < MIN_PAR_FRONTIER && frontier_edges < MIN_PAR_EDGES {
-                paths = c.advance_bfs(adapter, size)?;
+                paths = c.advance_bfs::<_, TIMED>(adapter, size)?;
                 if let Some(progress) = &mut c.progress {
                     progress.tick(&c.stats);
                 }
@@ -236,7 +245,7 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 .frontier
                 .iter()
                 .take(WORK_QUANTUM)
-                .filter(|&&p| c.arena[p].depth == depth && depth < c.cfg.max_depth)
+                .take_while(|&&p| c.arena[p].depth == depth)
                 .map(|&p| c.arena[p].node)
                 .collect::<Vec<_>>();
             adapter.prefetch_outgoing(&nodes)?;
@@ -244,6 +253,10 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             let mut expanded = Vec::new();
             let release_states =
                 !c.cfg.intermediate_states && adapter.can_release_expanded_states();
+            let mut job_size = WORK_QUANTUM.div_ceil(rayon::current_num_threads());
+            if TIMED {
+                job_size = job_size.min(Deadline::POLL_INTERVAL);
+            }
             while edge_total < WORK_QUANTUM {
                 let Some(&parent) = c.frontier.front() else {
                     break;
@@ -254,16 +267,13 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                 let count = match c.bfs_count {
                     Some(count) => count,
                     None => {
-                        let count = if depth >= c.cfg.max_depth {
-                            0
-                        } else {
-                            adapter.out_degree(c.arena[parent].node)?
-                        };
+                        let count = adapter.out_degree(c.arena[parent].node)?;
                         c.bfs_count = Some(count);
                         count
                     }
                 };
                 if c.bfs_edge == count {
+                    deadline.check_every(c.frontier.len())?;
                     c.frontier.pop_front();
                     if release_states {
                         expanded.push(parent);
@@ -272,29 +282,34 @@ impl<S: Clone, C> ParallelBfs<S, C> {
                     c.bfs_count = None;
                     continue;
                 }
-                let end = count.min(
-                    c.bfs_edge
-                        + (WORK_QUANTUM - edge_total)
-                            .min(WORK_QUANTUM.div_ceil(rayon::current_num_threads())),
-                );
+                let end = count.min(c.bfs_edge + (WORK_QUANTUM - edge_total).min(job_size));
                 jobs.push((parent, c.bfs_edge, end));
                 edge_total += end - c.bfs_edge;
                 c.bfs_edge = end;
             }
             let parallel = edge_total >= MIN_PAR_EDGES || frontier_count >= MIN_PAR_FRONTIER;
+            let max_visits_per_node = c.cfg.max_visits_per_node;
             let evaluate = |jobs: &[(usize, usize, usize)],
                             cache: &C|
              -> Result<EvaluatedChunk<S>> {
                 let mut stats = SearchStats::default();
                 let mut edges = Vec::new();
+                let mut work = Deadline::POLL_INTERVAL;
                 for &(parent, start, end) in jobs {
+                    if TIMED {
+                        if work >= Deadline::POLL_INTERVAL {
+                            deadline.check()?;
+                            work = 0;
+                        }
+                        work += end - start;
+                    }
                     adapter.for_each_range(c.arena[parent].node, start, end, |edge, dest| {
                         if let Some(edge) = eval_arena_edge(
                             adapter,
                             &c.arena,
                             parent,
                             (edge, dest),
-                            &c.cfg,
+                            max_visits_per_node,
                             &mut stats,
                             cache,
                         )? {
@@ -335,6 +350,10 @@ impl<S: Clone, C> ParallelBfs<S, C> {
             if let Some(progress) = &mut c.progress {
                 progress.tick(&c.stats);
             }
+        }
+        deadline.check()?;
+        if c.at_limit() {
+            c.done = true;
         }
         if paths.is_empty() {
             Ok(None)

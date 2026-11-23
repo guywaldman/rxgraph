@@ -156,6 +156,49 @@ fn parallel_workers_obey_one_global_limit() -> Result<()> {
         Ok(())
     })
 }
+
+#[test]
+fn deadline_interrupts_active_serial_and_parallel_searches() -> Result<()> {
+    use std::time::Duration;
+
+    struct SlowFirstEdge<'a>(&'a AtomicUsize);
+    impl Kernel for SlowFirstEdge<'_> {
+        type State = ();
+        fn initial_state(&self, _: &Graph, _: NodeId) -> Result<()> {
+            Ok(())
+        }
+        fn transition(&self, _: &EdgeCtx<'_, ()>) -> Result<Transition<()>> {
+            if self.0.fetch_add(1, Ordering::Relaxed) == 0 {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Ok(Transition::Reject)
+        }
+    }
+
+    let graph = graph();
+    let pool = rayon::ThreadPoolBuilder::new().num_threads(2).build()?;
+    pool.install(|| {
+        for strategy in [
+            TraversalStrategy::BreadthFirst,
+            TraversalStrategy::DepthFirst,
+        ] {
+            for parallel in [false, true] {
+                let calls = AtomicUsize::new(0);
+                let run = RunOptions {
+                    start_nodes: vec![0.into(); 8192],
+                    timeout: Some(Duration::from_millis(20)),
+                    ..run(strategy, parallel)
+                };
+                let err = graph
+                    .search_paths_with(SlowFirstEdge(&calls), run)
+                    .unwrap_err();
+                assert!(err.is::<SearchTimeout>());
+                assert!(calls.load(Ordering::Relaxed) < 8192 * 3);
+            }
+        }
+    });
+    Ok(())
+}
 #[test]
 fn custom_eager_only_runner_rejects_streaming() -> Result<()> {
     struct Eager;

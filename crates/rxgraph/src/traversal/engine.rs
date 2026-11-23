@@ -5,7 +5,9 @@ use rayon::prelude::*;
 
 use crate::{
     graph::{EdgeId, GraphId, NodeId},
-    traversal::{RunOptions, SearchStats, config::TraversalStrategy, progress::Progress},
+    traversal::{
+        RunOptions, SearchStats, config::TraversalStrategy, progress::Progress, timeout::Deadline,
+    },
 };
 
 const MIN_PAR_FRONTIER: usize = 512;
@@ -107,24 +109,30 @@ fn visit_hashes(node: NodeId) -> [usize; 2] {
 }
 
 #[derive(Debug, Clone)]
-struct RunConfig {
-    start_nodes: Vec<crate::OwnedGraphId>,
+pub(crate) struct RunConfig {
+    pub(super) start_nodes: Vec<crate::OwnedGraphId>,
     max_depth: usize,
-    max_paths: Option<usize>,
+    pub(super) max_paths: Option<usize>,
+    pub(super) deadline: Deadline,
     strategy: TraversalStrategy,
     max_visits_per_node: usize,
-    intermediate_states: bool,
+    pub(super) intermediate_states: bool,
+    parallel: bool,
+    progress: bool,
 }
 
-impl RunConfig {
-    fn from_run(run: RunOptions) -> Self {
+impl From<RunOptions> for RunConfig {
+    fn from(run: RunOptions) -> Self {
         Self {
             start_nodes: run.start_nodes,
             max_depth: run.max_depth.unwrap_or(usize::MAX),
             max_paths: run.max_paths,
+            deadline: Deadline::start(run.timeout),
             strategy: run.strategy,
             max_visits_per_node: run.max_visits_per_node,
             intermediate_states: run.intermediate_states,
+            parallel: run.parallel,
+            progress: run.progress,
         }
     }
 }
@@ -191,7 +199,7 @@ struct EdgeEval<S> {
 
 pub(crate) mod cursor;
 
-pub(crate) fn search<A>(adapter: &A, run: RunOptions) -> Result<SearchOutput<A::Path>>
+pub(super) fn search<A>(adapter: &A, run: RunConfig) -> Result<SearchOutput<A::Path>>
 where
     A: SearchAdapter + Sync,
     A::State: Send + Sync + Clone,
@@ -208,9 +216,9 @@ where
         stats: cursor.stats(),
     })
 }
-pub(crate) fn search_serial<A: SearchAdapter>(
+pub(super) fn search_serial<A: SearchAdapter>(
     adapter: &A,
-    run: RunOptions,
+    run: RunConfig,
 ) -> Result<SearchOutput<A::Path>> {
     let mut cursor = cursor::Cursor::new(run)?;
     let mut paths = Vec::new();
@@ -231,7 +239,8 @@ where
     let mut frontier = VecDeque::with_capacity(cfg.start_nodes.len());
     let mut stats = SearchStats::default();
 
-    for external in &cfg.start_nodes {
+    for (i, external) in cfg.start_nodes.iter().enumerate() {
+        cfg.deadline.check_every(i)?;
         let node = adapter
             .resolve_node(external.as_ref())?
             .with_context(|| format!("unknown start node {external}"))?;
@@ -256,7 +265,7 @@ fn eval_arena_edge<A>(
     arena: &[PathEntry<A::State>],
     parent: usize,
     candidate: (EdgeId, NodeId),
-    cfg: &RunConfig,
+    max_visits_per_node: usize,
     stats: &mut SearchStats,
     cache: &A::Cache,
 ) -> Result<Option<EdgeEval<A::State>>>
@@ -264,7 +273,7 @@ where
     A: SearchAdapter,
 {
     let (edge, dest) = candidate;
-    if !can_visit_arena(arena, parent, dest, cfg.max_visits_per_node) {
+    if !can_visit_arena(arena, parent, dest, max_visits_per_node) {
         stats.skipped_revisits += 1;
         return Ok(None);
     }
@@ -300,7 +309,7 @@ fn push_entry<S>(arena: &mut Vec<PathEntry<S>>, parent: usize, edge: EdgeEval<S>
     child
 }
 
-fn should_parallelize_dfs(cfg: &RunOptions) -> bool {
+fn should_parallelize_dfs(cfg: &RunConfig) -> bool {
     cfg.max_paths.is_none_or(|max| max >= MIN_PAR_DFS_PATHS)
         && cfg.start_nodes.len() >= rayon::current_num_threads()
 }

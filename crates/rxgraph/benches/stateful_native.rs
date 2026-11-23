@@ -117,6 +117,7 @@ impl Workload {
             parallel,
             intermediate_states: false,
             progress: false,
+            timeout: None,
         }
     }
 

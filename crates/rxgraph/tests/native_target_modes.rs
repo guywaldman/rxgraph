@@ -193,6 +193,30 @@ fn native_target_modes_match_search_and_stream() -> Result<()> {
 }
 
 #[test]
+fn native_timeout_covers_reverse_preparation_and_fuses_the_stream() -> Result<()> {
+    // Reverse preparation would reject this non-enumerable store if it ran.
+    let store = Store::new(false);
+    let kernel = StateRefines;
+    let run = RunOptions {
+        timeout: Some(std::time::Duration::ZERO),
+        ..run()
+    }
+    .with_optimizations(opts(Evaluation::Lazy, true));
+    let err = native::search_paths(&store, kernel, run.clone()).unwrap_err();
+    assert!(err.is::<rxgraph::SearchTimeout>());
+    let mut stream = native::search_batches(&store, StateRefines, run, 1)?;
+    assert!(
+        stream
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .is::<rxgraph::SearchTimeout>()
+    );
+    assert!(stream.next().is_none());
+    Ok(())
+}
+
+#[test]
 fn native_post_transition_hook_is_optional() -> Result<()> {
     let store = Store::new(true);
     for stateful in [false, true] {

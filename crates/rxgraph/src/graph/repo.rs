@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    convert::Infallible,
     fmt,
     sync::{Arc, OnceLock},
 };
@@ -370,7 +371,48 @@ impl Repo {
     /// Returns the reverse-adjacency CSR, building it on first use.
     fn incoming(&self) -> &IncomingCsr {
         self.incoming
-            .get_or_init(|| build_incoming_csr(self.node_count, &self.csr_offsets, &self.csr_dests))
+            .get_or_init(|| self.build_incoming(|_| Ok::<_, Infallible>(())).unwrap())
+    }
+
+    /// Publish the reverse index only after a cancellable build finishes.
+    pub(crate) fn try_prepare_incoming(&self, check: impl Fn(usize) -> Result<()>) -> Result<()> {
+        if self.incoming.get().is_none() {
+            let incoming = self.build_incoming(check)?;
+            self.incoming.get_or_init(|| incoming);
+        }
+        Ok(())
+    }
+
+    fn build_incoming<E>(&self, check: impl Fn(usize) -> Result<(), E>) -> Result<IncomingCsr, E> {
+        let mut offsets = vec![0 as Offset; self.node_count + 1];
+        for (index, &dest) in self.csr_dests.iter().enumerate() {
+            check(index)?;
+            offsets[dest as usize + 1] += 1;
+        }
+        for i in 1..offsets.len() {
+            check(i)?;
+            offsets[i] += offsets[i - 1];
+        }
+
+        let mut srcs = vec![0; self.csr_dests.len()];
+        let mut cursor = offsets.clone();
+        for src in 0..self.node_count {
+            check(src)?;
+            let start = self.csr_offsets[src] as usize;
+            let end = self.csr_offsets[src + 1] as usize;
+            for (offset, &dest) in self.csr_dests[start..end].iter().enumerate() {
+                check(start + offset + 1)?;
+                let dest = dest as usize;
+                let pos = cursor[dest] as usize;
+                srcs[pos] = src as NodeId;
+                cursor[dest] += 1;
+            }
+        }
+        Ok(IncomingCsr {
+            offsets,
+            srcs,
+            edge_ids: OnceLock::new(),
+        })
     }
 
     pub(crate) fn out_degrees(&self) -> Vec<usize> {
@@ -462,37 +504,6 @@ fn degrees_from_offsets(offsets: &[Offset]) -> Vec<usize> {
         .windows(2)
         .map(|pair| (pair[1] - pair[0]) as usize)
         .collect()
-}
-
-fn build_incoming_csr(
-    node_count: usize,
-    csr_offsets: &[Offset],
-    csr_dests: &[NodeId],
-) -> IncomingCsr {
-    let mut offsets = vec![0 as Offset; node_count + 1];
-    for &dest in csr_dests {
-        offsets[dest as usize + 1] += 1;
-    }
-    for i in 1..offsets.len() {
-        offsets[i] += offsets[i - 1];
-    }
-
-    let mut srcs = vec![0; csr_dests.len()];
-    let mut cursor = offsets.clone();
-    for src in 0..node_count as NodeId {
-        let start = csr_offsets[src as usize] as usize;
-        let end = csr_offsets[src as usize + 1] as usize;
-        for &dest in &csr_dests[start..end] {
-            let pos = cursor[dest as usize] as usize;
-            srcs[pos] = src;
-            cursor[dest as usize] += 1;
-        }
-    }
-    IncomingCsr {
-        offsets,
-        srcs,
-        edge_ids: OnceLock::new(),
-    }
 }
 
 struct Preprocessed {
@@ -749,6 +760,28 @@ mod tests {
         repo.outgoing(internal_id)
             .map(|(_, node)| repo.external_node(node).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn interrupted_reverse_index_can_be_rebuilt() -> Result<()> {
+        let nodes = record_batch!((ID_COL, UInt64, [0, 1, 2]))?;
+        let edges = record_batch!(
+            (ID_COL, UInt64, [0, 1]),
+            (EDGE_SRC_COL, UInt64, [0, 1]),
+            (EDGE_DEST_COL, UInt64, [2, 2])
+        )?;
+        let repo = Repo::from_tables(nodes, edges)?;
+        let interrupted = repo.try_prepare_incoming(|i| {
+            if i == 1 {
+                bail!("interrupted");
+            }
+            Ok(())
+        });
+        assert!(interrupted.is_err());
+        assert!(repo.incoming.get().is_none());
+        repo.try_prepare_incoming(|_| Ok(()))?;
+        assert_eq!(GraphRepo::incoming(&repo, 2).collect::<Vec<_>>(), [0, 1]);
+        repo.try_prepare_incoming(|_| panic!("expected cached index"))
     }
 
     #[test]

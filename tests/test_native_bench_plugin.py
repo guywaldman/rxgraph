@@ -62,6 +62,27 @@ def target_graph(rxg):
     )
 
 
+@pytest.mark.parametrize(
+    "kernel,optimizations",
+    [("bench_arrow", {"reverse": True}), ("bench_memo", {"memo_capacity": 8})],
+)
+def test_plugin_search_timeout(kernel, optimizations):
+    graph = target_graph(plugin())
+    kwargs = dict(
+        kernel=kernel,
+        start_nodes=["a"],
+        params={"budget": 10, "target": "target"},
+        optimizations=optimizations,
+        timeout=0,
+    )
+    with pytest.raises(TimeoutError):
+        graph.search(**kwargs)
+    with graph.search_batches(**kwargs) as stream:
+        with pytest.raises(TimeoutError):
+            next(stream)
+        assert list(stream) == []
+
+
 @pytest.mark.parametrize("strategy", ["dfs", "bfs"])
 @pytest.mark.parametrize("evaluation", ["incremental", "lazy"])
 def test_target_optimizations_eager_and_stream(strategy, evaluation):

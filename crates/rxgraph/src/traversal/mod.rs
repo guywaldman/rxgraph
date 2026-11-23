@@ -31,6 +31,7 @@ mod registry;
 mod state_encoder;
 mod stream;
 mod targets;
+mod timeout;
 mod typed;
 
 use crate::{dsl::StateRow, graph::GraphId};
@@ -47,6 +48,7 @@ pub use registry::{
 };
 pub use stream::{GraphSearchStream, NativeBatchStream, NativeSearchStream};
 pub use targets::{Evaluation, TargetCtx, TargetOptions};
+pub use timeout::SearchTimeout;
 pub use typed::ParquetPaths;
 pub use typed::{
     ArrowList, ArrowRow, ArrowStruct, OwnedGraphPath, OwnedSearchResult, PayloadField, TypedKernel,

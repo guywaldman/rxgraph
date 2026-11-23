@@ -86,6 +86,7 @@ class Graph:
         progress: bool = False,
         max_visits_per_node: int = 1,
         optimizations: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> SearchResult:
         """Run a stateful traversal.
 
@@ -98,6 +99,8 @@ class Graph:
         ``params`` node-label values under the conventional keys
         ``target``/``source``/``start``/``node`` are translated to engine IDs when
         the value is a known node label; other values pass through unchanged.
+
+        ``timeout`` limits traversal time in seconds. Expiry raises ``TimeoutError``.
 
         ``columns`` lists payload columns to load for ``from_lazy`` before a
         legacy named kernel runs. File-backed ``from_parquet`` graphs use typed
@@ -124,6 +127,7 @@ class Graph:
         max_visits_per_node: int = 1,
         batch_size: int = 1024,
         optimizations: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> SearchStream: ...
     def search_paths(
         self,
@@ -144,6 +148,7 @@ class Graph:
         progress: bool = False,
         max_visits_per_node: int = 1,
         optimizations: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> SearchResult: ...
     def search_first(
         self,
@@ -161,6 +166,7 @@ class Graph:
         progress: bool = False,
         max_visits_per_node: int = 1,
         optimizations: Mapping[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> SearchPath | None: ...
     def bfs(self, start: Hashable, max_depth: int | None = None) -> list[Any]:
         """Return nodes reachable from ``start`` in breadth-first order."""
@@ -256,6 +262,8 @@ class Traversal:
         parallel: bool | Literal["auto", "off", "on"] = True,
         intermediate_states: bool = False,
         progress: bool = False,
+        max_visits_per_node: int = 1,
+        timeout: float | None = None,
     ) -> None:
         """Create a traversal.
 

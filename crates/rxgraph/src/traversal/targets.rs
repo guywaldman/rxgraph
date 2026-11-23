@@ -3,12 +3,12 @@ use std::{borrow::Cow, marker::PhantomData, sync::Arc};
 
 use super::{
     algo::{GraphSearchAdapter, materialize_path},
-    engine::{self, PathEntry, SearchAdapter, cursor::GraphCursor},
+    engine::{self, PathEntry, RunConfig, SearchAdapter, cursor::GraphCursor},
     kernel::PayloadCache,
 };
 use crate::{
-    EdgeCtx, EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, RunOptions,
-    SearchResult, SearchStats,
+    EdgeCtx, EdgeId, Graph, GraphId, GraphPath, GraphRepo, Kernel, NodeId, SearchResult,
+    SearchStats,
 };
 use anyhow::{Context, Result, bail};
 
@@ -190,82 +190,32 @@ impl Reverse {
 pub(crate) fn build_reverse<K: Kernel>(
     graph: &Graph,
     kernel: &K,
-    run: &RunOptions,
+    run: &RunConfig,
     enabled: bool,
 ) -> Result<Option<Reverse>> {
-    if !enabled || run.start_nodes.is_empty() || run.max_paths == Some(0) {
-        return Ok(None);
-    }
-    let mut targets = Vec::new();
-    for external in &run.start_nodes {
-        let start = graph
-            .repo
-            .internal_node(external.as_ref())
-            .with_context(|| format!("unknown start node {external}"))?;
-        let Some(ids) = initial_bound(graph, kernel, start, None)? else {
-            return Ok(None);
-        };
-        targets.extend(ids.iter().copied());
-    }
-    targets.sort_unstable();
-    targets.dedup();
-    // Bound per-target preparation work and mask allocation; the coarse mask
-    // remains a safe overapproximation when the target set is larger.
-    if targets.len() <= 8 && graph.node_count().saturating_mul(8) <= 128 * 1024 * 1024 {
-        let mut masks = vec![0u64; graph.node_count()];
-        for (index, &target) in targets.iter().enumerate() {
-            let bit = 1u64 << index;
-            let mut queue = vec![target];
-            masks[target as usize] |= bit;
-            let mut head = 0;
-            while let Some(&node) = queue.get(head) {
-                head += 1;
-                for source in graph.repo.incoming(node) {
-                    if masks[source as usize] & bit == 0 {
-                        masks[source as usize] |= bit;
-                        queue.push(source);
-                    }
-                }
-            }
-        }
-        Ok(Some(Reverse::PerTarget {
-            ids: targets,
-            masks,
-        }))
-    } else {
-        let mut keep = vec![false; graph.node_count()];
-        let mut queue = Vec::new();
-        for target in targets {
-            if !keep[target as usize] {
-                keep[target as usize] = true;
-                queue.push(target);
-            }
-        }
-        let mut head = 0;
-        while let Some(&node) = queue.get(head) {
-            head += 1;
-            for source in graph.repo.incoming(node) {
-                if !keep[source as usize] {
-                    keep[source as usize] = true;
-                    queue.push(source);
-                }
-            }
-        }
-        Ok(Some(Reverse::Coarse(keep)))
-    }
+    let adapter = GraphSearchAdapter {
+        graph,
+        kernel,
+        project: |state: &K::State| Ok(state.clone()),
+        output: PhantomData,
+    };
+    build_reverse_for(&adapter, run, enabled)
 }
 
 /// Build reverse reachability for any dense topology backend.
 pub(crate) fn build_reverse_for<A: TargetBackend>(
     adapter: &A,
-    run: &RunOptions,
+    run: &RunConfig,
     enabled: bool,
 ) -> Result<Option<Reverse>> {
     if !enabled || run.start_nodes.is_empty() || run.max_paths == Some(0) {
         return Ok(None);
     }
+    let deadline = run.deadline;
+    deadline.check()?;
     let mut targets = Vec::new();
-    for external in &run.start_nodes {
+    for (index, external) in run.start_nodes.iter().enumerate() {
+        deadline.check_every(index)?;
         let start = adapter
             .resolve_node(external.as_ref())?
             .with_context(|| format!("unknown start node {external}"))?;
@@ -282,11 +232,23 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
     if targets.iter().any(|&node| node as usize >= count) {
         bail!("target node is out of range");
     }
+    if deadline.enabled()
+        && !targets.is_empty()
+        && let Some(graph) = adapter.graph()
+    {
+        graph
+            .repo
+            .try_prepare_incoming(|i| deadline.check_every(i))?;
+    }
     let incoming = if adapter.graph().is_none() {
         let mut incoming = vec![Vec::new(); count];
         for src in 0..count {
+            deadline.check_every(src)?;
             let degree = adapter.out_degree(src as NodeId)?;
+            let mut visited = 0;
             adapter.for_each_range(src as NodeId, 0, degree, |_, dest| {
+                visited += 1;
+                deadline.check_every(visited)?;
                 let sources = incoming
                     .get_mut(dest as usize)
                     .context("edge destination outside dense topology")?;
@@ -306,8 +268,9 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
             masks[target as usize] |= bit;
             let mut head = 0;
             while let Some(&node) = queue.get(head) {
+                deadline.check_every(head)?;
                 head += 1;
-                for source in adapter
+                for (index, source) in adapter
                     .graph()
                     .into_iter()
                     .flat_map(|g| g.repo.incoming(node))
@@ -317,7 +280,9 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
                             .into_iter()
                             .flat_map(|v| v[node as usize].iter().copied()),
                     )
+                    .enumerate()
                 {
+                    deadline.check_every(index + 1)?;
                     if masks[source as usize] & bit == 0 {
                         masks[source as usize] |= bit;
                         queue.push(source);
@@ -332,7 +297,8 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
     } else {
         let mut keep = vec![false; count];
         let mut queue = Vec::new();
-        for target in targets {
+        for (index, target) in targets.into_iter().enumerate() {
+            deadline.check_every(index)?;
             if !keep[target as usize] {
                 keep[target as usize] = true;
                 queue.push(target);
@@ -340,8 +306,9 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
         }
         let mut head = 0;
         while let Some(&node) = queue.get(head) {
+            deadline.check_every(head)?;
             head += 1;
-            for source in adapter
+            for (index, source) in adapter
                 .graph()
                 .into_iter()
                 .flat_map(|g| g.repo.incoming(node))
@@ -351,7 +318,9 @@ pub(crate) fn build_reverse_for<A: TargetBackend>(
                         .into_iter()
                         .flat_map(|v| v[node as usize].iter().copied()),
                 )
+                .enumerate()
             {
+                deadline.check_every(index + 1)?;
                 if !keep[source as usize] {
                     keep[source as usize] = true;
                     queue.push(source);
@@ -572,7 +541,7 @@ impl Graph {
     pub(crate) fn search_batches_optimized_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         batch_size: usize,
         options: TargetOptions,
     ) -> Result<OptimizedSearchStream<'_, K>>
@@ -594,7 +563,7 @@ impl Graph {
     pub(crate) fn search_paths_optimized_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         options: TargetOptions,
     ) -> Result<SearchResult<'_, K::State>>
     where
@@ -610,7 +579,7 @@ impl Graph {
     pub(crate) fn search_paths_targets_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         options: TargetOptions,
     ) -> Result<SearchResult<'_, K::State>>
     where
@@ -637,7 +606,7 @@ impl Graph {
     pub(crate) fn search_batches_targets_with<K: Kernel + Sync>(
         &self,
         kernel: K,
-        run: RunOptions,
+        run: RunConfig,
         batch_size: usize,
         options: TargetOptions,
     ) -> Result<TargetSearchStream<'_, K>>
@@ -667,7 +636,7 @@ pub(crate) struct TargetSearchStream<'g, K: Kernel> {
     cursor: GraphCursor<TargetState<K::State>, PayloadCache>,
     batch_size: usize,
     reverse: Option<Reverse>,
-    preparation: Option<RunOptions>,
+    preparation: Option<RunConfig>,
     release: bool,
 }
 impl<K: Kernel> TargetSearchStream<'_, K> {
